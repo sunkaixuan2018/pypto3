@@ -118,36 +118,87 @@ def collect_header_files() -> list[str]:
 
 def _get_changed_files(diff_base: str) -> set[str] | None:
     """Return the set of files changed relative to *diff_base*, or ``None`` on error."""
-    try:
-        result = subprocess.run(
-            ["git", "diff", "--name-only", "--diff-filter=d", diff_base, "HEAD"],
-            capture_output=True,
-            text=True,
-            check=True,
-        )
-    except subprocess.CalledProcessError as exc:
-        cmd = " ".join(str(part) for part in exc.cmd)
-        stderr = (exc.stderr or "").strip()
-        stdout = (exc.stdout or "").strip()
-        details = [f"command='{cmd}'", f"exit_code={exc.returncode}"]
-        if stderr:
-            details.append(f"stderr={stderr!r}")
-        if stdout:
-            details.append(f"stdout={stdout!r}")
-        details_msg = ", ".join(details)
-        print(
-            f"[clang-tidy] Warning: git diff failed ({details_msg}), linting all files.",
-            file=sys.stderr,
-        )
-        return None
-    except FileNotFoundError as exc:
-        print(
-            f"[clang-tidy] Warning: git diff failed ({exc}), linting all files.",
-            file=sys.stderr,
-        )
-        return None
 
-    changed = set(result.stdout.strip().splitlines())
+    def _run_git_diff(*args: str) -> set[str] | None:
+        try:
+            result = subprocess.run(
+                ["git", "diff", "--name-only", "--diff-filter=d", *args],
+                capture_output=True,
+                text=True,
+                check=True,
+            )
+        except subprocess.CalledProcessError as exc:
+            cmd = " ".join(str(part) for part in exc.cmd)
+            stderr = (exc.stderr or "").strip()
+            stdout = (exc.stdout or "").strip()
+            details = [f"command='{cmd}'", f"exit_code={exc.returncode}"]
+            if stderr:
+                details.append(f"stderr={stderr!r}")
+            if stdout:
+                details.append(f"stdout={stdout!r}")
+            details_msg = ", ".join(details)
+            print(
+                f"[clang-tidy] Warning: git diff failed ({details_msg}), linting all files.",
+                file=sys.stderr,
+            )
+            return None
+        except FileNotFoundError as exc:
+            print(
+                f"[clang-tidy] Warning: git diff failed ({exc}), linting all files.",
+                file=sys.stderr,
+            )
+            return None
+        return set(result.stdout.strip().splitlines())
+
+    def _run_git_untracked() -> set[str] | None:
+        try:
+            result = subprocess.run(
+                ["git", "ls-files", "--others", "--exclude-standard"],
+                capture_output=True,
+                text=True,
+                check=True,
+            )
+        except subprocess.CalledProcessError as exc:
+            cmd = " ".join(str(part) for part in exc.cmd)
+            stderr = (exc.stderr or "").strip()
+            stdout = (exc.stdout or "").strip()
+            details = [f"command='{cmd}'", f"exit_code={exc.returncode}"]
+            if stderr:
+                details.append(f"stderr={stderr!r}")
+            if stdout:
+                details.append(f"stdout={stdout!r}")
+            details_msg = ", ".join(details)
+            print(
+                f"[clang-tidy] Warning: git ls-files failed ({details_msg}), linting all files.",
+                file=sys.stderr,
+            )
+            return None
+        except FileNotFoundError as exc:
+            print(
+                f"[clang-tidy] Warning: git ls-files failed ({exc}), linting all files.",
+                file=sys.stderr,
+            )
+            return None
+        return set(result.stdout.strip().splitlines())
+
+    if diff_base == "HEAD":
+        # When diff_base is HEAD, include staged, unstaged, and untracked changes
+        # so that files being prepared for a commit (but not yet committed) are linted.
+        staged = _run_git_diff("--cached")
+        if staged is None:
+            return None
+        unstaged = _run_git_diff("HEAD")
+        if unstaged is None:
+            return None
+        untracked = _run_git_untracked()
+        if untracked is None:
+            return None
+        changed = staged | unstaged | untracked
+    else:
+        changed = _run_git_diff(diff_base, "HEAD")
+        if changed is None:
+            return None
+
     return changed if changed else set()
 
 
