@@ -105,6 +105,8 @@ std::vector<std::pair<std::string, std::any>> ConvertKwargsDict(const nb::dict& 
       kwargs.emplace_back(key, nb::cast<DataType>(item.second));
     } else if (nb::isinstance<MemorySpace>(item.second)) {
       kwargs.emplace_back(key, nb::cast<MemorySpace>(item.second));
+    } else if (nb::isinstance<TensorLayout>(item.second)) {
+      kwargs.emplace_back(key, nb::cast<TensorLayout>(item.second));
     } else if (nb::isinstance<PipeType>(item.second)) {
       // Cast enum to int for storage
       kwargs.emplace_back(key, static_cast<int>(nb::cast<PipeType>(item.second)));
@@ -474,6 +476,10 @@ void BindIR(nb::module_& m) {
             result[key.c_str()] = AnyCast<float>(value, "converting to Python: " + key);
           } else if (value.type() == typeid(DataType)) {
             result[key.c_str()] = AnyCast<DataType>(value, "converting to Python: " + key);
+          } else if (value.type() == typeid(MemorySpace)) {
+            result[key.c_str()] = AnyCast<MemorySpace>(value, "converting to Python: " + key);
+          } else if (value.type() == typeid(TensorLayout)) {
+            result[key.c_str()] = AnyCast<TensorLayout>(value, "converting to Python: " + key);
           }
         }
         return result;
@@ -1005,7 +1011,8 @@ void BindIR(nb::module_& m) {
               nb::list py_kwargs_list;
               for (const auto& [key, val] : kwargs) {
                 nb::object py_val =
-                    AnyToPyObject<DataType, MemorySpace, bool, int, std::string, double>(val, key);
+                    AnyToPyObject<DataType, MemorySpace, TensorLayout, bool, int, std::string, double>(val,
+                                                                                                       key);
                 nb::tuple pair = nb::make_tuple(nb::cast(key), py_val);
                 py_kwargs_list.append(pair);
               }

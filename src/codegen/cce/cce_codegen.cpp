@@ -878,15 +878,17 @@ void CCECodegen::GenerateGlobalTensorTypeDeclaration(
   stride_alias << "using " << stride_type_name << " = " << stride_type << ";";
   emitter_.EmitLine(stride_alias.str());
 
-  // TODO(YunjiQin): layout should be determined by the tensor format
-  if (*shape_dims.rbegin() == 1) {
-    stride_type_name += ", Layout::DN";
+  // Generate layout
+  std::string layout = "Layout::ND";
+  if (tensor_type->tensor_view_.has_value()) {
+    auto tensor_layout = tensor_type->tensor_view_.value().layout;
+    layout = "Layout::" + ir::TensorLayoutToString(tensor_layout);
   }
 
   // Generate GlobalTensor type alias
   std::ostringstream global_type_alias;
   global_type_alias << "using " << global_type_name << " = GlobalTensor<" << element_type << ", "
-                    << shape_type_name << ", " << stride_type_name << ">;";
+                    << shape_type_name << ", " << stride_type_name << ", " << layout << ">;";
   emitter_.EmitLine(global_type_alias.str());
 
   // Generate GlobalTensor instance
@@ -898,7 +900,17 @@ void CCECodegen::GenerateGlobalTensorTypeDeclaration(
   if (tensor_struct_ptr.has_value()) {
     global_instance << ", {}, {";
     for (size_t i = 0; i < shape_dims.size(); i++) {
-      global_instance << "compute_stride(" << tensor_struct_ptr.value() << ", " << std::to_string(i) << ")";
+      // For DN layout, swap the last two stride indices to match transposed memory order
+      size_t stride_idx = i;
+      if (layout == "Layout::DN" && shape_dims.size() >= 2) {
+        if (i == shape_dims.size() - 2) {
+          stride_idx = shape_dims.size() - 1;
+        } else if (i == shape_dims.size() - 1) {
+          stride_idx = shape_dims.size() - 2;
+        }
+      }
+      global_instance << "compute_stride(" << tensor_struct_ptr.value() << ", " << std::to_string(stride_idx)
+                      << ")";
       if (i != shape_dims.size() - 1) {
         global_instance << ", ";
       }
