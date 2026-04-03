@@ -425,6 +425,25 @@ ExprPtr ResolveTileAlias(const ExprPtr& expr, const TileAliasMap& alias_map) {
   return current;
 }
 
+/// Visitor that collects all Var pointers used as RHS expressions.
+/// Overrides AssignStmt handling to skip LHS definitions — only captures actual uses.
+/// Uses IRVisitor's built-in recursion to handle nested control flow (IfStmt, ForStmt, etc.).
+class VarUseCollector : public IRVisitor {
+ public:
+  const std::unordered_set<const Var*>& uses() const { return uses_; }
+
+ protected:
+  void VisitExpr_(const VarPtr& op) override { uses_.insert(op.get()); }
+  void VisitExpr_(const IterArgPtr& op) override { uses_.insert(op.get()); }
+  void VisitStmt_(const AssignStmtPtr& op) override {
+    // Only visit RHS value, not LHS var — definitions are not uses.
+    VisitExpr(op->value_);
+  }
+
+ private:
+  std::unordered_set<const Var*> uses_;
+};
+
 /// Find the index of the YieldStmt in a flat statement list (backward search).
 /// Returns stmts.size() if not found.
 size_t FindYieldIndex(const std::vector<StmtPtr>& stmts) {
@@ -1621,6 +1640,35 @@ IncoreTransformResult TransformIncoreFunction(const FunctionPtr& func,
 
         then_stmts[then_yield_idx] = std::make_shared<YieldStmt>(new_then_yield_values, then_yield->span_);
         else_stmts[else_yield_idx] = std::make_shared<YieldStmt>(new_else_yield_values, else_yield->span_);
+
+        // Remove alias assignments for yield values replaced by store sinking,
+        // but only if the alias var has no remaining uses in the branch.
+        auto remove_dead_aliases = [&sink_candidates](std::vector<StmtPtr>& stmts, const YieldStmtPtr& yield,
+                                                      const TileAliasMap& alias_map) {
+          std::unordered_set<const Var*> candidates;
+          for (const auto& cand : sink_candidates) {
+            auto old_var = As<Var>(yield->value_[cand.ifstmt_rv_index]);
+            if (old_var && alias_map.count(old_var.get())) {
+              candidates.insert(old_var.get());
+            }
+          }
+          if (candidates.empty()) return;
+
+          // Full IR walk to collect all var uses (handles nested control flow).
+          // Only remove aliases whose var is truly unused.
+          VarUseCollector collector;
+          for (const auto& s : stmts) collector.VisitStmt(s);
+          const auto& used = collector.uses();
+          stmts.erase(std::remove_if(stmts.begin(), stmts.end(),
+                                     [&candidates, &used](const StmtPtr& s) {
+                                       auto assign = As<AssignStmt>(s);
+                                       return assign && candidates.count(assign->var_.get()) > 0 &&
+                                              used.count(assign->var_.get()) == 0;
+                                     }),
+                      stmts.end());
+        };
+        remove_dead_aliases(then_stmts, then_yield, then_alias_map);
+        remove_dead_aliases(else_stmts, else_yield, else_alias_map);
 
         auto new_then_body = SeqStmts::Flatten(std::move(then_stmts), last_if_stmt->then_body_->span_);
         auto new_else_body = SeqStmts::Flatten(std::move(else_stmts), (*last_if_stmt->else_body_)->span_);
