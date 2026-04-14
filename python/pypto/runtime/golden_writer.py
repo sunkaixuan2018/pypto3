@@ -13,17 +13,28 @@ Golden script writer for the PyPTO runtime module.
 Generates a ``golden.py`` file compatible with Simpler's CodeRunner from a list
 of :class:`TensorSpec` objects and a user-supplied golden function.
 
-Generated file format::
+:func:`write_golden` materialises all tensor data via
+:meth:`TensorSpec.create_tensor` and saves them as ``.pt`` files.  By default
+data goes to a ``data/`` directory co-located with ``golden.py``; an explicit
+``data_dir`` can redirect storage to any path.  When the target directory
+already contains the required files they are reused.  The generated
+``generate_inputs`` function loads tensors via ``torch.load``, ensuring
+deterministic and reproducible inputs across runs.
 
+Generated file format (data-file mode)::
+
+    from pathlib import Path
     import torch
+
+    _DATA_DIR = Path(__file__).parent / "data"
 
     __outputs__ = ["out"]
     RTOL = 1e-5
     ATOL = 1e-5
 
     def generate_inputs(params):
-        query = torch.randn((32, 128), dtype=torch.bfloat16)
-        out   = torch.zeros((32, 128), dtype=torch.float32)
+        query = torch.load(_DATA_DIR / "query.pt", weights_only=True)
+        out   = torch.load(_DATA_DIR / "out.pt", weights_only=True)
         return [
             ("query", query),
             ("out", out),
@@ -66,8 +77,17 @@ def write_golden(
     rtol: float = 1e-5,
     atol: float = 1e-5,
     scalar_specs: list[ScalarSpec] | None = None,
+    data_dir: Path | str | None = None,
 ) -> Path:
     """Generate and write a ``golden.py`` file for Simpler's CodeRunner.
+
+    By default, all tensor data is materialised and saved as ``.pt`` files in a
+    ``data/`` subdirectory alongside the generated ``golden.py``.
+
+    When *data_dir* is provided the generated ``golden.py`` always references
+    that directory.  If the directory already contains ``.pt`` files they are
+    reused; otherwise the directory is created and data files are generated
+    there.
 
     Args:
         tensor_specs: Ordered list of tensor specifications matching the program's
@@ -79,12 +99,34 @@ def write_golden(
         atol: Absolute tolerance used by CodeRunner for result comparison.
         scalar_specs: Optional list of scalar parameter specifications.  Scalar
             TaskArg entries appear after all tensor entries in the generated list.
+        data_dir: Target directory for ``.pt`` data files.  If the directory
+            exists and already contains data, it is reused without regeneration.
+            If it does not exist it is created and data is generated there.
+            The generated ``golden.py`` always references this path.
+            When ``None`` (default), data is saved to ``<output_path>/../data/``.
 
     Returns:
         The resolved ``output_path`` after writing.
     """
-    content = generate_golden_source(tensor_specs, golden_fn, rtol, atol, scalar_specs=scalar_specs)
     output_path = Path(output_path)
+    if data_dir is not None:
+        resolved_dir = Path(data_dir).resolve()
+    else:
+        resolved_dir = (output_path.parent / "data").resolve()
+
+    if not _data_dir_has_files(resolved_dir, tensor_specs):
+        data = _materialize_tensors(tensor_specs)
+        _save_data_files(data, resolved_dir)
+
+    content = generate_golden_source(
+        tensor_specs,
+        golden_fn,
+        rtol,
+        atol,
+        scalar_specs=scalar_specs,
+        data_dir=resolved_dir if data_dir is not None else None,
+        use_data_files=True,
+    )
     output_path.write_text(content, encoding="utf-8")
     return output_path
 
@@ -97,6 +139,8 @@ def generate_golden_source(
     *,
     compute_golden_src: str | None = None,
     scalar_specs: list[ScalarSpec] | None = None,
+    data_dir: Path | None = None,
+    use_data_files: bool = False,
 ) -> str:
     """Build the full content of golden.py as a string.
 
@@ -113,10 +157,19 @@ def generate_golden_source(
         scalar_specs: Optional list of scalar TaskArg specifications.  Entries are
             placed after all tensor entries in the returned list, matching the
             TaskArg slot order produced by orchestration codegen.
+        data_dir: When set, the generated ``_DATA_DIR`` constant uses this
+            absolute path.  When ``None`` and *use_data_files* is ``True``,
+            a portable ``Path(__file__).parent / "data"`` expression is used.
+        use_data_files: When ``True``, the generated ``generate_inputs``
+            loads all tensors from ``.pt`` files via ``torch.load``.
+            Defaults to ``False`` for backward compatibility with callers
+            that rely on inline expressions.
 
     Returns:
         Full Python source for ``golden.py`` as a string.
     """
+    emit_data_dir = use_data_files or data_dir is not None
+
     scalars = scalar_specs or []
     output_names = [spec.name for spec in tensor_specs if spec.is_output]
 
@@ -129,12 +182,14 @@ def generate_golden_source(
     imports = _compute_golden_imports(compute_golden_src)
     if scalars:
         imports.append("import ctypes")
+    if emit_data_dir:
+        imports.append("from pathlib import Path")
     imports.append("import torch")
 
     # Pre-compute init expressions so that helper function preambles (e.g. for
     # callable init_values) are collected before we start building the output.
     preambles: dict[str, str] = {}
-    init_exprs = [_init_expr(spec, preambles) for spec in tensor_specs]
+    init_exprs = [_init_expr(spec, preambles, use_data_dir=emit_data_dir) for spec in tensor_specs]
 
     lines: list[str] = [
         '"""',
@@ -144,11 +199,24 @@ def generate_golden_source(
         '"""',
         "",
         *imports,
-        "",
-        f"__outputs__ = {output_names!r}",
-        f"RTOL = {rtol}",
-        f"ATOL = {atol}",
     ]
+
+    if emit_data_dir:
+        lines.append("")
+        if data_dir is not None:
+            escaped = str(data_dir).replace("\\", "\\\\")
+            lines.append(f'_DATA_DIR = Path("{escaped}")')
+        else:
+            lines.append('_DATA_DIR = Path(__file__).parent / "data"')
+
+    lines.extend(
+        [
+            "",
+            f"__outputs__ = {output_names!r}",
+            f"RTOL = {rtol}",
+            f"ATOL = {atol}",
+        ]
+    )
 
     # Helper functions referenced by init expressions (e.g. copied from
     # callable init_values).
@@ -191,6 +259,27 @@ def generate_golden_source(
 # ---------------------------------------------------------------------------
 
 
+def _data_dir_has_files(data_dir: Path, tensor_specs: list[TensorSpec]) -> bool:
+    """Return ``True`` if *data_dir* already contains all required ``.pt`` files."""
+    if not data_dir.is_dir():
+        return False
+    return all((data_dir / f"{spec.name}.pt").exists() for spec in tensor_specs)
+
+
+def _materialize_tensors(tensor_specs: list[TensorSpec]) -> dict[str, torch.Tensor]:
+    """Create concrete tensors from specs and return them keyed by name."""
+    return {spec.name: spec.create_tensor() for spec in tensor_specs}
+
+
+def _save_data_files(data_files: dict[str, torch.Tensor], data_dir: Path) -> None:
+    """Save materialised tensors to ``data_dir/{name}.pt``."""
+    if not data_files:
+        return
+    data_dir.mkdir(parents=True, exist_ok=True)
+    for name, tensor in data_files.items():
+        torch.save(tensor, data_dir / f"{name}.pt")
+
+
 def _compute_golden_imports(compute_golden_src: str) -> list[str]:
     """Return import lines required by the generated compute_golden body."""
     return [
@@ -200,13 +289,24 @@ def _compute_golden_imports(compute_golden_src: str) -> list[str]:
     ]
 
 
-def _init_expr(spec: TensorSpec, preambles: dict[str, str]) -> str:
+def _init_expr(
+    spec: TensorSpec,
+    preambles: dict[str, str],
+    *,
+    use_data_dir: bool = False,
+) -> str:
     """Return the Python expression (string) used to initialise this tensor in golden.py.
 
-    For callable init_values that are not built-in factories, the function
-    source is extracted and appended to *preambles* so it can be emitted
-    before ``generate_inputs`` in the generated file.
+    When *use_data_dir* is ``True``, returns a ``torch.load(...)`` expression
+    referencing a ``.pt`` file via the ``_DATA_DIR`` constant.
+
+    When ``False`` (legacy mode), callable init_values that are not built-in
+    factories have their source extracted and appended to *preambles* for
+    emission before ``generate_inputs``.
     """
+    if use_data_dir:
+        return f'torch.load(_DATA_DIR / "{spec.name}.pt", weights_only=True)'
+
     dtype_str = _torch_dtype_str(spec.dtype)
     shape_str = repr(tuple(spec.shape))
 
