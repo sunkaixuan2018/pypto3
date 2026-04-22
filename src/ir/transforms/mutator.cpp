@@ -193,7 +193,10 @@ ExprPtr IRMutator::VisitExpr_(const CallPtr& op) {
   }
 
   if (changed) {
-    return std::make_shared<const Call>(op->op_, std::move(new_args), op->kwargs_, op->GetType(), op->span_);
+    // Preserve attrs_ across mutation: callers of the base mutator should not lose
+    // compiler-internal metadata (e.g., arg_directions) when only argument expressions change.
+    return std::make_shared<const Call>(op->op_, std::move(new_args), op->kwargs_, op->attrs_, op->GetType(),
+                                        op->span_);
   }
   return op;
 }

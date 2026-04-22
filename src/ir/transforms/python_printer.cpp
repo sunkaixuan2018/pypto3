@@ -492,6 +492,27 @@ void IRPythonPrinter::VisitExpr_(const ConstFloatPtr& op) {
 
 void IRPythonPrinter::VisitExpr_(const ConstBoolPtr& op) { stream_ << (op->value_ ? "True" : "False"); }
 
+// Lowercase-snake-case names for ArgDirection used by the DSL helpers in
+// ``pypto.language.arg_direction`` (``pl.adir.<name>``). Kept in sync with
+// ``python/pypto/language/arg_direction.py::NAME_TO_DIRECTION``.
+static const char* ArgDirectionToDslName(ArgDirection dir) {
+  switch (dir) {
+    case ArgDirection::Input:
+      return "input";
+    case ArgDirection::Output:
+      return "output";
+    case ArgDirection::OutputExisting:
+      return "output_existing";
+    case ArgDirection::InOut:
+      return "inout";
+    case ArgDirection::NoDep:
+      return "no_dep";
+    case ArgDirection::Scalar:
+      return "scalar";
+  }
+  throw pypto::TypeError("Unknown ArgDirection in printer");
+}
+
 void IRPythonPrinter::VisitExpr_(const CallPtr& op) {
   INTERNAL_CHECK_SPAN(op->op_, op->span_) << "Call has null op";
   // Check if this is a GlobalVar call within a Program context
@@ -501,10 +522,28 @@ void IRPythonPrinter::VisitExpr_(const CallPtr& op) {
       // This is a cross-function call - print as self.method_name()
       stream_ << "self." << gvar->name_ << "(";
 
-      // Print positional arguments
       for (size_t i = 0; i < op->args_.size(); ++i) {
         if (i > 0) stream_ << ", ";
         VisitExpr(op->args_[i]);
+      }
+
+      // When ``attrs_["arg_directions"]`` is populated (post DeriveCallDirections),
+      // surface the direction vector as a trailing ``attrs={"arg_directions": [...]}``
+      // keyword so the parser can recover it on the round-trip. When empty
+      // (legacy / pre-derive) keep the call bare for back-compatibility.
+      // A non-empty vector with a mismatched size is invalid IR — fail loudly
+      // instead of silently dropping the metadata.
+      auto call_arg_directions = op->GetArgDirections();
+      if (!call_arg_directions.empty()) {
+        INTERNAL_CHECK_SPAN(call_arg_directions.size() == op->args_.size(), op->span_)
+            << "Call arg_directions size (" << call_arg_directions.size() << ") must match args size ("
+            << op->args_.size() << ")";
+        stream_ << ", attrs={\"arg_directions\": [";
+        for (size_t i = 0; i < call_arg_directions.size(); ++i) {
+          if (i > 0) stream_ << ", ";
+          stream_ << prefix_ << ".adir." << ArgDirectionToDslName(call_arg_directions[i]);
+        }
+        stream_ << "]}";
       }
 
       stream_ << ")";

@@ -770,6 +770,33 @@ class ParamDirection(enum.Enum):
     InOut = ...
     """Read-write input/output."""
 
+class ArgDirection(enum.Enum):
+    """Call-site argument direction (mirrors runtime TensorArgType one-to-one).
+
+    Distinct from `ParamDirection` (callee function-signature contract).
+    `ArgDirection` describes the call-site task-submission behavior:
+    which runtime API to invoke, what dependency edges to establish,
+    and whether the buffer is allocated by the runtime.
+    """
+
+    Input = ...
+    """Read-only input → add_input / TensorArgType::INPUT."""
+
+    Output = ...
+    """Runtime-allocated output buffer → add_output(create_info) / TensorArgType::OUTPUT."""
+
+    InOut = ...
+    """Read-then-write → add_inout / TensorArgType::INOUT."""
+
+    OutputExisting = ...
+    """Write-only into an existing tensor → add_output(tensor) / TensorArgType::OUTPUT_EXISTING."""
+
+    NoDep = ...
+    """No-dependency existing tensor → add_no_dep / TensorArgType::NO_DEP."""
+
+    Scalar = ...
+    """Scalar (non-tensor) argument → add_scalar."""
+
 class ForKind(enum.Enum):
     """For loop kind classification.
 
@@ -1043,6 +1070,26 @@ class Call(Expr):
     args: Final[Sequence[Expr]]
     """Positional arguments."""
 
+    @property
+    def arg_directions(self) -> Sequence[ArgDirection]:
+        """Resolved per-argument call-site directions.
+
+        Stored under ``attrs['arg_directions']``. Returns an empty list when
+        not yet derived (legacy / pre-DeriveCallDirections state). When non-empty
+        the length must match ``args`` and is the source of truth for runtime
+        task-submission semantics.
+        """
+
+    @property
+    def attrs(self) -> Mapping[str, Any]:
+        """Compiler-internal node metadata.
+
+        Reserved keys:
+
+        - ``"arg_directions"`` -> ``list[ArgDirection]`` (use the
+          :attr:`arg_directions` shortcut for typed access).
+        """
+
     kwargs: Final[Mapping[str, int | bool | str | float | DataType | MemorySpace | PadValue]]
     """Keyword arguments (metadata)."""
 
@@ -1109,6 +1156,29 @@ class Call(Expr):
             op: Operation/function to call
             args: List of argument expressions
             kwargs: Keyword arguments (metadata)
+            type: Explicit result type
+            span: Source location
+        """
+        ...
+
+    @overload
+    def __init__(
+        self,
+        op: Op,
+        args: Sequence[Expr],
+        kwargs: Mapping[str, int | bool | str | float | DataType | MemorySpace | PadValue],
+        attrs: Mapping[str, object] | Sequence[tuple[str, object]] | None,
+        type: Type,
+        span: Span,
+    ) -> None:
+        """Create a function call expression with kwargs, explicit attrs and type.
+
+        Args:
+            op: Operation/function to call
+            args: List of argument expressions
+            kwargs: Keyword arguments (metadata)
+            attrs: Compiler-internal node metadata. Reserved keys:
+                ``"arg_directions"`` -> ``Sequence[ArgDirection]``.
             type: Explicit result type
             span: Source location
         """

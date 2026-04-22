@@ -511,6 +511,36 @@ class StructuralEqualImpl {
     return true;
   }
 
+  result_type VisitLeafField(const ArgDirection& lhs, const ArgDirection& rhs) {
+    if (lhs != rhs) {
+      if constexpr (AssertMode) {
+        std::ostringstream msg;
+        msg << "ArgDirection mismatch (" << ArgDirectionToString(lhs) << " != " << ArgDirectionToString(rhs)
+            << ")";
+        ThrowMismatch(msg.str(), IRNodePtr(), IRNodePtr(), "", "");
+      }
+      return false;
+    }
+    return true;
+  }
+
+  result_type VisitLeafField(const std::vector<ArgDirection>& lhs, const std::vector<ArgDirection>& rhs) {
+    if (lhs.size() != rhs.size()) {
+      if constexpr (AssertMode) {
+        std::ostringstream msg;
+        msg << "ArgDirection vector size mismatch (" << lhs.size() << " != " << rhs.size() << ")";
+        ThrowMismatch(msg.str(), IRNodePtr(), IRNodePtr(), "", "");
+      }
+      return false;
+    }
+    for (size_t i = 0; i < lhs.size(); ++i) {
+      if (!VisitLeafField(lhs[i], rhs[i])) {
+        return false;
+      }
+    }
+    return true;
+  }
+
   // Compare kwargs (vector of pairs to preserve order)
   result_type VisitLeafField(const std::vector<std::pair<std::string, std::any>>& lhs,
                              const std::vector<std::pair<std::string, std::any>>& rhs) {
@@ -578,6 +608,12 @@ class StructuralEqualImpl {
       } else if (lhs_val.type() == typeid(float)) {
         values_equal = (AnyCast<float>(lhs_val, "comparing kwarg: " + lhs[i].first) ==
                         AnyCast<float>(rhs_val, "comparing kwarg: " + lhs[i].first));
+      } else if (lhs_val.type() == typeid(std::vector<ArgDirection>)) {
+        const auto& lhs_dirs =
+            AnyCast<std::vector<ArgDirection>>(lhs_val, "comparing kwarg: " + lhs[i].first);
+        const auto& rhs_dirs =
+            AnyCast<std::vector<ArgDirection>>(rhs_val, "comparing kwarg: " + lhs[i].first);
+        values_equal = VisitLeafField(lhs_dirs, rhs_dirs);
       } else {
         INTERNAL_CHECK(false) << "Unsupported kwargs value type for key '" << lhs[i].first
                               << "': " << DemangleTypeName(lhs_val.type().name());

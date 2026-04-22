@@ -321,16 +321,108 @@ class IterArg : public Var {
 using IterArgPtr = std::shared_ptr<const IterArg>;
 
 /**
+ * @brief Call-site argument direction classification
+ *
+ * Models the runtime task-submission semantics for each positional argument of a Call.
+ * Mirrors the runtime TensorArgType enum (INPUT/OUTPUT/INOUT/OUTPUT_EXISTING/NO_DEP)
+ * one-to-one, plus a Scalar tag for non-tensor arguments.
+ *
+ * Distinct from `ParamDirection` (which lives on the callee Function and describes
+ * the function-signature contract — "I read/write this parameter"). `ArgDirection`
+ * describes the call-site task behavior — "this submission establishes these
+ * dependencies and uses this memory ownership model".
+ *
+ * - Input:           Read-only input → runtime add_input, TensorArgType::INPUT
+ * - Output:          Runtime allocates a new buffer → add_output(create_info),
+ *                    TensorArgType::OUTPUT
+ * - InOut:           Read-then-write → add_inout, TensorArgType::INOUT
+ * - OutputExisting:  Write into an already-existing tensor (skips OverlapMap,
+ *                    keeps creator dependency) → add_output(tensor),
+ *                    TensorArgType::OUTPUT_EXISTING
+ * - NoDep:           No-dependency existing tensor (skips OverlapMap, no publish)
+ *                    → add_no_dep, TensorArgType::NO_DEP
+ * - Scalar:          Non-tensor scalar argument → add_scalar (must follow all
+ *                    tensors in the runtime arg list)
+ */
+enum class ArgDirection : uint8_t {
+  Input = 0,           ///< Read-only input (default for tensors)
+  Output = 1,          ///< Runtime-allocated output buffer
+  InOut = 2,           ///< Read-then-write
+  OutputExisting = 3,  ///< Write-only into an existing tensor
+  NoDep = 4,           ///< No-dependency existing tensor
+  Scalar = 5,          ///< Scalar (non-tensor) argument
+};
+
+/**
+ * @brief Convert ArgDirection to string
+ */
+inline std::string ArgDirectionToString(ArgDirection dir) {
+  switch (dir) {
+    case ArgDirection::Input:
+      return "Input";
+    case ArgDirection::Output:
+      return "Output";
+    case ArgDirection::InOut:
+      return "InOut";
+    case ArgDirection::OutputExisting:
+      return "OutputExisting";
+    case ArgDirection::NoDep:
+      return "NoDep";
+    case ArgDirection::Scalar:
+      return "Scalar";
+  }
+  throw pypto::TypeError("Unknown ArgDirection");
+}
+
+/**
+ * @brief Convert string to ArgDirection
+ */
+inline ArgDirection StringToArgDirection(const std::string& str) {
+  if (str == "Input") {
+    return ArgDirection::Input;
+  } else if (str == "Output") {
+    return ArgDirection::Output;
+  } else if (str == "InOut") {
+    return ArgDirection::InOut;
+  } else if (str == "OutputExisting") {
+    return ArgDirection::OutputExisting;
+  } else if (str == "NoDep") {
+    return ArgDirection::NoDep;
+  } else if (str == "Scalar") {
+    return ArgDirection::Scalar;
+  }
+  throw pypto::TypeError("Unknown ArgDirection: " + str);
+}
+
+/**
+ * @brief Reserved attrs key for call-site argument directions
+ *
+ * The value stored under this key is a `std::vector<ArgDirection>` whose length
+ * matches `Call::args_`. See `Call::GetArgDirections` for details.
+ */
+inline constexpr const char* kAttrArgDirections = "arg_directions";
+
+/**
  * @brief Function call expression
  *
  * Represents a function call with an operation and arguments.
  * Can accept any Expr as arguments, not just scalar expressions.
- * Supports keyword arguments (kwargs) for operator metadata.
+ * Supports keyword arguments (kwargs) for operator metadata, plus a generic
+ * `attrs_` map for compiler-internal node metadata (e.g., call-site argument
+ * directions). Both containers share the `vector<pair<string, any>>` shape so
+ * they reuse the same serialization / structural-comparison machinery.
+ *
+ * Call-site argument directions are stored as an optional attr under the
+ * reserved key `kAttrArgDirections` (value type: `std::vector<ArgDirection>`).
+ * Absence means legacy / pre-DeriveCallDirections state; consumers that require
+ * resolved call-site behavior (codegen, runtime task submission) must run
+ * DeriveCallDirections before they observe the IR.
  */
 class Call : public Expr {
  public:
   OpPtr op_;                                              // Operation/function
   std::vector<ExprPtr> args_;                             // Positional arguments
+  std::vector<std::pair<std::string, std::any>> attrs_;   // Compiler-internal metadata (ordered)
   std::vector<std::pair<std::string, std::any>> kwargs_;  // Keyword arguments (metadata, ordered)
 
   /**
@@ -341,7 +433,7 @@ class Call : public Expr {
    * @param span Source location
    */
   Call(OpPtr op, std::vector<ExprPtr> args, Span span)
-      : Expr(std::move(span)), op_(std::move(op)), args_(std::move(args)), kwargs_() {}
+      : Expr(std::move(span)), op_(std::move(op)), args_(std::move(args)), attrs_(), kwargs_() {}
 
   /**
    * @brief Create a function call expression with explicit type
@@ -352,7 +444,11 @@ class Call : public Expr {
    * @param span Source location
    */
   Call(OpPtr op, std::vector<ExprPtr> args, TypePtr type, Span span)
-      : Expr(std::move(span), std::move(type)), op_(std::move(op)), args_(std::move(args)), kwargs_() {}
+      : Expr(std::move(span), std::move(type)),
+        op_(std::move(op)),
+        args_(std::move(args)),
+        attrs_(),
+        kwargs_() {}
 
   /**
    * @brief Create a function call expression with kwargs
@@ -363,7 +459,11 @@ class Call : public Expr {
    * @param span Source location
    */
   Call(OpPtr op, std::vector<ExprPtr> args, std::vector<std::pair<std::string, std::any>> kwargs, Span span)
-      : Expr(std::move(span)), op_(std::move(op)), args_(std::move(args)), kwargs_(std::move(kwargs)) {}
+      : Expr(std::move(span)),
+        op_(std::move(op)),
+        args_(std::move(args)),
+        attrs_(),
+        kwargs_(std::move(kwargs)) {}
 
   /**
    * @brief Create a function call expression with kwargs and explicit type
@@ -379,7 +479,31 @@ class Call : public Expr {
       : Expr(std::move(span), std::move(type)),
         op_(std::move(op)),
         args_(std::move(args)),
+        attrs_(),
         kwargs_(std::move(kwargs)) {}
+
+  /**
+   * @brief Create a function call expression with attrs, kwargs, and explicit type
+   *
+   * @param op Operation/function to call
+   * @param args List of argument expressions
+   * @param kwargs Keyword arguments (metadata)
+   * @param attrs Compiler-internal metadata (e.g., reserved key `arg_directions`)
+   * @param type Result type of the call
+   * @param span Source location
+   *
+   * Validates that, when present, `attrs[kAttrArgDirections]` is a
+   * `std::vector<ArgDirection>` with the same length as `args`.
+   */
+  Call(OpPtr op, std::vector<ExprPtr> args, std::vector<std::pair<std::string, std::any>> kwargs,
+       std::vector<std::pair<std::string, std::any>> attrs, TypePtr type, Span span)
+      : Expr(std::move(span), std::move(type)),
+        op_(std::move(op)),
+        args_(std::move(args)),
+        attrs_(std::move(attrs)),
+        kwargs_(std::move(kwargs)) {
+    ValidateArgDirectionsAttr();
+  }
 
   /**
    * @brief Get a kwarg value with type checking
@@ -414,23 +538,109 @@ class Call : public Expr {
     return false;
   }
 
+  /**
+   * @brief Get an attr value with type checking
+   *
+   * @tparam T Type of the attr value
+   * @param key Attr key
+   * @param default_value Default value if key doesn't exist
+   * @return The attr value or default
+   */
+  template <typename T>
+  [[nodiscard]] T GetAttr(const std::string& key, const T& default_value = T{}) const {
+    for (const auto& [k, v] : attrs_) {
+      if (k == key) {
+        return AnyCast<T>(v, "attr key: " + key);
+      }
+    }
+    return default_value;
+  }
+
+  /**
+   * @brief Check if an attr exists
+   *
+   * @param key Attr key
+   * @return true if the attr exists
+   */
+  [[nodiscard]] bool HasAttr(const std::string& key) const {
+    for (const auto& [k, v] : attrs_) {
+      if (k == key) {
+        return true;
+      }
+    }
+    return false;
+  }
+
+  /**
+   * @brief Check if call-site arg directions have been resolved
+   *
+   * @return true if attrs_ contains a non-empty arg_directions vector
+   */
+  [[nodiscard]] bool HasArgDirections() const { return HasAttr(kAttrArgDirections); }
+
+  /**
+   * @brief Get the resolved call-site arg directions
+   *
+   * @return Per-argument directions, or empty vector if not yet resolved.
+   */
+  [[nodiscard]] std::vector<ArgDirection> GetArgDirections() const {
+    return GetAttr<std::vector<ArgDirection>>(kAttrArgDirections);
+  }
+
   [[nodiscard]] ObjectKind GetKind() const override { return ObjectKind::Call; }
   [[nodiscard]] std::string TypeName() const override { return "Call"; }
 
   /**
    * @brief Get field descriptors for reflection-based visitation
    *
-   * @return Tuple of field descriptors (op, args, and kwargs as USUAL fields)
+   * @return Tuple of field descriptors (op, args, attrs, and kwargs as USUAL fields)
    */
   static constexpr auto GetFieldDescriptors() {
     return std::tuple_cat(Expr::GetFieldDescriptors(),
                           std::make_tuple(reflection::UsualField(&Call::op_, "op"),
                                           reflection::UsualField(&Call::args_, "args"),
+                                          reflection::UsualField(&Call::attrs_, "attrs"),
                                           reflection::UsualField(&Call::kwargs_, "kwargs")));
+  }
+
+ private:
+  void ValidateArgDirectionsAttr() const {
+    for (const auto& [k, v] : attrs_) {
+      if (k != kAttrArgDirections) {
+        continue;
+      }
+      if (v.type() != typeid(std::vector<ArgDirection>)) {
+        throw pypto::TypeError("Call attrs['" + std::string(kAttrArgDirections) +
+                               "'] must be std::vector<ArgDirection>");
+      }
+      const auto& dirs = AnyCast<std::vector<ArgDirection>>(v, "attr key: arg_directions");
+      if (!dirs.empty() && dirs.size() != args_.size()) {
+        throw pypto::TypeError("Call attrs['arg_directions'] size (" + std::to_string(dirs.size()) +
+                               ") must match args size (" + std::to_string(args_.size()) + ")");
+      }
+      return;
+    }
   }
 };
 
 using CallPtr = std::shared_ptr<const Call>;
+
+/**
+ * @brief Build a copy of `attrs` with `kAttrArgDirections` set to `dirs`
+ *
+ * Replaces an existing entry if present; otherwise appends.
+ */
+inline std::vector<std::pair<std::string, std::any>> WithArgDirectionsAttr(
+    std::vector<std::pair<std::string, std::any>> attrs, std::vector<ArgDirection> dirs) {
+  for (auto& [k, v] : attrs) {
+    if (k == kAttrArgDirections) {
+      v = std::move(dirs);
+      return attrs;
+    }
+  }
+  attrs.emplace_back(kAttrArgDirections, std::move(dirs));
+  return attrs;
+}
 
 /**
  * @brief Expression to create a tuple from multiple expressions
