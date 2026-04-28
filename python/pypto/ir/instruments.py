@@ -15,6 +15,18 @@ from pypto.pypto_core import ir as _ir
 from pypto.pypto_core import passes as _passes
 
 
+_NON_ROUNDTRIPPABLE_PASS_REASONS = {
+    "IdentifyStableRegions": (
+        "adds compiler-only stable-region attrs consumed by "
+        "LowerStableRegionsToManualScope/codegen"
+    ),
+    "LowerStableRegionsToManualScope": (
+        "produces compiler-generated ManualScopeStmt nodes that have no "
+        "user-facing DSL construction path"
+    ),
+}
+
+
 def make_roundtrip_instrument() -> _passes.CallbackInstrument:
     """Create a CallbackInstrument that verifies print→parse roundtrip after each pass.
 
@@ -42,6 +54,13 @@ def make_roundtrip_instrument() -> _passes.CallbackInstrument:
         from pypto.language.parser.text_parser import parse  # noqa: PLC0415
 
         pass_name = pass_obj.get_name()
+        if pass_name in _NON_ROUNDTRIPPABLE_PASS_REASONS:
+            warnings.warn(
+                f"[RoundtripInstrument] Skipping roundtrip after '{pass_name}' — "
+                f"{_NON_ROUNDTRIPPABLE_PASS_REASONS[pass_name]}.",
+                stacklevel=2,
+            )
+            return
 
         # --- Step 1: print ---
         try:

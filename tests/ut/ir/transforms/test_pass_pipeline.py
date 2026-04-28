@@ -503,6 +503,29 @@ class TestReportInstrument:
 class TestRoundtripInstrument:
     """Test RoundtripInstrument error formatting."""
 
+    @pytest.mark.parametrize(
+        ("pass_factory", "pass_name"),
+        [
+            (passes.identify_stable_regions, "IdentifyStableRegions"),
+            (passes.lower_stable_regions_to_manual_scope, "LowerStableRegionsToManualScope"),
+        ],
+    )
+    def test_compiler_only_passes_skip_roundtrip(self, pass_factory, pass_name):
+        """RoundtripInstrument skips compiler-only stable-region intermediate forms."""
+        from unittest import mock  # noqa: PLC0415
+
+        from pypto.ir.instruments import make_roundtrip_instrument  # noqa: PLC0415
+
+        instrument = make_roundtrip_instrument()
+
+        with mock.patch("pypto.language.parser.text_parser.parse") as parse_mock:
+            parse_mock.side_effect = AssertionError("non-roundtrippable pass should not parse")
+            with pytest.warns(UserWarning, match=f"Skipping roundtrip after '{pass_name}'"):
+                with passes.PassContext([instrument]):
+                    pass_factory()(_make_non_ssa_program())
+
+        parse_mock.assert_not_called()
+
     def test_parse_failure_no_ir_dump(self):
         """RoundtripInstrument error does not include full IR dump when parse fails."""
         from unittest import mock  # noqa: PLC0415
