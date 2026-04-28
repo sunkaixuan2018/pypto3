@@ -32,8 +32,17 @@ std::string LowerAscii(std::string value) {
 }  // namespace
 
 const std::vector<StableRegionTemplate>& GetStableRegionTemplates() {
+  using ir::ArgDirection;
   static const std::vector<StableRegionTemplate> templates = {
-      {"paged_attention_qk_softmax_pv_update", {"qk", "softmax", "pv", "update"}},
+      {"paged_attention_qk_softmax_pv_update", {"qk", "softmax", "pv", "update"}, {}},
+      {"bgemm_tile_add_bgemm_tile_add",
+       {"bgemm", "tile_add", "bgemm", "tile_add"},
+       {
+           {ArgDirection::Input, ArgDirection::Input, ArgDirection::OutputExisting},
+           {ArgDirection::Input, ArgDirection::Input, ArgDirection::OutputExisting},
+           {ArgDirection::Input, ArgDirection::Input, ArgDirection::OutputExisting},
+           {ArgDirection::Input, ArgDirection::Input, ArgDirection::OutputExisting},
+       }},
   };
   return templates;
 }

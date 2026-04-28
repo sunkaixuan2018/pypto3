@@ -43,6 +43,7 @@ using ::pypto::codegen::IsBuiltinOp;
 using ::pypto::codegen::IsTensorOp;
 using ::pypto::codegen::orchestration::GetStableRegionTemplates;
 using ::pypto::codegen::orchestration::KernelNameMatchesToken;
+using ::pypto::codegen::orchestration::StableRegionTemplate;
 
 struct RegionCallAttrs {
   std::string template_key;
@@ -83,6 +84,30 @@ ArgDirection GetArgDirectionOrDefault(const CallPtr& call, size_t arg_index) {
       << "Call arg_directions size (" << directions.size() << ") must match args size ("
       << call->args_.size() << ")";
   return directions[arg_index];
+}
+
+bool ArgDirectionsMatchPattern(const CallPtr& call, const std::vector<ArgDirection>& expected) {
+  if (expected.empty()) {
+    return true;
+  }
+  auto actual = call->GetArgDirections();
+  if (actual.size() != expected.size()) {
+    return false;
+  }
+  return actual == expected;
+}
+
+bool TemplateStageMatchesCall(const StableRegionTemplate& templ, size_t stage_index, const CallPtr& call) {
+  if (!KernelNameMatchesToken(call->op_->name_, templ.kernel_name_tokens[stage_index])) {
+    return false;
+  }
+  if (templ.arg_direction_patterns.empty()) {
+    return true;
+  }
+  INTERNAL_CHECK(templ.arg_direction_patterns.size() == templ.kernel_name_tokens.size())
+      << "Internal error: stable-region template '" << templ.template_key
+      << "' arg_direction_patterns size must match kernel_name_tokens size";
+  return ArgDirectionsMatchPattern(call, templ.arg_direction_patterns[stage_index]);
 }
 
 std::vector<const Var*> CollectExprVarUses(const ExprPtr& expr) {
@@ -292,19 +317,19 @@ class StableRegionIdentifier : public IRMutator {
           continue;
         }
 
-        bool token_match = true;
+        bool stage_match = true;
         std::unordered_set<const Stmt*> task_stmts;
         for (size_t j = 0; j < tokens.size(); ++j) {
           const auto& stmt = seq->stmts_[task_stmt_indices[task_pos + j]];
           auto call = GetDirectCall(stmt);
           INTERNAL_CHECK(call) << "Internal error: task index without direct call";
-          if (!KernelNameMatchesToken(call->op_->name_, tokens[j])) {
-            token_match = false;
+          if (!TemplateStageMatchesCall(templ, j, call)) {
+            stage_match = false;
             break;
           }
           task_stmts.insert(stmt.get());
         }
-        if (!token_match) {
+        if (!stage_match) {
           continue;
         }
 

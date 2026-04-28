@@ -15,6 +15,8 @@
 #include <string>
 #include <vector>
 
+#include "pypto/ir/expr.h"
+
 namespace pypto {
 namespace codegen {
 namespace orchestration {
@@ -22,6 +24,7 @@ namespace orchestration {
 struct StableRegionTemplate {
   std::string template_key;
   std::vector<std::string> kernel_name_tokens;
+  std::vector<std::vector<ir::ArgDirection>> arg_direction_patterns;
 };
 
 const std::vector<StableRegionTemplate>& GetStableRegionTemplates();
