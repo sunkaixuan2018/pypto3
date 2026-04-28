@@ -139,6 +139,8 @@ set(PYPTO_SOURCES
     src/ir/transforms/convert_tensor_to_tile_ops_pass.cpp
     src/ir/transforms/optimize_orch_tensors_pass.cpp
     src/ir/transforms/derive_call_directions_pass.cpp
+    src/ir/transforms/identify_stable_regions_pass.cpp
+    src/ir/transforms/lower_stable_regions_to_manual_scope_pass.cpp
     src/ir/transforms/convert_to_ssa_pass.cpp
     src/ir/transforms/ctrl_flow_transform_pass.cpp
     src/ir/transforms/flatten_call_expr_pass.cpp
@@ -216,6 +218,7 @@ set(PYPTO_SOURCES
     src/codegen/codegen_base.cpp
     src/codegen/orchestration/orchestration_analysis.cpp
     src/codegen/orchestration/orchestration_codegen.cpp
+    src/codegen/orchestration/template_registry.cpp
     src/codegen/orchestration_op_registry.cpp
     src/codegen/pto/pto_codegen.cpp
     src/codegen/pto/pto_control_flow_codegen.cpp

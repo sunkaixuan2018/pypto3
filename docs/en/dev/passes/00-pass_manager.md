@@ -76,6 +76,9 @@ struct PassProperties {
 | MemoryReuse | TypeChecked, SplitIncoreOrch, IncoreTileOps, HasMemRefs, TileOps2D | — | — |
 | AllocateMemoryAddr | TypeChecked, SplitIncoreOrch, IncoreTileOps, HasMemRefs, TileOps2D | AllocatedMemoryAddr | — |
 | FuseCreateAssembleToSlice | — | — | — |
+| DeriveCallDirections | SplitIncoreOrch | CallDirectionsResolved | — |
+| IdentifyStableRegions | CallDirectionsResolved, NormalizedStmtStructure | CallDirectionsResolved, NormalizedStmtStructure | — |
+| LowerStableRegionsToManualScope | CallDirectionsResolved, NormalizedStmtStructure | CallDirectionsResolved, NormalizedStmtStructure | — |
 | Simplify | — | — | — |
 
 > **Note**: VerifySSA and TypeCheck are **PropertyVerifiers** (verification rules), not Passes. They run via `VerificationInstrument` or the `run_verifier()` utility — see [Verifier](99-verifier.md).
@@ -374,7 +377,10 @@ The PTO-oriented tile stage shared by `Default` and `DebugTileOptimization` is:
 11. `LegalizePTOBufferReuse`
 12. `AllocateMemoryAddr`
 13. `FuseCreateAssembleToSlice`
-14. `Simplify`
+14. `DeriveCallDirections`
+15. `Simplify`
+16. `IdentifyStableRegions`
+17. `LowerStableRegionsToManualScope`
 
 `DebugTileOptimization` is a debug-only strategy for inspecting this tile stage
 without the tensor-only prefix passes. Use `Default` for normal compilation and

@@ -498,6 +498,23 @@ Pass FuseCreateAssembleToSlice();
 Pass DeriveCallDirections();
 
 /**
+ * @brief Identify stable orchestration call regions that can use manual scope lowering.
+ *
+ * The initial registry recognizes PagedAttention-like qk -> softmax -> pv -> update
+ * call sequences by kernel-name tokens. It annotates matched calls with
+ * stable_region_template_key, manual_task_index, and manual_dep_indices.
+ */
+Pass IdentifyStableRegions();
+
+/**
+ * @brief Lower identified stable orchestration regions into ManualScopeStmt.
+ *
+ * Consumes attrs produced by IdentifyStableRegions and wraps each matched
+ * structured region so orchestration codegen emits PTO2 manual scopes.
+ */
+Pass LowerStableRegionsToManualScope();
+
+/**
  * @brief Verify properties on a program and throw on errors
  *
  * Uses PropertyVerifierRegistry to verify the given properties and throws

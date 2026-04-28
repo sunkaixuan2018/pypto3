@@ -213,6 +213,16 @@ std::vector<std::pair<std::string, std::any>> DeserializeKwargs(const msgpack::o
           dirs.push_back(static_cast<ArgDirection>(code));
         }
         kwargs.emplace_back(key, std::move(dirs));
+      } else if (type_name == "IntVector") {
+        if (!has_value_obj || value_obj_inner.type != msgpack::type::ARRAY) {
+          throw TypeError("IntVector kwarg '" + key + "' must have ARRAY value");
+        }
+        std::vector<int> values;
+        values.reserve(value_obj_inner.via.array.size);
+        for (uint32_t j = 0; j < value_obj_inner.via.array.size; ++j) {
+          values.push_back(value_obj_inner.via.array.ptr[j].as<int>());
+        }
+        kwargs.emplace_back(key, std::move(values));
       } else if (type_name == "TensorLayout") {
         if (value_str.empty()) {
           throw TypeError("Missing 'value' field for TensorLayout kwarg: " + key);
@@ -723,6 +733,24 @@ static IRNodePtr DeserializeSpmdScopeStmt(const msgpack::object& fields_obj, msg
                                          DeserializeLeadingComments(fields_obj));
 }
 
+// Deserialize ManualScopeStmt
+static IRNodePtr DeserializeManualScopeStmt(const msgpack::object& fields_obj, msgpack::zone& zone,
+                                            DeserializerContext& ctx) {
+  auto span = ctx.DeserializeSpan(GET_FIELD_OBJ("span"));
+  auto name_hint = DeserializeScopeNameHint(fields_obj, ctx);
+  auto body = std::static_pointer_cast<const Stmt>(ctx.DeserializeNode(GET_FIELD_OBJ("body"), zone));
+  std::string template_key = GET_FIELD(std::string, "template_key");
+
+  std::optional<int> template_version = std::nullopt;
+  auto version_obj = GetOptionalFieldObj(fields_obj, "template_version", ctx);
+  if (version_obj.has_value() && version_obj->type != msgpack::type::NIL) {
+    template_version = version_obj->as<int>();
+  }
+
+  return std::make_shared<ManualScopeStmt>(std::move(template_key), template_version, std::move(name_hint),
+                                           body, span, DeserializeLeadingComments(fields_obj));
+}
+
 // Backward-compatibility: route legacy "ScopeStmt" type tags (written before the
 // per-kind subclass split, issue #1047) to the matching derived deserializer by
 // reading the legacy "scope_kind" field.
@@ -743,6 +771,8 @@ static IRNodePtr DeserializeLegacyScopeStmt(const msgpack::object& fields_obj, m
       return DeserializeHierarchyScopeStmt(fields_obj, zone, ctx);
     case ScopeKind::Spmd:
       return DeserializeSpmdScopeStmt(fields_obj, zone, ctx);
+    case ScopeKind::Manual:
+      return DeserializeManualScopeStmt(fields_obj, zone, ctx);
   }
   throw pypto::TypeError("Unknown legacy ScopeKind during deserialization");
 }
@@ -987,6 +1017,7 @@ static TypeRegistrar _auto_in_core_scope_stmt_registrar("AutoInCoreScopeStmt",
 static TypeRegistrar _cluster_scope_stmt_registrar("ClusterScopeStmt", DeserializeClusterScopeStmt);
 static TypeRegistrar _hierarchy_scope_stmt_registrar("HierarchyScopeStmt", DeserializeHierarchyScopeStmt);
 static TypeRegistrar _spmd_scope_stmt_registrar("SpmdScopeStmt", DeserializeSpmdScopeStmt);
+static TypeRegistrar _manual_scope_stmt_registrar("ManualScopeStmt", DeserializeManualScopeStmt);
 // Backward compatibility for IR serialized before issue #1047 split ScopeStmt into per-kind subclasses.
 static TypeRegistrar _legacy_scope_stmt_registrar("ScopeStmt", DeserializeLegacyScopeStmt);
 static TypeRegistrar _seq_stmts_registrar("SeqStmts", DeserializeSeqStmts);

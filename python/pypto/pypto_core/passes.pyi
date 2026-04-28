@@ -412,6 +412,12 @@ def derive_call_directions() -> Pass:
     auto-verified by the pipeline.
     """
 
+def identify_stable_regions() -> Pass:
+    """Identify stable orchestration call regions and annotate matched calls with manual-scope metadata."""
+
+def lower_stable_regions_to_manual_scope() -> Pass:
+    """Lower identified stable orchestration call regions into ManualScopeStmt nodes."""
+
 def flatten_call_expr() -> Pass:
     """Create a pass that flattens nested call expressions."""
 
@@ -541,6 +547,8 @@ __all__ = [
     "flatten_call_expr",
     "normalize_stmt_structure",
     "derive_call_directions",
+    "identify_stable_regions",
+    "lower_stable_regions_to_manual_scope",
     "NestedCallErrorType",
     "UseAfterDefErrorType",
     "DiagnosticSeverity",

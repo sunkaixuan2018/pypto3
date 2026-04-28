@@ -658,6 +658,18 @@ StmtPtr IRMutator::VisitStmt_(const SpmdScopeStmtPtr& op) {
   return op;
 }
 
+StmtPtr IRMutator::VisitStmt_(const ManualScopeStmtPtr& op) {
+  INTERNAL_CHECK_SPAN(op->body_, op->span_) << "ManualScopeStmt has null body";
+  auto new_body = StmtFunctor<StmtPtr>::VisitStmt(op->body_);
+  INTERNAL_CHECK_SPAN(new_body, op->span_) << "ManualScopeStmt body mutated to null";
+  if (new_body.get() != op->body_.get()) {
+    auto result = MutableCopy(op);
+    result->body_ = std::move(new_body);
+    return result;
+  }
+  return op;
+}
+
 StmtPtr IRMutator::VisitStmt_(const SeqStmtsPtr& op) {
   std::vector<StmtPtr> new_stmts;
   bool changed = false;

@@ -349,6 +349,9 @@ StmtPtr IRBuilder::EndScope(const Span& end_span) {
       scope_stmt = std::make_shared<const SpmdScopeStmt>(core_num, sync_start.value_or(false),
                                                          std::move(name_hint), body, combined_span);
       break;
+    case ScopeKind::Manual:
+      CHECK(false) << "ManualScopeStmt is compiler-generated; use LowerStableRegionsToManualScope";
+      break;
   }
   // Safety net: every ScopeKind value above must populate scope_stmt. The switch has
   // no default so adding a new ScopeKind without a case here will trip -Wswitch-enum;

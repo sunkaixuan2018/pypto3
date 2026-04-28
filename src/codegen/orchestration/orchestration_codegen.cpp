@@ -92,6 +92,8 @@ CoreType InferFunctionCoreType(const FunctionPtr& func) {
 namespace {
 
 constexpr const char* kDualAivDispatchAttr = "dual_aiv_dispatch";
+constexpr const char* kManualTaskIndexAttr = "manual_task_index";
+constexpr const char* kManualDepIndicesAttr = "manual_dep_indices";
 
 // ---------------------------------------------------------------------------
 // Template / boilerplate generation helpers
@@ -234,6 +236,9 @@ class OrchestrationStmtCodegen : public CodegenBase {
   }
 
   void VisitStmt_(const ForStmtPtr& for_stmt) override {
+    INTERNAL_CHECK_SPAN(manual_scope_depth_ == 0, for_stmt->span_)
+        << "ManualScopeStmt cannot contain ForStmt because orchestration codegen would emit an AUTO "
+           "PTO2_SCOPE inside a MANUAL scope";
     if (for_stmt->kind_ == ForKind::Unroll) {
       LOG_WARN << "ForKind::Unroll loop was not expanded before codegen; "
                   "generating sequential loop as fallback";
@@ -275,6 +280,9 @@ class OrchestrationStmtCodegen : public CodegenBase {
   }
 
   void VisitStmt_(const IfStmtPtr& if_stmt) override {
+    INTERNAL_CHECK_SPAN(manual_scope_depth_ == 0, if_stmt->span_)
+        << "ManualScopeStmt cannot contain IfStmt because orchestration codegen would emit an AUTO "
+           "PTO2_SCOPE inside a MANUAL scope";
     std::string cond_expr = GenerateExprString(if_stmt->condition_);
 
     for (const auto& rv : if_stmt->return_vars_) {
@@ -344,6 +352,16 @@ class OrchestrationStmtCodegen : public CodegenBase {
       if (batched_create_stmts_.count(stmt.get())) continue;
       VisitStmt(stmt);
     }
+  }
+
+  void VisitStmt_(const ManualScopeStmtPtr& manual_scope) override {
+    code_ << Indent() << "PTO2_SCOPE(PTO2ScopeMode::MANUAL) {\n";
+    indent_ += 4;
+    manual_scope_depth_++;
+    VisitStmt(manual_scope->body_);
+    manual_scope_depth_--;
+    indent_ -= 4;
+    code_ << Indent() << "}\n";
   }
 
   void VisitStmt_(const YieldStmtPtr& yield_stmt) override {
@@ -732,8 +750,23 @@ class OrchestrationStmtCodegen : public CodegenBase {
     }
   }
 
-  void EmitTaskSubmitAndBind(const std::string& submit_expr) {
-    code_ << Indent() << submit_expr << ";\n";
+  void EmitManualDeps(const std::string& ind, const std::string& task_var, const CallPtr& call) {
+    if (manual_scope_depth_ == 0 || !call) {
+      return;
+    }
+    auto dep_indices = call->GetAttr<std::vector<int>>(kManualDepIndicesAttr, {});
+    for (int dep_index : dep_indices) {
+      code_ << ind << task_var << ".add_dep(task_result_" << dep_index << ".task_id());\n";
+    }
+  }
+
+  void EmitTaskSubmitAndBind(const std::string& submit_expr, const CallPtr& call) {
+    if (manual_scope_depth_ > 0) {
+      int manual_task_index = call ? call->GetAttr<int>(kManualTaskIndexAttr, task_counter_) : task_counter_;
+      code_ << Indent() << "auto task_result_" << manual_task_index << " = " << submit_expr << ";\n";
+    } else {
+      code_ << Indent() << submit_expr << ";\n";
+    }
     task_counter_++;
   }
 
@@ -885,10 +918,11 @@ class OrchestrationStmtCodegen : public CodegenBase {
     for (const auto& p : params) {
       code_ << ind << task_var << "." << ArgDirectionToMethodName(p.direction) << "(" << p.value << ");\n";
     }
+    EmitManualDeps(ind, task_var, call);
 
     std::string submit_expr =
         CoreTypeToSubmitPrefix(core_type) + std::to_string(func_id) + ", " + task_var + ")";
-    EmitTaskSubmitAndBind(submit_expr);
+    EmitTaskSubmitAndBind(submit_expr, call);
   }
 
   void GenerateSpmdCallCode(const CallPtr& call, const FunctionPtr& spmd_func) {
@@ -916,11 +950,12 @@ class OrchestrationStmtCodegen : public CodegenBase {
     for (const auto& p : params) {
       code_ << ind << task_var << "." << ArgDirectionToMethodName(p.direction) << "(" << p.value << ");\n";
     }
+    EmitManualDeps(ind, task_var, call);
     EmitLaunchSpec(ind, task_var, spmd_func);
 
     std::string submit_expr =
         CoreTypeToSubmitPrefix(core_type) + std::to_string(func_id) + ", " + task_var + ")";
-    EmitTaskSubmitAndBind(submit_expr);
+    EmitTaskSubmitAndBind(submit_expr, call);
   }
 
   void GenerateGroupCallCode(const CallPtr& call, const FunctionPtr& group_func,
@@ -954,12 +989,13 @@ class OrchestrationStmtCodegen : public CodegenBase {
       for (const auto& p : params) {
         code_ << ind << task_var << "." << ArgDirectionToMethodName(p.direction) << "(" << p.value << ");\n";
       }
+      EmitManualDeps(ind, task_var, call);
 
       EmitLaunchSpec(ind, task_var, launch_func);
 
       std::string submit_expr =
           CoreTypeToSubmitPrefix(CoreType::VECTOR) + std::to_string(aiv_id) + ", " + task_var + ")";
-      EmitTaskSubmitAndBind(submit_expr);
+      EmitTaskSubmitAndBind(submit_expr, call);
       return;
     }
 
@@ -995,6 +1031,7 @@ class OrchestrationStmtCodegen : public CodegenBase {
     for (const auto& p : params) {
       code_ << ind << task_var << "." << ArgDirectionToMethodName(p.direction) << "(" << p.value << ");\n";
     }
+    EmitManualDeps(ind, task_var, call);
     // Split AIV groups dispatch the same kernel on both vector lanes. The
     // kernel body uses tile.get_subblock_idx() to select its lane-local slice.
     std::string third_id = RequiresDualAivDispatch(aiv_func) ? std::to_string(aiv_id) : "INVALID_KERNEL_ID";
@@ -1005,7 +1042,7 @@ class OrchestrationStmtCodegen : public CodegenBase {
 
     std::string submit_expr =
         "pto2_rt_submit_task(mixed_" + std::to_string(task_counter_) + ", " + task_var + ")";
-    EmitTaskSubmitAndBind(submit_expr);
+    EmitTaskSubmitAndBind(submit_expr, call);
   }
 
   // --- Alias generation helpers ---
@@ -1140,6 +1177,7 @@ class OrchestrationStmtCodegen : public CodegenBase {
   std::vector<VarPtr> current_return_vars_;
   int task_counter_ = 0;
   int alloc_counter_ = 0;
+  int manual_scope_depth_ = 0;
   std::map<std::string, std::vector<TupleElement>> tuple_var_to_elements_;
   std::map<const Call*, std::string> call_to_tuple_key_;
   std::unordered_set<const Var*> declared_var_ptrs_;

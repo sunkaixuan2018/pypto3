@@ -41,7 +41,8 @@ struct OrchestrationResult {
  * - aicpu_orchestration_entry(const ChipStorageTaskArgs& orch_args)
  * - from_task_arg() for ND external tensors, make_tensor for internal tensors
  * - PTOParam + pto2_rt_submit_task for task submission
- * - No manual dependency management (runtime handles automatically)
+ * - AUTO scopes by default, with ManualScopeStmt lowering to PTO2 manual scopes
+ *   and explicit Arg.add_dep(...) dependencies
  *
  * @param program The IR Program (used to resolve callee functions and validate references)
  * @param func The orchestration function to generate code for

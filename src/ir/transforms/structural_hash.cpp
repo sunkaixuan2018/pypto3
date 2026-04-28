@@ -303,6 +303,14 @@ class StructuralHasher {
     return 0;  // Never reached
   }
 
+  result_type VisitLeafField(const std::vector<int>& field) {
+    result_type h = 0;
+    for (int value : field) {
+      h = hash_combine(h, std::hash<int>{}(value));
+    }
+    return h;
+  }
+
   // Hash kwargs (vector of pairs - order is preserved and matters)
   result_type VisitLeafField(const std::vector<std::pair<std::string, std::any>>& kwargs) {
     result_type h = 0;
@@ -341,6 +349,8 @@ class StructuralHasher {
       } else if (value.type() == typeid(std::vector<ArgDirection>)) {
         h = hash_combine(h,
                          VisitLeafField(AnyCast<std::vector<ArgDirection>>(value, "hashing kwarg: " + key)));
+      } else if (value.type() == typeid(std::vector<int>)) {
+        h = hash_combine(h, VisitLeafField(AnyCast<std::vector<int>>(value, "hashing kwarg: " + key)));
       } else {
         throw TypeError("Unsupported kwarg type for key: " + key + ": " +
                         DemangleTypeName(value.type().name()));
@@ -572,6 +582,7 @@ StructuralHasher::result_type StructuralHasher::HashNode(const IRNodePtr& node) 
   HASH_DISPATCH(ClusterScopeStmt)
   HASH_DISPATCH(HierarchyScopeStmt)
   HASH_DISPATCH(SpmdScopeStmt)
+  HASH_DISPATCH(ManualScopeStmt)
   HASH_DISPATCH(SeqStmts)
   HASH_DISPATCH(EvalStmt)
   HASH_DISPATCH(BreakStmt)

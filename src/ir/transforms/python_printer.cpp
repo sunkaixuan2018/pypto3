@@ -246,6 +246,7 @@ class IRPythonPrinter : public IRVisitor {
   void VisitStmt_(const ClusterScopeStmtPtr& op) override;
   void VisitStmt_(const HierarchyScopeStmtPtr& op) override;
   void VisitStmt_(const SpmdScopeStmtPtr& op) override;
+  void VisitStmt_(const ManualScopeStmtPtr& op) override;
   void VisitStmt_(const SeqStmtsPtr& op) override;
   void VisitStmt_(const EvalStmtPtr& op) override;
   void VisitStmt_(const BreakStmtPtr& op) override;
@@ -1186,6 +1187,20 @@ void IRPythonPrinter::VisitStmt_(const SpmdScopeStmtPtr& op) {
   VisitExpr(op->core_num_);
   if (op->sync_start_) {
     stream_ << ", sync_start=True";
+  }
+  if (!op->name_hint_.empty()) {
+    stream_ << ", name_hint=\"" << op->name_hint_ << "\"";
+  }
+  stream_ << "):\n";
+  IncreaseIndent();
+  PrintStmtBlock(op->body_);
+  DecreaseIndent();
+}
+
+void IRPythonPrinter::VisitStmt_(const ManualScopeStmtPtr& op) {
+  stream_ << "with " << prefix_ << ".manual_scope(template_key=\"" << op->template_key_ << "\"";
+  if (op->template_version_.has_value()) {
+    stream_ << ", template_version=" << *op->template_version_;
   }
   if (!op->name_hint_.empty()) {
     stream_ << ", name_hint=\"" << op->name_hint_ << "\"";

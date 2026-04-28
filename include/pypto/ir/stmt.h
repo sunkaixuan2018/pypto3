@@ -162,7 +162,8 @@ enum class ScopeKind : uint8_t {
   AutoInCore = 1,  ///< AutoInCore scope for automatic chunking
   Cluster = 2,     ///< Cluster scope for co-scheduled AIC + AIV groups
   Hierarchy = 3,   ///< Distributed hierarchy scope (uses level_/role_ on ScopeStmt)
-  Spmd = 4         ///< SPMD dispatch scope (core_num/sync_start on ScopeStmt)
+  Spmd = 4,        ///< SPMD dispatch scope (core_num/sync_start on ScopeStmt)
+  Manual = 5       ///< Runtime manual dependency scope for orchestration regions
 };
 
 /**
@@ -270,6 +271,8 @@ inline std::string ScopeKindToString(ScopeKind kind) {
       return "Hierarchy";
     case ScopeKind::Spmd:
       return "Spmd";
+    case ScopeKind::Manual:
+      return "Manual";
   }
   throw pypto::TypeError("Unknown ScopeKind");
 }
@@ -291,6 +294,8 @@ inline ScopeKind StringToScopeKind(const std::string& str) {
     return ScopeKind::Hierarchy;
   } else if (str == "Spmd") {
     return ScopeKind::Spmd;
+  } else if (str == "Manual") {
+    return ScopeKind::Manual;
   } else {
     throw pypto::TypeError("Unknown ScopeKind: " + str);
   }
@@ -715,6 +720,7 @@ using WhileStmtPtr = std::shared_ptr<const WhileStmt>;
  *   - `ClusterScopeStmt`: no extra fields
  *   - `HierarchyScopeStmt`: required `level_`, optional `role_`
  *   - `SpmdScopeStmt`: required `core_num_`, `sync_start_` (default false)
+ *   - `ManualScopeStmt`: required `template_key_`, optional `template_version_`
  *
  * **Syntax:**
  * with pl.incore():    # InCore scope -> InCoreScopeStmt
@@ -904,6 +910,43 @@ class SpmdScopeStmt : public ScopeStmt {
 };
 
 using SpmdScopeStmtPtr = std::shared_ptr<const SpmdScopeStmt>;
+
+/**
+ * @brief Manual runtime scope for orchestration template regions.
+ *
+ * Manual scopes are produced by stable-region lowering passes, not by the
+ * public Python DSL. They tell orchestration codegen to emit
+ * `PTO2_SCOPE(PTO2ScopeMode::MANUAL)` and to consume per-call manual
+ * dependency attrs inside the body.
+ */
+class ManualScopeStmt : public ScopeStmt {
+ public:
+  ManualScopeStmt(std::string template_key, std::optional<int> template_version, std::string name_hint,
+                  StmtPtr body, Span span, std::vector<std::string> leading_comments = {})
+      : ScopeStmt(std::move(name_hint), std::move(body), std::move(span), std::move(leading_comments)),
+        template_key_(std::move(template_key)),
+        template_version_(template_version) {
+    INTERNAL_CHECK(!template_key_.empty()) << "ManualScopeStmt template_key must not be empty";
+  }
+
+  [[nodiscard]] ObjectKind GetKind() const override { return ObjectKind::ManualScopeStmt; }
+  [[nodiscard]] ScopeKind GetScopeKind() const override { return ScopeKind::Manual; }
+  [[nodiscard]] std::string TypeName() const override { return "ManualScopeStmt"; }
+
+  static constexpr auto GetFieldDescriptors() {
+    return std::tuple_cat(ScopeStmt::GetFieldDescriptors(),
+                          std::make_tuple(reflection::UsualField(&ManualScopeStmt::template_key_,
+                                                                  "template_key"),
+                                          reflection::UsualField(&ManualScopeStmt::template_version_,
+                                                                  "template_version")));
+  }
+
+ public:
+  std::string template_key_;                 ///< Stable template identifier
+  std::optional<int> template_version_;      ///< Optional template version
+};
+
+using ManualScopeStmtPtr = std::shared_ptr<const ManualScopeStmt>;
 
 /**
  * @brief Sequence of statements

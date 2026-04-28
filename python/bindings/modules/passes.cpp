@@ -397,6 +397,11 @@ void BindPass(nb::module_& m) {
              "Post-condition: ``IRProperty::CallDirectionsResolved``. The integrity of\n"
              "the produced ``Call.attrs['arg_directions']`` is verified automatically by the\n"
              "``CallDirectionsResolved`` PropertyVerifier (no separate verify pass).");
+  passes.def("identify_stable_regions", &pass::IdentifyStableRegions,
+             "Identify stable orchestration call regions and annotate matched calls with manual-scope "
+             "metadata.");
+  passes.def("lower_stable_regions_to_manual_scope", &pass::LowerStableRegionsToManualScope,
+             "Lower identified stable orchestration call regions into ManualScopeStmt nodes.");
   // Bind DiagnosticSeverity enum
   nb::enum_<DiagnosticSeverity>(passes, "DiagnosticSeverity", "Severity level for diagnostics")
       .value("Error", DiagnosticSeverity::Error, "Error that must be fixed")

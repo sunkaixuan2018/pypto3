@@ -105,6 +105,7 @@ class FieldSerializerVisitor {
   result_type VisitLeafField(const std::vector<ParamDirection>& field);
   result_type VisitLeafField(const ArgDirection& field);
   result_type VisitLeafField(const std::vector<ArgDirection>& field);
+  result_type VisitLeafField(const std::vector<int>& field);
   result_type VisitLeafField(const std::vector<std::string>& field);
   result_type VisitLeafField(const TypePtr& field);
   result_type VisitLeafField(const OpPtr& field);
@@ -226,6 +227,7 @@ class IRSerializer::Impl {
     SERIALIZE_FIELDS(ClusterScopeStmt);
     SERIALIZE_FIELDS(HierarchyScopeStmt);
     SERIALIZE_FIELDS(SpmdScopeStmt);
+    SERIALIZE_FIELDS(ManualScopeStmt);
     SERIALIZE_FIELDS(SeqStmts);
     SERIALIZE_FIELDS(EvalStmt);
     SERIALIZE_FIELDS(BreakStmt);
@@ -663,6 +665,15 @@ msgpack::object FieldSerializerVisitor::VisitLeafField(const std::vector<ArgDire
   return msgpack::object(vec, zone_);
 }
 
+msgpack::object FieldSerializerVisitor::VisitLeafField(const std::vector<int>& field) {
+  std::vector<msgpack::object> vec;
+  vec.reserve(field.size());
+  for (int value : field) {
+    vec.emplace_back(value, zone_);
+  }
+  return msgpack::object(vec, zone_);
+}
+
 msgpack::object FieldSerializerVisitor::VisitLeafField(const std::vector<std::string>& field) {
   std::vector<msgpack::object> vec;
   vec.reserve(field.size());
@@ -773,11 +784,17 @@ msgpack::object FieldSerializerVisitor::VisitLeafField(
       dir_map["type"] = msgpack::object("ArgDirectionVector", zone_);
       dir_map["value"] = VisitLeafField(dirs);
       kwargs_msgs.push_back(make_pair(key, msgpack::object(dir_map, zone_)));
+    } else if (value.type() == typeid(std::vector<int>)) {
+      const auto& ints = AnyCast<std::vector<int>>(value, "serializing kwarg: " + key);
+      std::map<std::string, msgpack::object> int_map;
+      int_map["type"] = msgpack::object("IntVector", zone_);
+      int_map["value"] = VisitLeafField(ints);
+      kwargs_msgs.push_back(make_pair(key, msgpack::object(int_map, zone_)));
     } else {
       throw TypeError("Invalid kwarg type for key: " + key +
                       ", expected int, bool, std::string, double, float, DataType, MemorySpace, "
                       "TensorLayout, TileLayout, PadValue, LoopOrigin, or "
-                      "std::vector<ArgDirection>, but got " +
+                      "std::vector<ArgDirection>/std::vector<int>, but got " +
                       DemangleTypeName(value.type().name()));
     }
   }

@@ -186,6 +186,16 @@ inline const PassProperties kCanonicalizeIOOrderProperties{
 inline const PassProperties kDeriveCallDirectionsProperties{.required = {IRProperty::SplitIncoreOrch},
                                                             .produced = {IRProperty::CallDirectionsResolved}};
 
+// -- Stable orchestration region passes --------------------------------------
+
+inline const PassProperties kIdentifyStableRegionsProperties{
+    .required = {IRProperty::CallDirectionsResolved, IRProperty::NormalizedStmtStructure},
+    .produced = {IRProperty::CallDirectionsResolved, IRProperty::NormalizedStmtStructure}};
+
+inline const PassProperties kLowerStableRegionsToManualScopeProperties{
+    .required = {IRProperty::CallDirectionsResolved, IRProperty::NormalizedStmtStructure},
+    .produced = {IRProperty::CallDirectionsResolved, IRProperty::NormalizedStmtStructure}};
+
 }  // namespace pass
 }  // namespace ir
 }  // namespace pypto

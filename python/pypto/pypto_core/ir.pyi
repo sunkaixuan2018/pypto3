@@ -1867,6 +1867,9 @@ class ScopeKind(enum.Enum):
     Spmd = 4
     """SPMD dispatch scope (core_num/sync_start on ScopeStmt)."""
 
+    Manual = 5
+    """Runtime manual dependency scope."""
+
 class SplitMode(enum.Enum):
     """Split mode for cross-core data transfer."""
 
@@ -1896,7 +1899,7 @@ class ScopeStmt(Stmt):
 
     def __init__(self, *args: object, **kwargs: object) -> None:
         """ScopeStmt is abstract — construct an InCoreScopeStmt, AutoInCoreScopeStmt,
-        ClusterScopeStmt, HierarchyScopeStmt, or SpmdScopeStmt instead."""
+        ClusterScopeStmt, HierarchyScopeStmt, SpmdScopeStmt, or ManualScopeStmt instead."""
 
 class InCoreScopeStmt(ScopeStmt):
     """InCore scope: AICore sub-graph region."""
@@ -1979,6 +1982,26 @@ class SpmdScopeStmt(ScopeStmt):
         Accepts either a Python ``int`` (auto-wrapped as ``ConstInt``) or any
         ``Expr`` of integer type.
         """
+
+class ManualScopeStmt(ScopeStmt):
+    """Manual runtime dependency scope produced by stable-region lowering."""
+
+    template_key: Final[str]
+    """Stable template identifier."""
+
+    template_version: Final[int | None]
+    """Optional template version."""
+
+    def __init__(
+        self,
+        template_key: str,
+        template_version: int | None = None,
+        name_hint: str = "",
+        *,
+        body: Stmt,
+        span: Span,
+    ) -> None:
+        """Create a manual runtime scope statement."""
 
 class SeqStmts(Stmt):
     """Sequence of statements: a sequence of statements."""
@@ -3297,6 +3320,7 @@ class IRVisitor:
     def visit_cluster_scope_stmt(self, op: ClusterScopeStmt) -> None: ...
     def visit_hierarchy_scope_stmt(self, op: HierarchyScopeStmt) -> None: ...
     def visit_spmd_scope_stmt(self, op: SpmdScopeStmt) -> None: ...
+    def visit_manual_scope_stmt(self, op: ManualScopeStmt) -> None: ...
     def visit_seq_stmts(self, op: SeqStmts) -> None: ...
     def visit_yield_stmt(self, op: YieldStmt) -> None: ...
     def visit_return_stmt(self, op: ReturnStmt) -> None: ...
@@ -3374,6 +3398,7 @@ class IRMutator:
     def visit_cluster_scope_stmt(self, op: ClusterScopeStmt) -> Stmt: ...
     def visit_hierarchy_scope_stmt(self, op: HierarchyScopeStmt) -> Stmt: ...
     def visit_spmd_scope_stmt(self, op: SpmdScopeStmt) -> Stmt: ...
+    def visit_manual_scope_stmt(self, op: ManualScopeStmt) -> Stmt: ...
     def visit_seq_stmts(self, op: SeqStmts) -> Stmt: ...
     def visit_yield_stmt(self, op: YieldStmt) -> Stmt: ...
     def visit_return_stmt(self, op: ReturnStmt) -> Stmt: ...

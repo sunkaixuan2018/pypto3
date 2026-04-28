@@ -155,6 +155,8 @@ class PassManager:
             ("FuseCreateAssembleToSlice", lambda: passes.fuse_create_assemble_to_slice()),
             ("DeriveCallDirections", lambda: passes.derive_call_directions()),
             ("Simplify", lambda: passes.simplify()),
+            ("IdentifyStableRegions", lambda: passes.identify_stable_regions()),
+            ("LowerStableRegionsToManualScope", lambda: passes.lower_stable_regions_to_manual_scope()),
         ]
         cls._strategy_passes = {
             OptimizationStrategy.Default: tensor_prefix_passes + tensor_only_passes + tile_pto_passes,

@@ -70,8 +70,91 @@ def _generate_orch_result(program) -> "codegen.OrchestrationResult":
     raise ValueError("No orchestration function found in program")
 
 
+def _generate_manual_scope_orch_code(program) -> str:
+    """Generate orchestration code after stable-region manual-scope lowering."""
+    program = passes.derive_call_directions()(program)
+    program = passes.simplify()(program)
+    program = passes.identify_stable_regions()(program)
+    program = passes.lower_stable_regions_to_manual_scope()(program)
+    for func in program.functions.values():
+        if func.func_type == ir.FunctionType.Orchestration:
+            return codegen.generate_orchestration(program, func).code
+    raise ValueError("No orchestration function found in program")
+
+
 class TestOrchestration:
     """Test orchestration codegen format."""
+
+    def test_manual_scope_emits_task_handles_and_deps(self):
+        """Stable PagedAttention-like regions use manual scope with explicit task deps."""
+        backend.reset_for_testing()
+        backend.set_backend_type(BackendType.Ascend910B)
+
+        @pl.program
+        class StableRegionProgram:
+            @pl.function(type=pl.FunctionType.InCore)
+            def kernel_qk_matmul(
+                self,
+                src: pl.Tensor[[16], pl.FP32],
+                dst: pl.Out[pl.Tensor[[16], pl.FP32]],
+            ) -> pl.Tensor[[16], pl.FP32]:
+                tile = pl.load(src, [0], [16])
+                ret = pl.store(tile, [0], dst)
+                return ret
+
+            @pl.function(type=pl.FunctionType.InCore)
+            def kernel_softmax_prepare(
+                self,
+                src: pl.Tensor[[16], pl.FP32],
+                dst: pl.Out[pl.Tensor[[16], pl.FP32]],
+            ) -> pl.Tensor[[16], pl.FP32]:
+                tile = pl.load(src, [0], [16])
+                ret = pl.store(tile, [0], dst)
+                return ret
+
+            @pl.function(type=pl.FunctionType.InCore)
+            def kernel_pv_matmul(
+                self,
+                src: pl.Tensor[[16], pl.FP32],
+                dst: pl.Out[pl.Tensor[[16], pl.FP32]],
+            ) -> pl.Tensor[[16], pl.FP32]:
+                tile = pl.load(src, [0], [16])
+                ret = pl.store(tile, [0], dst)
+                return ret
+
+            @pl.function(type=pl.FunctionType.InCore)
+            def kernel_online_update(
+                self,
+                src: pl.Tensor[[16], pl.FP32],
+                dst: pl.Out[pl.Tensor[[16], pl.FP32]],
+            ) -> pl.Tensor[[16], pl.FP32]:
+                tile = pl.load(src, [0], [16])
+                ret = pl.store(tile, [0], dst)
+                return ret
+
+            @pl.function(type=pl.FunctionType.Orchestration)
+            def main(
+                self,
+                src: pl.Tensor[[16], pl.FP32],
+                dst: pl.Out[pl.Tensor[[16], pl.FP32]],
+            ) -> pl.Tensor[[16], pl.FP32]:
+                qk_buf: pl.Tensor[[16], pl.FP32] = pl.create_tensor([16], dtype=pl.FP32)
+                qk_buf = self.kernel_qk_matmul(src, qk_buf)
+                softmax_buf: pl.Tensor[[16], pl.FP32] = pl.create_tensor([16], dtype=pl.FP32)
+                softmax_buf = self.kernel_softmax_prepare(qk_buf, softmax_buf)
+                pv_buf: pl.Tensor[[16], pl.FP32] = pl.create_tensor([16], dtype=pl.FP32)
+                pv_buf = self.kernel_pv_matmul(softmax_buf, pv_buf)
+                updated = self.kernel_online_update(pv_buf, dst)
+                return updated
+
+        code = _generate_manual_scope_orch_code(StableRegionProgram)
+
+        assert "PTO2_SCOPE(PTO2ScopeMode::MANUAL)" in code
+        assert "auto task_result_0 = pto2_rt_submit_aiv_task" in code
+        assert "auto task_result_1 = pto2_rt_submit_aiv_task" in code
+        assert "params_t1.add_dep(task_result_0.task_id())" in code
+        assert "params_t2.add_dep(task_result_1.task_id())" in code
+        assert "params_t3.add_dep(task_result_2.task_id())" in code
 
     def test_basic_structure(self):
         """Test codegen produces PTO2 format: make_tensor_external, Arg, pto2_rt_submit_aiv_task."""

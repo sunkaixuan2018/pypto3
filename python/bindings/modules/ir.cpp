@@ -142,17 +142,29 @@ std::vector<std::pair<std::string, std::any>> ConvertKwargsDict(const nb::dict& 
     } else if (nb::isinstance<nb::float_>(item.second)) {
       kwargs.emplace_back(key, nb::cast<double>(item.second));
     } else if (nb::isinstance<nb::list>(item.second) || nb::isinstance<nb::tuple>(item.second)) {
-      // Lists/tuples currently only used to carry `vector<ArgDirection>` (e.g. attrs["arg_directions"]).
-      // Reject non-ArgDirection sequences to avoid silently dropping metadata.
-      std::vector<ArgDirection> dirs;
-      for (auto elem : nb::cast<nb::sequence>(item.second)) {
-        if (!nb::isinstance<ArgDirection>(elem)) {
-          throw pypto::TypeError("Unsupported list element type for key: " + key +
-                                 " (expected ArgDirection)");
+      auto seq = nb::cast<nb::sequence>(item.second);
+      if (key == "manual_dep_indices") {
+        std::vector<int> ints;
+        for (auto elem : seq) {
+          if (!nb::isinstance<nb::int_>(elem)) {
+            throw pypto::TypeError("Unsupported list element type for key: " + key + " (expected int)");
+          }
+          ints.push_back(nb::cast<int>(elem));
         }
-        dirs.push_back(nb::cast<ArgDirection>(elem));
+        kwargs.emplace_back(key, std::move(ints));
+      } else {
+        // Lists/tuples carry `vector<ArgDirection>` (e.g. attrs["arg_directions"]).
+        // Reject non-ArgDirection sequences to avoid silently dropping metadata.
+        std::vector<ArgDirection> dirs;
+        for (auto elem : seq) {
+          if (!nb::isinstance<ArgDirection>(elem)) {
+            throw pypto::TypeError("Unsupported list element type for key: " + key +
+                                   " (expected ArgDirection)");
+          }
+          dirs.push_back(nb::cast<ArgDirection>(elem));
+        }
+        kwargs.emplace_back(key, std::move(dirs));
       }
-      kwargs.emplace_back(key, std::move(dirs));
     } else {
       throw pypto::TypeError("Unsupported kwarg type for key: " + key);
     }
@@ -701,6 +713,13 @@ void BindIR(nb::module_& m) {
           lst.append(nb::cast(d));
         }
         result[key.c_str()] = lst;
+      } else if (value.type() == typeid(std::vector<int>)) {
+        const auto& ints = AnyCast<std::vector<int>>(value, "converting to Python: " + key);
+        nb::list lst;
+        for (int value_int : ints) {
+          lst.append(value_int);
+        }
+        result[key.c_str()] = lst;
       }
     }
     return result;
@@ -1014,6 +1033,7 @@ void BindIR(nb::module_& m) {
       .value("Cluster", ScopeKind::Cluster, "Cluster scope for co-scheduled AIC + AIV groups")
       .value("Hierarchy", ScopeKind::Hierarchy, "Distributed hierarchy scope (uses level/role)")
       .value("Spmd", ScopeKind::Spmd, "SPMD dispatch scope (core_num/sync_start)")
+      .value("Manual", ScopeKind::Manual, "Runtime manual dependency scope")
       .export_values();
 
   // SplitMode enum
@@ -1082,6 +1102,15 @@ void BindIR(nb::module_& m) {
       nb::arg("core_num"), nb::arg("sync_start") = false, nb::arg("name_hint") = "", nb::arg("body"),
       nb::arg("span"), "Create an SPMD scope statement (int core_num is wrapped as ConstInt)");
   BindFields<SpmdScopeStmt>(spmd_scope_stmt_class);
+
+  // ManualScopeStmt
+  auto manual_scope_stmt_class = nb::class_<ManualScopeStmt, ScopeStmt>(
+      ir, "ManualScopeStmt", "Manual runtime dependency scope produced by stable-region lowering");
+  manual_scope_stmt_class.def(
+      nb::init<std::string, std::optional<int>, std::string, const StmtPtr&, const Span&>(),
+      nb::arg("template_key"), nb::arg("template_version") = nb::none(), nb::arg("name_hint") = "",
+      nb::arg("body"), nb::arg("span"), "Create a manual runtime scope statement");
+  BindFields<ManualScopeStmt>(manual_scope_stmt_class);
 
   // SeqStmts - const shared_ptr
   auto seq_stmts_class =

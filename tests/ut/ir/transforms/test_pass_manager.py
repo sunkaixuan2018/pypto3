@@ -52,6 +52,8 @@ TENSOR_OPTIMIZATION_PASSES = [
     "FuseCreateAssembleToSlice",
     "DeriveCallDirections",
     "Simplify",
+    "IdentifyStableRegions",
+    "LowerStableRegionsToManualScope",
 ]
 
 DEBUG_TILE_OPTIMIZATION_PASSES = [
@@ -79,6 +81,8 @@ DEBUG_TILE_OPTIMIZATION_PASSES = [
     "FuseCreateAssembleToSlice",
     "DeriveCallDirections",
     "Simplify",
+    "IdentifyStableRegions",
+    "LowerStableRegionsToManualScope",
 ]
 
 

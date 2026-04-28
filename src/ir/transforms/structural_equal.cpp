@@ -541,6 +541,28 @@ class StructuralEqualImpl {
     return true;
   }
 
+  result_type VisitLeafField(const std::vector<int>& lhs, const std::vector<int>& rhs) {
+    if (lhs.size() != rhs.size()) {
+      if constexpr (AssertMode) {
+        std::ostringstream msg;
+        msg << "int vector size mismatch (" << lhs.size() << " != " << rhs.size() << ")";
+        ThrowMismatch(msg.str(), IRNodePtr(), IRNodePtr(), "", "");
+      }
+      return false;
+    }
+    for (size_t i = 0; i < lhs.size(); ++i) {
+      if (lhs[i] != rhs[i]) {
+        if constexpr (AssertMode) {
+          std::ostringstream msg;
+          msg << "int vector value mismatch at index " << i << " (" << lhs[i] << " != " << rhs[i] << ")";
+          ThrowMismatch(msg.str(), IRNodePtr(), IRNodePtr(), "", "");
+        }
+        return false;
+      }
+    }
+    return true;
+  }
+
   // Compare kwargs (vector of pairs to preserve order)
   result_type VisitLeafField(const std::vector<std::pair<std::string, std::any>>& lhs,
                              const std::vector<std::pair<std::string, std::any>>& rhs) {
@@ -614,6 +636,10 @@ class StructuralEqualImpl {
         const auto& rhs_dirs =
             AnyCast<std::vector<ArgDirection>>(rhs_val, "comparing kwarg: " + lhs[i].first);
         values_equal = VisitLeafField(lhs_dirs, rhs_dirs);
+      } else if (lhs_val.type() == typeid(std::vector<int>)) {
+        const auto& lhs_ints = AnyCast<std::vector<int>>(lhs_val, "comparing kwarg: " + lhs[i].first);
+        const auto& rhs_ints = AnyCast<std::vector<int>>(rhs_val, "comparing kwarg: " + lhs[i].first);
+        values_equal = VisitLeafField(lhs_ints, rhs_ints);
       } else if (lhs_val.type() == typeid(ExprPtr)) {
         const auto& lhs_expr = AnyCast<ExprPtr>(lhs_val, "comparing kwarg: " + lhs[i].first);
         const auto& rhs_expr = AnyCast<ExprPtr>(rhs_val, "comparing kwarg: " + lhs[i].first);
@@ -921,6 +947,7 @@ bool StructuralEqualImpl<AssertMode>::Equal(const IRNodePtr& lhs, const IRNodePt
   EQUAL_DISPATCH(ClusterScopeStmt)
   EQUAL_DISPATCH(HierarchyScopeStmt)
   EQUAL_DISPATCH(SpmdScopeStmt)
+  EQUAL_DISPATCH(ManualScopeStmt)
   EQUAL_DISPATCH_TRANSPARENT(SeqStmts)
   EQUAL_DISPATCH(EvalStmt)
   EQUAL_DISPATCH(BreakStmt)
