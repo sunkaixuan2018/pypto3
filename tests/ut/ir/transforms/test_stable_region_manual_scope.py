@@ -194,7 +194,7 @@ def _collect_manual_scopes(program: ir.Program) -> list[ir.ManualScopeStmt]:
     return collector.scopes
 
 
-def _collect_return_stmts(program: ir.Program) -> list[ir.ReturnStmt]:
+def _collect_orchestration_return_stmts(program: ir.Program) -> list[ir.ReturnStmt]:
     class _Collector(ir.IRVisitor):
         def __init__(self) -> None:
             super().__init__()
@@ -205,7 +205,9 @@ def _collect_return_stmts(program: ir.Program) -> list[ir.ReturnStmt]:
             super().visit_return_stmt(op)
 
     collector = _Collector()
-    collector.visit_program(program)
+    for func in program.functions.values():
+        if func.func_type == ir.FunctionType.Orchestration:
+            collector.visit_stmt(func.body)
     return collector.returns
 
 
@@ -271,7 +273,7 @@ def test_lower_stable_regions_wraps_marked_calls_in_manual_scope():
     manual_scopes = _collect_manual_scopes(lowered)
     assert len(manual_scopes) == 1
     assert manual_scopes[0].template_key == "paged_attention_qk_softmax_pv_update"
-    assert len(_collect_return_stmts(lowered)) == 1
+    assert len(_collect_orchestration_return_stmts(lowered)) == 1
 
 
 def test_lower_stable_regions_wraps_bgemm_template_in_manual_scope():
@@ -284,7 +286,7 @@ def test_lower_stable_regions_wraps_bgemm_template_in_manual_scope():
     manual_scopes = _collect_manual_scopes(lowered)
     assert len(manual_scopes) == 1
     assert manual_scopes[0].template_key == "bgemm_tile_add_bgemm_tile_add"
-    assert len(_collect_return_stmts(lowered)) == 1
+    assert len(_collect_orchestration_return_stmts(lowered)) == 1
 
 
 def test_identify_stable_regions_rejects_open_output_boundary():
@@ -353,7 +355,8 @@ def test_identify_stable_regions_rejects_open_output_boundary():
             pv_buf: pl.Tensor[[16], pl.FP32] = pl.create_tensor([16], dtype=pl.FP32)
             pv_buf = self.kernel_pv_matmul(softmax_buf, pv_buf)
             updated = self.kernel_online_update(pv_buf, dst)
-            post = self.kernel_post_consumer(updated, dst)
+            post_buf: pl.Tensor[[16], pl.FP32] = pl.create_tensor([16], dtype=pl.FP32)
+            post = self.kernel_post_consumer(updated, post_buf)
             return post
 
     program = passes.derive_call_directions()(OpenOutputProgram)
