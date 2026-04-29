@@ -156,7 +156,7 @@ class TestOrchestration:
         assert "params_t2.add_dep(task_result_1.task_id())" in code
         assert "params_t3.add_dep(task_result_2.task_id())" in code
 
-    def test_bgemm_template_manual_scope_emits_task_handles_and_deps(self):
+    def test_bgemm_manual_scope_emits_mixed_aic_aiv_task_deps(self):
         """A complete bgemm-like template region is lowered to a manual dependency scope."""
         backend.reset_for_testing()
         backend.set_backend_type(BackendType.Ascend910B)
