@@ -10,7 +10,9 @@
 """End-to-end runtime coverage for stable-region manual-scope templates."""
 
 from datetime import datetime
+import os
 from pathlib import Path
+import shutil
 
 import pypto.language as pl
 import pytest
@@ -117,7 +119,23 @@ def _read_orchestration_cpp(output_dir: Path) -> str:
     return "\n".join(path.read_text() for path in cpp_files)
 
 
+def _require_ptoas() -> None:
+    ptoas_root = os.environ.get("PTOAS_ROOT")
+    if ptoas_root:
+        ptoas_bin = Path(ptoas_root) / "ptoas"
+        if ptoas_bin.is_file() and os.access(ptoas_bin, os.X_OK):
+            return
+        pytest.skip(f"PTOAS_ROOT is set but {ptoas_bin} is not executable")
+
+    if shutil.which("ptoas"):
+        return
+
+    pytest.skip("ptoas binary not found; set PTOAS_ROOT or add ptoas to PATH for runtime template e2e")
+
+
 def test_bgemm_manual_scope_template_executes_end_to_end(output_root, test_config):
+    _require_ptoas()
+
     compiled = ir.compile(
         BgemmManualScopeProgram,
         output_dir=str(output_root / "bgemm_manual_scope"),
