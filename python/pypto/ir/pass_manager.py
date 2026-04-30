@@ -89,6 +89,7 @@ class OptimizationStrategy(Enum):
     """Enumeration of optimization strategies."""
 
     Default = "Default"  # Full tensor-oriented PTO pipeline
+    DefaultWithoutStableRegionTemplates = "DefaultWithoutStableRegionTemplates"  # AUTO-scope baseline
     DebugTileOptimization = "DebugTileOptimization"  # Debug-only PTO tile pipeline
 
 
@@ -158,8 +159,18 @@ class PassManager:
             ("IdentifyStableRegions", lambda: passes.identify_stable_regions()),
             ("LowerStableRegionsToManualScope", lambda: passes.lower_stable_regions_to_manual_scope()),
         ]
+        stable_template_pass_names = {
+            "IdentifyStableRegions",
+            "LowerStableRegionsToManualScope",
+        }
+        tile_pto_passes_without_stable_templates = [
+            spec for spec in tile_pto_passes if spec[0] not in stable_template_pass_names
+        ]
         cls._strategy_passes = {
             OptimizationStrategy.Default: tensor_prefix_passes + tensor_only_passes + tile_pto_passes,
+            OptimizationStrategy.DefaultWithoutStableRegionTemplates: (
+                tensor_prefix_passes + tensor_only_passes + tile_pto_passes_without_stable_templates
+            ),
             OptimizationStrategy.DebugTileOptimization: tensor_prefix_passes + tile_pto_passes,
         }
 

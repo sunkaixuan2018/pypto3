@@ -133,6 +133,16 @@ def _require_ptoas() -> None:
     pytest.skip("ptoas binary not found; set PTOAS_ROOT or add ptoas to PATH for runtime template e2e")
 
 
+def make_bgemm_manual_scope_inputs() -> tuple[torch.Tensor, ...]:
+    lhs = torch.eye(_SIZE, dtype=torch.float32)
+    rhs0 = torch.full((_SIZE, _SIZE), 1.25, dtype=torch.float32)
+    bias0 = torch.full((_SIZE, _SIZE), 2.0, dtype=torch.float32)
+    rhs1 = torch.eye(_SIZE, dtype=torch.float32)
+    bias1 = torch.full((_SIZE, _SIZE), 3.0, dtype=torch.float32)
+    dst = torch.zeros((_SIZE, _SIZE), dtype=torch.float32)
+    return lhs, rhs0, bias0, rhs1, bias1, dst
+
+
 def test_bgemm_manual_scope_template_executes_end_to_end(output_root, test_config):
     _require_ptoas()
 
@@ -153,12 +163,7 @@ def test_bgemm_manual_scope_template_executes_end_to_end(output_root, test_confi
     assert "params_t2.add_dep(task_result_1.task_id())" in orchestration_cpp
     assert "params_t3.add_dep(task_result_2.task_id())" in orchestration_cpp
 
-    lhs = torch.eye(_SIZE, dtype=torch.float32)
-    rhs0 = torch.full((_SIZE, _SIZE), 1.25, dtype=torch.float32)
-    bias0 = torch.full((_SIZE, _SIZE), 2.0, dtype=torch.float32)
-    rhs1 = torch.eye(_SIZE, dtype=torch.float32)
-    bias1 = torch.full((_SIZE, _SIZE), 3.0, dtype=torch.float32)
-    dst = torch.zeros((_SIZE, _SIZE), dtype=torch.float32)
+    lhs, rhs0, bias0, rhs1, bias1, dst = make_bgemm_manual_scope_inputs()
 
     compiled(lhs, rhs0, bias0, rhs1, bias1, dst, config=test_config)
 
@@ -166,6 +171,22 @@ def test_bgemm_manual_scope_template_executes_end_to_end(output_root, test_confi
     assert torch.allclose(dst, expected, rtol=1e-5, atol=1e-5), (
         f"Manual-scope template execution failed: max diff = {(dst - expected).abs().max().item()}"
     )
+
+
+def test_bgemm_template_baseline_strategy_emits_auto_scope(output_root, test_config):
+    _require_ptoas()
+
+    compiled = ir.compile(
+        BgemmManualScopeProgram,
+        output_dir=str(output_root / "bgemm_auto_scope_baseline"),
+        strategy=ir.OptimizationStrategy.DefaultWithoutStableRegionTemplates,
+        backend_type=platform_to_backend(test_config.platform),
+        platform=test_config.platform,
+    )
+
+    orchestration_cpp = _read_orchestration_cpp(compiled.output_dir)
+    assert "PTO2_SCOPE(PTO2ScopeMode::MANUAL)" not in orchestration_cpp
+    assert ".add_dep(task_result_" not in orchestration_cpp
 
 
 if __name__ == "__main__":

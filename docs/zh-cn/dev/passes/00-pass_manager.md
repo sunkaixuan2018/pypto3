@@ -17,7 +17,7 @@
 - **属性跟踪**：Pass 声明所需、产生和失效的属性
 - **插桩**：PassContext 持有 PassInstrument，在每个 Pass 执行前/后运行
 - **运行时验证**：VerificationInstrument 根据实际 IR 检查属性
-- **基于策略的流水线**：预配置的优化级别（`Default`、`DebugTileOptimization`）
+- **基于策略的流水线**：预配置的优化级别（`Default`、`DefaultWithoutStableRegionTemplates`、`DebugTileOptimization`）
 - **不可变变换**：返回新的 IR 节点，不就地修改
 
 ## IRProperty 系统
@@ -361,6 +361,12 @@ with passes.PassContext([passes.VerificationInstrument(passes.VerificationMode.A
 ```
 
 ### 策略补充说明
+
+策略概览：
+
+- `Default`：完整的 tensor-oriented PTO 流水线，包含稳定模板识别和 manual-scope lowering。
+- `DefaultWithoutStableRegionTemplates`：与 `Default` 相同，但省略 `IdentifyStableRegions` 和 `LowerStableRegionsToManualScope`；用于静态模板性能测量中的传统 AUTO-scope baseline。
+- `DebugTileOptimization`：调试用 PTO tile 流水线，包含稳定模板识别。
 
 `Default` 和 `DebugTileOptimization` 共享的 PTO tile 阶段顺序为：
 

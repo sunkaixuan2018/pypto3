@@ -17,7 +17,7 @@ Framework for organizing and executing IR transformation passes on Programs with
 - **Property Tracking**: Passes declare required, produced, and invalidated properties
 - **Instrumentation**: PassContext holds PassInstruments that run before/after each pass
 - **Runtime Verification**: VerificationInstrument checks properties against actual IR
-- **Strategy-based Pipelines**: Pre-configured optimization levels (`Default`, `DebugTileOptimization`)
+- **Strategy-based Pipelines**: Pre-configured optimization levels (`Default`, `DefaultWithoutStableRegionTemplates`, `DebugTileOptimization`)
 - **Immutable Transformations**: Return new IR nodes, don't modify in place
 
 ## IRProperty System
@@ -361,6 +361,12 @@ with passes.PassContext([passes.VerificationInstrument(passes.VerificationMode.A
 ```
 
 ### Strategy Notes
+
+Strategy summary:
+
+- `Default`: full tensor-oriented PTO pipeline, including stable-template detection and manual-scope lowering.
+- `DefaultWithoutStableRegionTemplates`: same as `Default` except it omits `IdentifyStableRegions` and `LowerStableRegionsToManualScope`; use it as the traditional AUTO-scope baseline for static-template performance measurements.
+- `DebugTileOptimization`: debug-only PTO tile pipeline, including stable-template detection.
 
 The PTO-oriented tile stage shared by `Default` and `DebugTileOptimization` is:
 

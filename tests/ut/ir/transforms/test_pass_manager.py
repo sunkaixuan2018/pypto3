@@ -56,6 +56,15 @@ TENSOR_OPTIMIZATION_PASSES = [
     "LowerStableRegionsToManualScope",
 ]
 
+STABLE_TEMPLATE_PASSES = [
+    "IdentifyStableRegions",
+    "LowerStableRegionsToManualScope",
+]
+
+TENSOR_OPTIMIZATION_WITHOUT_STABLE_TEMPLATE_PASSES = [
+    name for name in TENSOR_OPTIMIZATION_PASSES if name not in STABLE_TEMPLATE_PASSES
+]
+
 DEBUG_TILE_OPTIMIZATION_PASSES = [
     "UnrollLoops",
     "CtrlFlowTransform",
@@ -111,12 +120,14 @@ class TestOptimizationStrategy:
     def test_optimization_strategy_values(self):
         """Test that all optimization strategies exist."""
         assert ir.OptimizationStrategy.Default is not None
+        assert ir.OptimizationStrategy.DefaultWithoutStableRegionTemplates is not None
         assert ir.OptimizationStrategy.DebugTileOptimization is not None
 
     def test_optimization_strategy_values_are_different(self):
         """Test that optimization strategies have different values."""
         strategies = [
             ir.OptimizationStrategy.Default,
+            ir.OptimizationStrategy.DefaultWithoutStableRegionTemplates,
             ir.OptimizationStrategy.DebugTileOptimization,
         ]
         assert len(strategies) == len(set(strategies))
@@ -131,6 +142,16 @@ class TestPassManagerBasics:
         assert pm is not None
         assert pm.strategy == ir.OptimizationStrategy.Default
         assert pm.pass_names == TENSOR_OPTIMIZATION_PASSES
+
+    def test_pass_manager_get_strategy_default_without_stable_templates(self):
+        """Test getting DefaultWithoutStableRegionTemplates strategy PassManager."""
+        pm = ir.PassManager.get_strategy(ir.OptimizationStrategy.DefaultWithoutStableRegionTemplates)
+        assert pm is not None
+        assert pm.strategy == ir.OptimizationStrategy.DefaultWithoutStableRegionTemplates
+        assert pm.pass_names == TENSOR_OPTIMIZATION_WITHOUT_STABLE_TEMPLATE_PASSES
+        assert "DeriveCallDirections" in pm.pass_names
+        assert "IdentifyStableRegions" not in pm.pass_names
+        assert "LowerStableRegionsToManualScope" not in pm.pass_names
 
     def test_pass_manager_get_strategy_debug_tile_optimization(self):
         """Test getting DebugTileOptimization strategy PassManager."""
