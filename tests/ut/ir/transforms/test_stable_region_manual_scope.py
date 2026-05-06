@@ -163,6 +163,116 @@ def _build_bgemm_like_program():
     return BgemmTemplateProgram
 
 
+def _build_loop_body_paged_attention_like_program():
+    @pl.program
+    class LoopBodyStableRegionProgram:
+        @pl.function(type=pl.FunctionType.InCore)
+        def kernel_qk_matmul(
+            self,
+            src: pl.Tensor[[16], pl.FP32],
+            dst: pl.Out[pl.Tensor[[16], pl.FP32]],
+        ) -> pl.Tensor[[16], pl.FP32]:
+            tile = pl.load(src, [0], [16])
+            ret = pl.store(tile, [0], dst)
+            return ret
+
+        @pl.function(type=pl.FunctionType.InCore)
+        def kernel_softmax_prepare(
+            self,
+            src: pl.Tensor[[16], pl.FP32],
+            dst: pl.Out[pl.Tensor[[16], pl.FP32]],
+        ) -> pl.Tensor[[16], pl.FP32]:
+            tile = pl.load(src, [0], [16])
+            ret = pl.store(tile, [0], dst)
+            return ret
+
+        @pl.function(type=pl.FunctionType.InCore)
+        def kernel_pv_matmul(
+            self,
+            src: pl.Tensor[[16], pl.FP32],
+            dst: pl.Out[pl.Tensor[[16], pl.FP32]],
+        ) -> pl.Tensor[[16], pl.FP32]:
+            tile = pl.load(src, [0], [16])
+            ret = pl.store(tile, [0], dst)
+            return ret
+
+        @pl.function(type=pl.FunctionType.InCore)
+        def kernel_online_update(
+            self,
+            src: pl.Tensor[[16], pl.FP32],
+            mi_state: pl.InOut[pl.Tensor[[16], pl.FP32]],
+            li_state: pl.InOut[pl.Tensor[[16], pl.FP32]],
+            oi_state: pl.InOut[pl.Tensor[[16], pl.FP32]],
+            dst: pl.Out[pl.Tensor[[16], pl.FP32]],
+            is_first: pl.Scalar[pl.BOOL],
+            is_last: pl.Scalar[pl.BOOL],
+        ) -> tuple[
+            pl.Tensor[[16], pl.FP32],
+            pl.Tensor[[16], pl.FP32],
+            pl.Tensor[[16], pl.FP32],
+            pl.Tensor[[16], pl.FP32],
+        ]:
+            src_tile = pl.load(src, [0], [16])
+            if is_first:
+                mi_out = pl.store(src_tile, [0], mi_state)
+            else:
+                mi_out = pl.store(src_tile, [0], mi_state)
+
+            if is_last:
+                li_out = pl.store(src_tile, [0], li_state)
+            else:
+                li_out = pl.store(src_tile, [0], li_state)
+
+            oi_out = pl.store(src_tile, [0], oi_state)
+            dst_out = pl.store(src_tile, [0], dst)
+            return mi_out, li_out, oi_out, dst_out
+
+        @pl.function(type=pl.FunctionType.Orchestration)
+        def main(
+            self,
+            src: pl.Tensor[[16], pl.FP32],
+            dst: pl.Out[pl.Tensor[[16], pl.FP32]],
+        ) -> pl.Tensor[[16], pl.FP32]:
+            mi_init: pl.Tensor[[16], pl.FP32] = pl.create_tensor([16], dtype=pl.FP32)
+            li_init: pl.Tensor[[16], pl.FP32] = pl.create_tensor([16], dtype=pl.FP32)
+            oi_init: pl.Tensor[[16], pl.FP32] = pl.create_tensor([16], dtype=pl.FP32)
+
+            for bn, (mi_state, li_state, oi_state) in pl.range(2, init_values=(mi_init, li_init, oi_init)):
+                qk_buf: pl.Tensor[[16], pl.FP32] = pl.create_tensor([16], dtype=pl.FP32)
+                qk_buf = self.kernel_qk_matmul(src, qk_buf)
+
+                softmax_buf: pl.Tensor[[16], pl.FP32] = pl.create_tensor([16], dtype=pl.FP32)
+                softmax_buf = self.kernel_softmax_prepare(qk_buf, softmax_buf)
+
+                pv_buf: pl.Tensor[[16], pl.FP32] = pl.create_tensor([16], dtype=pl.FP32)
+                pv_buf = self.kernel_pv_matmul(softmax_buf, pv_buf)
+
+                if bn == 0:
+                    is_first: pl.Scalar[pl.BOOL] = pl.yield_(1)
+                else:
+                    is_first: pl.Scalar[pl.BOOL] = pl.yield_(0)
+
+                if bn == 1:
+                    is_last: pl.Scalar[pl.BOOL] = pl.yield_(1)
+                else:
+                    is_last: pl.Scalar[pl.BOOL] = pl.yield_(0)
+
+                next_mi, next_li, next_oi, dst = self.kernel_online_update(
+                    pv_buf,
+                    mi_state,
+                    li_state,
+                    oi_state,
+                    dst,
+                    is_first,
+                    is_last,
+                )
+                mi_out, li_out, oi_out = pl.yield_(next_mi, next_li, next_oi)
+
+            return dst
+
+    return LoopBodyStableRegionProgram
+
+
 def _collect_user_calls(program: ir.Program) -> list[ir.Call]:
     class _Collector(ir.IRVisitor):
         def __init__(self) -> None:
@@ -263,6 +373,34 @@ def test_identify_stable_regions_marks_bgemm_template_calls():
     assert [call.attrs["manual_dep_indices"] for call in calls] == [[], [0], [1], [2]]
 
 
+def test_identify_stable_regions_marks_loop_body_template_calls():
+    program = passes.derive_call_directions()(_build_loop_body_paged_attention_like_program())
+    program = passes.simplify()(program)
+
+    identified = passes.identify_stable_regions()(program)
+
+    calls = [
+        call
+        for call in _collect_user_calls(identified)
+        if call.op.name
+        in {
+            "kernel_qk_matmul",
+            "kernel_softmax_prepare",
+            "kernel_pv_matmul",
+            "kernel_online_update",
+        }
+    ]
+    assert len(calls) == 4
+    assert [call.attrs["stable_region_template_key"] for call in calls] == [
+        "paged_attention_loop_body_v1",
+        "paged_attention_loop_body_v1",
+        "paged_attention_loop_body_v1",
+        "paged_attention_loop_body_v1",
+    ]
+    assert [call.attrs["manual_task_index"] for call in calls] == [0, 1, 2, 3]
+    assert [call.attrs["manual_dep_indices"] for call in calls] == [[], [0], [1], [2]]
+
+
 def test_lower_stable_regions_wraps_marked_calls_in_manual_scope():
     program = passes.derive_call_directions()(_build_paged_attention_like_program())
     program = passes.simplify()(program)
@@ -286,6 +424,19 @@ def test_lower_stable_regions_wraps_bgemm_template_in_manual_scope():
     manual_scopes = _collect_manual_scopes(lowered)
     assert len(manual_scopes) == 1
     assert manual_scopes[0].template_key == "bgemm_tile_add_bgemm_tile_add"
+    assert len(_collect_orchestration_return_stmts(lowered)) == 1
+
+
+def test_lower_stable_regions_wraps_loop_body_template_in_manual_scope():
+    program = passes.derive_call_directions()(_build_loop_body_paged_attention_like_program())
+    program = passes.simplify()(program)
+    identified = passes.identify_stable_regions()(program)
+
+    lowered = passes.lower_stable_regions_to_manual_scope()(identified)
+
+    manual_scopes = _collect_manual_scopes(lowered)
+    assert len(manual_scopes) == 1
+    assert manual_scopes[0].template_key == "paged_attention_loop_body_v1"
     assert len(_collect_orchestration_return_stmts(lowered)) == 1
 
 

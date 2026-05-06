@@ -236,9 +236,6 @@ class OrchestrationStmtCodegen : public CodegenBase {
   }
 
   void VisitStmt_(const ForStmtPtr& for_stmt) override {
-    INTERNAL_CHECK_SPAN(manual_scope_depth_ == 0, for_stmt->span_)
-        << "ManualScopeStmt cannot contain ForStmt because orchestration codegen would emit an AUTO "
-           "PTO2_SCOPE inside a MANUAL scope";
     if (for_stmt->kind_ == ForKind::Unroll) {
       LOG_WARN << "ForKind::Unroll loop was not expanded before codegen; "
                   "generating sequential loop as fallback";
@@ -265,24 +262,26 @@ class OrchestrationStmtCodegen : public CodegenBase {
     code_ << Indent() << "for (int64_t " << loop_var << " = " << start_expr << "; " << loop_var << " < "
           << stop_expr << "; " << loop_var << " += " << step_expr << ") {\n";
     indent_ += 4;
-    code_ << Indent() << "PTO2_SCOPE() {\n";
-    indent_ += 4;
+
+    if (manual_scope_depth_ == 0) {
+      code_ << Indent() << "PTO2_SCOPE() {\n";
+      indent_ += 4;
+    }
 
     auto saved = current_return_vars_;
     current_return_vars_.clear();
     VisitStmt(for_stmt->body_);
     current_return_vars_ = saved;
 
-    indent_ -= 4;
-    code_ << Indent() << "}\n";
+    if (manual_scope_depth_ == 0) {
+      indent_ -= 4;
+      code_ << Indent() << "}\n";
+    }
     indent_ -= 4;
     code_ << Indent() << "}\n";
   }
 
   void VisitStmt_(const IfStmtPtr& if_stmt) override {
-    INTERNAL_CHECK_SPAN(manual_scope_depth_ == 0, if_stmt->span_)
-        << "ManualScopeStmt cannot contain IfStmt because orchestration codegen would emit an AUTO "
-           "PTO2_SCOPE inside a MANUAL scope";
     std::string cond_expr = GenerateExprString(if_stmt->condition_);
 
     for (const auto& rv : if_stmt->return_vars_) {
@@ -290,11 +289,11 @@ class OrchestrationStmtCodegen : public CodegenBase {
     }
 
     code_ << Indent() << "if (" << cond_expr << ") {\n";
-    VisitScopedBranchBody(if_stmt->then_body_, if_stmt->return_vars_);
+    VisitBranchBody(if_stmt->then_body_, if_stmt->return_vars_, manual_scope_depth_ == 0);
 
     if (if_stmt->else_body_.has_value()) {
       code_ << Indent() << "} else {\n";
-      VisitScopedBranchBody(*if_stmt->else_body_, if_stmt->return_vars_);
+      VisitBranchBody(*if_stmt->else_body_, if_stmt->return_vars_, manual_scope_depth_ == 0);
     }
 
     code_ << Indent() << "}\n";
@@ -1117,18 +1116,22 @@ class OrchestrationStmtCodegen : public CodegenBase {
     }
   }
 
-  void VisitScopedBranchBody(const StmtPtr& body, const std::vector<VarPtr>& return_vars) {
+  void VisitBranchBody(const StmtPtr& body, const std::vector<VarPtr>& return_vars, bool wrap_auto_scope) {
     indent_ += 4;
-    code_ << Indent() << "PTO2_SCOPE() {\n";
-    indent_ += 4;
+    if (wrap_auto_scope) {
+      code_ << Indent() << "PTO2_SCOPE() {\n";
+      indent_ += 4;
+    }
 
     auto saved = current_return_vars_;
     current_return_vars_.assign(return_vars.begin(), return_vars.end());
     VisitStmt(body);
     current_return_vars_ = saved;
 
-    indent_ -= 4;
-    code_ << Indent() << "}\n";
+    if (wrap_auto_scope) {
+      indent_ -= 4;
+      code_ << Indent() << "}\n";
+    }
     indent_ -= 4;
   }
 

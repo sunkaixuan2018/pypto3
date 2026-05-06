@@ -82,8 +82,139 @@ def _generate_manual_scope_orch_code(program) -> str:
     raise ValueError("No orchestration function found in program")
 
 
+def _generate_loop_body_manual_scope_orch_code(program) -> str:
+    """Generate orchestration code for a control-flow-aware loop-body manual scope."""
+    program = passes.derive_call_directions()(program)
+    program = passes.simplify()(program)
+    program = passes.identify_stable_regions()(program)
+    program = passes.lower_stable_regions_to_manual_scope()(program)
+    for func in program.functions.values():
+        if func.func_type == ir.FunctionType.Orchestration:
+            return codegen.generate_orchestration(program, func).code
+    raise ValueError("No orchestration function found in program")
+
+
 class TestOrchestration:
     """Test orchestration codegen format."""
+
+    def test_manual_scope_loop_body_emits_manual_loop_and_flag_branches(self):
+        """A matched innermost loop body should remain a loop inside a manual scope."""
+        backend.reset_for_testing()
+        backend.set_backend_type(BackendType.Ascend910B)
+
+        @pl.program
+        class LoopBodyStableRegionProgram:
+            @pl.function(type=pl.FunctionType.InCore)
+            def kernel_qk_matmul(
+                self,
+                src: pl.Tensor[[16], pl.FP32],
+                dst: pl.Out[pl.Tensor[[16], pl.FP32]],
+            ) -> pl.Tensor[[16], pl.FP32]:
+                tile = pl.load(src, [0], [16])
+                ret = pl.store(tile, [0], dst)
+                return ret
+
+            @pl.function(type=pl.FunctionType.InCore)
+            def kernel_softmax_prepare(
+                self,
+                src: pl.Tensor[[16], pl.FP32],
+                dst: pl.Out[pl.Tensor[[16], pl.FP32]],
+            ) -> pl.Tensor[[16], pl.FP32]:
+                tile = pl.load(src, [0], [16])
+                ret = pl.store(tile, [0], dst)
+                return ret
+
+            @pl.function(type=pl.FunctionType.InCore)
+            def kernel_pv_matmul(
+                self,
+                src: pl.Tensor[[16], pl.FP32],
+                dst: pl.Out[pl.Tensor[[16], pl.FP32]],
+            ) -> pl.Tensor[[16], pl.FP32]:
+                tile = pl.load(src, [0], [16])
+                ret = pl.store(tile, [0], dst)
+                return ret
+
+            @pl.function(type=pl.FunctionType.InCore)
+            def kernel_online_update(
+                self,
+                src: pl.Tensor[[16], pl.FP32],
+                mi_state: pl.InOut[pl.Tensor[[16], pl.FP32]],
+                li_state: pl.InOut[pl.Tensor[[16], pl.FP32]],
+                oi_state: pl.InOut[pl.Tensor[[16], pl.FP32]],
+                dst: pl.Out[pl.Tensor[[16], pl.FP32]],
+                is_first: pl.Scalar[pl.BOOL],
+                is_last: pl.Scalar[pl.BOOL],
+            ) -> tuple[
+                pl.Tensor[[16], pl.FP32],
+                pl.Tensor[[16], pl.FP32],
+                pl.Tensor[[16], pl.FP32],
+                pl.Tensor[[16], pl.FP32],
+            ]:
+                src_tile = pl.load(src, [0], [16])
+                if is_first:
+                    mi_out = pl.store(src_tile, [0], mi_state)
+                else:
+                    mi_out = pl.store(src_tile, [0], mi_state)
+                if is_last:
+                    li_out = pl.store(src_tile, [0], li_state)
+                else:
+                    li_out = pl.store(src_tile, [0], li_state)
+                oi_out = pl.store(src_tile, [0], oi_state)
+                dst_out = pl.store(src_tile, [0], dst)
+                return mi_out, li_out, oi_out, dst_out
+
+            @pl.function(type=pl.FunctionType.Orchestration)
+            def main(
+                self,
+                src: pl.Tensor[[16], pl.FP32],
+                dst: pl.Out[pl.Tensor[[16], pl.FP32]],
+            ) -> pl.Tensor[[16], pl.FP32]:
+                mi_init: pl.Tensor[[16], pl.FP32] = pl.create_tensor([16], dtype=pl.FP32)
+                li_init: pl.Tensor[[16], pl.FP32] = pl.create_tensor([16], dtype=pl.FP32)
+                oi_init: pl.Tensor[[16], pl.FP32] = pl.create_tensor([16], dtype=pl.FP32)
+
+                for bn, (mi_state, li_state, oi_state) in pl.range(2, init_values=(mi_init, li_init, oi_init)):
+                    qk_buf: pl.Tensor[[16], pl.FP32] = pl.create_tensor([16], dtype=pl.FP32)
+                    qk_buf = self.kernel_qk_matmul(src, qk_buf)
+
+                    softmax_buf: pl.Tensor[[16], pl.FP32] = pl.create_tensor([16], dtype=pl.FP32)
+                    softmax_buf = self.kernel_softmax_prepare(qk_buf, softmax_buf)
+
+                    pv_buf: pl.Tensor[[16], pl.FP32] = pl.create_tensor([16], dtype=pl.FP32)
+                    pv_buf = self.kernel_pv_matmul(softmax_buf, pv_buf)
+
+                    if bn == 0:
+                        is_first: pl.Scalar[pl.BOOL] = pl.yield_(1)
+                    else:
+                        is_first: pl.Scalar[pl.BOOL] = pl.yield_(0)
+
+                    if bn == 1:
+                        is_last: pl.Scalar[pl.BOOL] = pl.yield_(1)
+                    else:
+                        is_last: pl.Scalar[pl.BOOL] = pl.yield_(0)
+
+                    next_mi, next_li, next_oi, dst = self.kernel_online_update(
+                        pv_buf,
+                        mi_state,
+                        li_state,
+                        oi_state,
+                        dst,
+                        is_first,
+                        is_last,
+                    )
+                    mi_out, li_out, oi_out = pl.yield_(next_mi, next_li, next_oi)
+
+                return dst
+
+        code = _generate_loop_body_manual_scope_orch_code(LoopBodyStableRegionProgram)
+
+        assert "PTO2_SCOPE(PTO2ScopeMode::MANUAL)" in code
+        assert "for (int64_t bn = 0; bn < 2; bn += 1)" in code
+        assert "if (bn == 0)" in code
+        assert "if (bn == 1)" in code
+        assert "params_t1.add_dep(task_result_0.task_id())" in code
+        assert "params_t2.add_dep(task_result_1.task_id())" in code
+        assert "params_t3.add_dep(task_result_2.task_id())" in code
 
     def test_manual_scope_emits_task_handles_and_deps(self):
         """Stable PagedAttention-like regions use manual scope with explicit task deps."""

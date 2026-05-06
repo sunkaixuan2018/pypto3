@@ -4,7 +4,7 @@ Wraps calls marked by `IdentifyStableRegions` in structured manual-scope IR.
 
 ## Overview
 
-`LowerStableRegionsToManualScope` consumes the attrs produced by `IdentifyStableRegions` and creates a `ManualScopeStmt` around the matched straight-line region. The per-call attrs remain on the calls so orchestration codegen can emit explicit dependencies.
+`LowerStableRegionsToManualScope` consumes the attrs produced by `IdentifyStableRegions` and creates a `ManualScopeStmt` around the matched region. The per-call attrs remain on the calls so orchestration codegen can emit explicit dependencies.
 
 ## API
 
@@ -22,13 +22,19 @@ Calls must carry:
 
 ## Output
 
-The matched statements are wrapped as:
+Straight-line regions are wrapped as:
 
 ```text
 ManualScopeStmt(template_key=..., body=SeqStmts([...]))
 ```
 
-The pass preserves unmarked statements before and after the region, including trailing `ReturnStmt`s. It rejects unsafe wrapping if the candidate range contains control flow or an existing scope.
+Loop-body regions are wrapped as:
+
+```text
+ManualScopeStmt(template_key=..., body=ForStmt(...))
+```
+
+The pass preserves unmarked statements before and after the region, including trailing `ReturnStmt`s. For straight-line regions it still rejects unsafe wrapping if the candidate range contains control flow or an existing scope.
 
 ## Codegen Contract
 

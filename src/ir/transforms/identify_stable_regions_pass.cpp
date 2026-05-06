@@ -12,6 +12,7 @@
 #include <any>
 #include <cstddef>
 #include <memory>
+#include <optional>
 #include <string>
 #include <unordered_map>
 #include <unordered_set>
@@ -29,6 +30,7 @@
 #include "pypto/ir/transforms/base/mutator.h"
 #include "pypto/ir/transforms/base/visitor.h"
 #include "pypto/ir/transforms/passes.h"
+#include "pypto/ir/transforms/utils/mutable_copy.h"
 
 namespace pypto {
 namespace ir {
@@ -41,8 +43,10 @@ constexpr const char* kManualDepIndices = "manual_dep_indices";
 
 using ::pypto::codegen::IsBuiltinOp;
 using ::pypto::codegen::IsTensorOp;
+using ::pypto::codegen::orchestration::AllowedIfFlagWindow;
 using ::pypto::codegen::orchestration::GetStableRegionTemplates;
 using ::pypto::codegen::orchestration::KernelNameMatchesToken;
+using ::pypto::codegen::orchestration::StableRegionKind;
 using ::pypto::codegen::orchestration::StableRegionTemplate;
 
 struct RegionCallAttrs {
@@ -259,11 +263,100 @@ CallPtr CloneCallWithStableRegionAttrs(const CallPtr& call, const RegionCallAttr
                                 call->span_);
 }
 
+StmtPtr ReplaceDirectCall(const StmtPtr& stmt, const CallPtr& new_call) {
+  if (auto assign = As<AssignStmt>(stmt)) {
+    auto replacement = MutableCopy(assign);
+    replacement->value_ = new_call;
+    return replacement;
+  }
+  if (auto eval = As<EvalStmt>(stmt)) {
+    auto replacement = MutableCopy(eval);
+    replacement->expr_ = new_call;
+    return replacement;
+  }
+  INTERNAL_CHECK(false) << "Internal error: direct call stmt is neither AssignStmt nor EvalStmt";
+  return stmt;
+}
+
+bool ExprIsScalar(const ExprPtr& expr) { return expr && As<ScalarType>(expr->GetType()) != nullptr; }
+
+bool BranchIsScalarYieldOnly(const StmtPtr& stmt) {
+  auto yield = As<YieldStmt>(stmt);
+  if (!yield) {
+    auto seq = As<SeqStmts>(stmt);
+    if (!seq || seq->stmts_.size() != 1) {
+      return false;
+    }
+    yield = As<YieldStmt>(seq->stmts_[0]);
+  }
+  if (!yield || yield->value_.size() != 1) {
+    return false;
+  }
+  return ExprIsScalar(yield->value_[0]);
+}
+
+bool IsSupportedFlagIfStmt(const IfStmtPtr& if_stmt) {
+  if (!if_stmt || !if_stmt->else_body_.has_value() || if_stmt->return_vars_.size() != 1) {
+    return false;
+  }
+  if (!As<ScalarType>(if_stmt->return_vars_[0]->GetType())) {
+    return false;
+  }
+  return BranchIsScalarYieldOnly(if_stmt->then_body_) && BranchIsScalarYieldOnly(*if_stmt->else_body_);
+}
+
+bool ContainsNestedLoop(const StmtPtr& stmt) {
+  class NestedLoopFinder : public IRVisitor {
+   public:
+    bool has_nested_loop = false;
+
+   protected:
+    void VisitStmt_(const ForStmtPtr&) override { has_nested_loop = true; }
+    void VisitStmt_(const WhileStmtPtr&) override { has_nested_loop = true; }
+  };
+
+  NestedLoopFinder finder;
+  finder.VisitStmt(stmt);
+  return finder.has_nested_loop;
+}
+
+const AllowedIfFlagWindow* FindAllowedIfFlagWindow(const StableRegionTemplate& templ, size_t after_task_index,
+                                                   size_t before_task_index) {
+  for (const auto& window : templ.allowed_if_flag_windows) {
+    if (window.after_task_index == after_task_index && window.before_task_index == before_task_index) {
+      return &window;
+    }
+  }
+  return nullptr;
+}
+
 class StableRegionIdentifier : public IRMutator {
  protected:
+  StmtPtr VisitStmt_(const ForStmtPtr& for_stmt) override {
+    if (auto body_seq = As<SeqStmts>(for_stmt->body_)) {
+      auto marks = MatchLoopBodyStableRegion(for_stmt, body_seq);
+      if (!marks.empty()) {
+        auto new_body = RewriteSeqWithMarks(body_seq, marks);
+        if (new_body.get() != for_stmt->body_.get()) {
+          auto replacement = MutableCopy(for_stmt);
+          replacement->body_ = new_body;
+          return replacement;
+        }
+      }
+    }
+    return IRMutator::VisitStmt_(for_stmt);
+  }
+
   StmtPtr VisitStmt_(const SeqStmtsPtr& seq) override {
     std::unordered_map<const Call*, RegionCallAttrs> marks = MatchStableRegions(seq);
+    if (marks.empty()) {
+      return IRMutator::VisitStmt_(seq);
+    }
+    return RewriteSeqWithMarks(seq, marks);
+  }
 
+ private:
+  StmtPtr RewriteSeqWithMarks(const SeqStmtsPtr& seq, const std::unordered_map<const Call*, RegionCallAttrs>& marks) {
     std::vector<StmtPtr> new_stmts;
     bool changed = false;
     new_stmts.reserve(seq->stmts_.size());
@@ -273,14 +366,7 @@ class StableRegionIdentifier : public IRMutator {
       auto mark_it = call ? marks.find(call.get()) : marks.end();
       if (call && mark_it != marks.end()) {
         auto new_call = CloneCallWithStableRegionAttrs(call, mark_it->second);
-        if (auto assign = As<AssignStmt>(stmt)) {
-          new_stmts.push_back(std::make_shared<AssignStmt>(assign->var_, new_call, assign->span_,
-                                                           assign->leading_comments_));
-        } else {
-          auto eval = As<EvalStmt>(stmt);
-          INTERNAL_CHECK(eval) << "Internal error: direct call stmt is neither AssignStmt nor EvalStmt";
-          new_stmts.push_back(std::make_shared<EvalStmt>(new_call, eval->span_, eval->leading_comments_));
-        }
+        new_stmts.push_back(ReplaceDirectCall(stmt, new_call));
         changed = true;
         continue;
       }
@@ -298,7 +384,6 @@ class StableRegionIdentifier : public IRMutator {
     return seq;
   }
 
- private:
   std::unordered_map<const Call*, RegionCallAttrs> MatchStableRegions(const SeqStmtsPtr& seq) {
     std::unordered_map<const Call*, RegionCallAttrs> result;
     std::vector<size_t> task_stmt_indices;
@@ -312,6 +397,9 @@ class StableRegionIdentifier : public IRMutator {
     while (task_pos < task_stmt_indices.size()) {
       bool matched = false;
       for (const auto& templ : GetStableRegionTemplates()) {
+        if (templ.region_kind != StableRegionKind::StraightLine) {
+          continue;
+        }
         const auto& tokens = templ.kernel_name_tokens;
         if (task_pos + tokens.size() > task_stmt_indices.size()) {
           continue;
@@ -372,6 +460,108 @@ class StableRegionIdentifier : public IRMutator {
       if (!matched) {
         ++task_pos;
       }
+    }
+    return result;
+  }
+
+  std::unordered_map<const Call*, RegionCallAttrs> MatchLoopBodyStableRegion(const ForStmtPtr& for_stmt,
+                                                                              const SeqStmtsPtr& body_seq) {
+    if (ContainsNestedLoop(body_seq)) {
+      return {};
+    }
+
+    for (const auto& templ : GetStableRegionTemplates()) {
+      if (templ.region_kind != StableRegionKind::LoopBody) {
+        continue;
+      }
+      auto marks = TryMatchLoopBodyTemplate(for_stmt, body_seq, templ);
+      if (!marks.empty()) {
+        return marks;
+      }
+    }
+    return {};
+  }
+
+  std::unordered_map<const Call*, RegionCallAttrs> TryMatchLoopBodyTemplate(const ForStmtPtr& for_stmt,
+                                                                             const SeqStmtsPtr& body_seq,
+                                                                             const StableRegionTemplate& templ) {
+    if (templ.loop_iter_arg_count != 0 && for_stmt->iter_args_.size() != templ.loop_iter_arg_count) {
+      return {};
+    }
+    if (templ.loop_return_var_count != 0 && for_stmt->return_vars_.size() != templ.loop_return_var_count) {
+      return {};
+    }
+
+    std::vector<size_t> matched_task_stmt_indices;
+    matched_task_stmt_indices.reserve(templ.kernel_name_tokens.size());
+    std::unordered_map<size_t, size_t> observed_if_flag_counts;
+    std::unordered_set<const Stmt*> task_stmts;
+    size_t next_task_index = 0;
+
+    for (size_t stmt_index = 0; stmt_index < body_seq->stmts_.size(); ++stmt_index) {
+      const auto& stmt = body_seq->stmts_[stmt_index];
+
+      if (auto call = GetDirectCall(stmt)) {
+        if (!IsBuiltinOp(call->op_->name_)) {
+          if (next_task_index >= templ.kernel_name_tokens.size() ||
+              !TemplateStageMatchesCall(templ, next_task_index, call)) {
+            return {};
+          }
+          matched_task_stmt_indices.push_back(stmt_index);
+          task_stmts.insert(stmt.get());
+          ++next_task_index;
+          continue;
+        }
+        if (!IsAllowedBetweenTemplateTasks(stmt, task_stmts)) {
+          return {};
+        }
+        continue;
+      }
+
+      if (auto if_stmt = As<IfStmt>(stmt)) {
+        if (next_task_index == 0 || next_task_index >= templ.kernel_name_tokens.size()) {
+          return {};
+        }
+        const AllowedIfFlagWindow* window = FindAllowedIfFlagWindow(templ, next_task_index - 1, next_task_index);
+        if (!window || !IsSupportedFlagIfStmt(if_stmt)) {
+          return {};
+        }
+        observed_if_flag_counts[next_task_index]++;
+        continue;
+      }
+
+      if ((As<ForStmt>(stmt) || As<WhileStmt>(stmt) || As<ScopeStmt>(stmt)) && !task_stmts.count(stmt.get())) {
+        return {};
+      }
+    }
+
+    if (matched_task_stmt_indices.size() != templ.kernel_name_tokens.size()) {
+      return {};
+    }
+
+    for (const auto& window : templ.allowed_if_flag_windows) {
+      if (observed_if_flag_counts[window.before_task_index] != window.expected_count) {
+        return {};
+      }
+    }
+
+    size_t start_stmt = matched_task_stmt_indices.front();
+    size_t end_stmt = matched_task_stmt_indices.back();
+    if (HasUnsafeOpenTaskBoundary(body_seq, start_stmt, end_stmt, matched_task_stmt_indices)) {
+      return {};
+    }
+
+    std::unordered_map<const Call*, RegionCallAttrs> result;
+    for (size_t task_index = 0; task_index < matched_task_stmt_indices.size(); ++task_index) {
+      auto call = GetDirectCall(body_seq->stmts_[matched_task_stmt_indices[task_index]]);
+      INTERNAL_CHECK(call) << "Internal error: matched loop-body task statement has no direct call";
+      RegionCallAttrs attrs;
+      attrs.template_key = templ.template_key;
+      attrs.task_index = static_cast<int>(task_index);
+      if (task_index > 0) {
+        attrs.dep_indices.push_back(static_cast<int>(task_index - 1));
+      }
+      result[call.get()] = std::move(attrs);
     }
     return result;
   }

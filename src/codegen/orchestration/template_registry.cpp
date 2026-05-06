@@ -13,6 +13,7 @@
 
 #include <algorithm>
 #include <cctype>
+#include <optional>
 #include <string>
 #include <vector>
 
@@ -34,17 +35,38 @@ std::string LowerAscii(std::string value) {
 const std::vector<StableRegionTemplate>& GetStableRegionTemplates() {
   using ir::ArgDirection;
   static const std::vector<StableRegionTemplate> templates = {
-      {"paged_attention_qk_softmax_pv_update", {"qk", "softmax", "pv", "update"}, {}},
+      {"paged_attention_qk_softmax_pv_update", StableRegionKind::StraightLine, {"qk", "softmax", "pv", "update"}, {},
+       {}, 0, 0},
+      {"paged_attention_loop_body_v1",
+       StableRegionKind::LoopBody,
+       {"qk", "softmax", "pv", "update"},
+       {},
+       {{2, 3, 2}},
+       3,
+       3},
       {"bgemm_tile_add_bgemm_tile_add",
+       StableRegionKind::StraightLine,
        {"bgemm", "tile_add", "bgemm", "tile_add"},
        {
            {ArgDirection::Input, ArgDirection::Input, ArgDirection::OutputExisting},
            {ArgDirection::Input, ArgDirection::Input, ArgDirection::OutputExisting},
            {ArgDirection::Input, ArgDirection::Input, ArgDirection::OutputExisting},
            {ArgDirection::Input, ArgDirection::Input, ArgDirection::OutputExisting},
-       }},
+       },
+       {},
+       0,
+       0},
   };
   return templates;
+}
+
+std::optional<StableRegionTemplate> FindStableRegionTemplate(const std::string& template_key) {
+  for (const auto& templ : GetStableRegionTemplates()) {
+    if (templ.template_key == template_key) {
+      return templ;
+    }
+  }
+  return std::nullopt;
 }
 
 bool KernelNameMatchesToken(const std::string& kernel_name, const std::string& token) {

@@ -12,6 +12,8 @@
 #ifndef PYPTO_CODEGEN_ORCHESTRATION_TEMPLATE_REGISTRY_H_
 #define PYPTO_CODEGEN_ORCHESTRATION_TEMPLATE_REGISTRY_H_
 
+#include <cstddef>
+#include <optional>
 #include <string>
 #include <vector>
 
@@ -21,13 +23,29 @@ namespace pypto {
 namespace codegen {
 namespace orchestration {
 
+enum class StableRegionKind {
+  StraightLine,
+  LoopBody,
+};
+
+struct AllowedIfFlagWindow {
+  size_t after_task_index = 0;
+  size_t before_task_index = 0;
+  size_t expected_count = 0;
+};
+
 struct StableRegionTemplate {
   std::string template_key;
+  StableRegionKind region_kind = StableRegionKind::StraightLine;
   std::vector<std::string> kernel_name_tokens;
   std::vector<std::vector<ir::ArgDirection>> arg_direction_patterns;
+  std::vector<AllowedIfFlagWindow> allowed_if_flag_windows;
+  size_t loop_iter_arg_count = 0;
+  size_t loop_return_var_count = 0;
 };
 
 const std::vector<StableRegionTemplate>& GetStableRegionTemplates();
+std::optional<StableRegionTemplate> FindStableRegionTemplate(const std::string& template_key);
 
 bool KernelNameMatchesToken(const std::string& kernel_name, const std::string& token);
 

@@ -1,5 +1,7 @@
 # LowerStableRegionsToManualScope Pass
 
+除了直线 `SeqStmts` region 之外，当前 pass 也支持把命中的最内层 `ForStmt` loop body 整体包成 `ManualScopeStmt`，详细契约见 `docs/zh-cn/dev/codegen/05-control_flow_aware_stable_regions.md`。
+
 把 `IdentifyStableRegions` 标记过的 call 包成结构化 manual-scope IR。
 
 ## 概览

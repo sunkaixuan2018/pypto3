@@ -2,15 +2,23 @@
 
 This design identifies stable orchestration call regions at compile time and lowers them to PTO2 manual scopes with explicit task dependencies. It does not add a device-side learning cache, and `simpler` does not need to understand templates.
 
+The original phase focused on straight-line regions. Control-flow-aware loop-body regions are now covered as a conservative extension; see [05-control_flow_aware_stable_regions.md](05-control_flow_aware_stable_regions.md) for the detailed contract.
+
 ## Goal
 
-The first implementation is intentionally conservative:
+The straight-line implementation is intentionally conservative:
 
 - Match only straight-line call sequences in the same lexical scope.
 - Do not match across `for`, `while`, `if`, or existing scope statements.
 - Require closed manual regions; open manual/AUTO dependency boundaries fall back to AUTO.
 - Do not enforce a `func_id` sequence. `func_id` may be recorded for debugging later, but it is not a phase-one match constraint.
 - Keep unmatched code on the existing AUTO path.
+
+The control-flow-aware extension keeps the same fallback rule and adds one narrow loop-body shape:
+
+- Match only an innermost `ForStmt` body.
+- Allow only template-declared flag-producing `IfStmt`s between task stages.
+- Reuse `ManualScopeStmt` instead of introducing a separate loop-body template node.
 
 For PagedAttention-style code, the initial built-in template is:
 
@@ -27,7 +35,7 @@ The implementation is split into two passes plus codegen support:
 1. `IdentifyStableRegions`
    Finds candidate orchestration regions, checks the built-in template registry, rejects unsafe boundaries, and annotates matched calls.
 2. `LowerStableRegionsToManualScope`
-   Wraps marked regions in a structured `ManualScopeStmt`.
+   Wraps marked regions in a structured `ManualScopeStmt`. For loop-body templates, the `ManualScopeStmt` body is the matched `ForStmt`.
 3. Orchestration codegen
    Consumes `ManualScopeStmt` and per-call dependency attrs to emit `PTO2_SCOPE(PTO2ScopeMode::MANUAL)` and `Arg.add_dep(...)`.
 
@@ -67,7 +75,7 @@ update  deps [2]
 
 Manual scopes can be mixed with AUTO scopes at runtime, but manual-scope tasks do not get TensorMap automatic dependencies. A manual task that needs a dependency must receive it explicitly through `Arg.add_dep(...)`.
 
-Phase one therefore accepts only closed regions:
+Straight-line phase one therefore accepts only closed regions:
 
 - Inputs may come from function parameters, `tensor.create`, or earlier tasks inside the same matched region.
 - Outputs may flow to `return`, `Out`/`InOut` parameters, or later tasks inside the same matched region.
@@ -75,6 +83,8 @@ Phase one therefore accepts only closed regions:
 - If a matched task output is consumed by an outside task, reject the match.
 
 This may miss some real PagedAttention shapes, but it avoids generating a manual scope with a broken cross-boundary dependency. Later phases can store AUTO task handles and add explicit cross-boundary deps if needed.
+
+For loop-body templates, the same safety principle applies, but the region boundary is the matched innermost loop body rather than a pure straight-line statement range.
 
 ## Pass Placement
 

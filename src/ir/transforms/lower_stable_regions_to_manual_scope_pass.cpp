@@ -15,6 +15,7 @@
 #include <utility>
 #include <vector>
 
+#include "pypto/codegen/orchestration/template_registry.h"
 #include "pypto/codegen/orchestration/orchestration_analysis.h"
 #include "pypto/ir/expr.h"
 #include "pypto/ir/function.h"
@@ -34,6 +35,8 @@ constexpr const char* kStableRegionTemplateKey = "stable_region_template_key";
 constexpr const char* kManualTaskIndex = "manual_task_index";
 
 using ::pypto::codegen::IsBuiltinOp;
+using ::pypto::codegen::orchestration::FindStableRegionTemplate;
+using ::pypto::codegen::orchestration::StableRegionKind;
 
 CallPtr GetDirectCall(const StmtPtr& stmt) {
   if (auto assign = As<AssignStmt>(stmt)) {
@@ -59,6 +62,43 @@ int GetManualTaskIndex(const StmtPtr& stmt) {
     return -1;
   }
   return call->GetAttr<int>(kManualTaskIndex, -1);
+}
+
+std::optional<std::string> GetLoopBodyStableTemplateKey(const ForStmtPtr& for_stmt) {
+  auto body_seq = As<SeqStmts>(for_stmt->body_);
+  if (!body_seq) {
+    return std::nullopt;
+  }
+
+  std::optional<std::string> key;
+  int expected_task_index = 0;
+  for (const auto& stmt : body_seq->stmts_) {
+    auto current_key = GetStableTemplateKey(stmt);
+    if (!current_key.has_value()) {
+      continue;
+    }
+    if (!key.has_value()) {
+      key = current_key;
+    } else if (*key != *current_key) {
+      return std::nullopt;
+    }
+    if (GetManualTaskIndex(stmt) != expected_task_index) {
+      return std::nullopt;
+    }
+    ++expected_task_index;
+  }
+
+  if (!key.has_value()) {
+    return std::nullopt;
+  }
+  auto templ = FindStableRegionTemplate(*key);
+  if (!templ.has_value() || templ->region_kind != StableRegionKind::LoopBody) {
+    return std::nullopt;
+  }
+  if (expected_task_index != static_cast<int>(templ->kernel_name_tokens.size())) {
+    return std::nullopt;
+  }
+  return key;
 }
 
 bool ContainsManualUnsafeStmt(const std::vector<StmtPtr>& stmts, size_t start, size_t end) {
@@ -90,6 +130,17 @@ class StableRegionLowerer : public IRMutator {
     std::vector<StmtPtr> lowered;
     bool wrapped = false;
     for (size_t i = 0; i < visited.size();) {
+      if (auto for_stmt = As<ForStmt>(visited[i])) {
+        auto loop_body_key = GetLoopBodyStableTemplateKey(for_stmt);
+        if (loop_body_key.has_value()) {
+          lowered.push_back(
+              std::make_shared<ManualScopeStmt>(*loop_body_key, std::nullopt, "", for_stmt, for_stmt->span_));
+          wrapped = true;
+          ++i;
+          continue;
+        }
+      }
+
       auto key = GetStableTemplateKey(visited[i]);
       if (!key.has_value() || GetManualTaskIndex(visited[i]) != 0) {
         lowered.push_back(visited[i]);

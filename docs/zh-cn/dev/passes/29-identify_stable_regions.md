@@ -1,5 +1,7 @@
 # IdentifyStableRegions Pass
 
+控制流感知的 loop-body 扩展设计见 `docs/zh-cn/dev/codegen/05-control_flow_aware_stable_regions.md`。当前内置模板同时覆盖直线 `qk -> softmax -> pv -> update` 和受限的最内层 `ForStmt` loop body 变体。
+
 标记可以下沉到 PTO2 manual scope 的稳定 orchestration call region。
 
 ## 概览
