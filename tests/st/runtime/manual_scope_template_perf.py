@@ -15,9 +15,10 @@ import os
 import sys
 import time
 from contextlib import contextmanager
+from dataclasses import dataclass
 from datetime import datetime
 from pathlib import Path
-from typing import Any
+from typing import Any, Callable
 
 _THIS_DIR = Path(__file__).resolve().parent
 _ST_DIR = _THIS_DIR.parent
@@ -26,6 +27,10 @@ for _path in (_PROJECT_ROOT, _ST_DIR):
     if str(_path) not in sys.path:
         sys.path.insert(0, str(_path))
 
+from examples.models.paged_attention import (  # noqa: E402
+    build_paged_attention_program,
+    build_tensors as build_paged_attention_tensors,
+)
 from harness.core.harness import platform_to_backend  # noqa: E402
 from pypto import ir  # noqa: E402
 from pypto.perf.static_template import (  # noqa: E402
@@ -46,18 +51,37 @@ _VARIANTS = {
 _FREQ_MHZ = {"a2a3": 50, "a5": 1000}
 
 
+@dataclass(frozen=True)
+class BenchmarkWorkload:
+    name: str
+    program: Any
+    make_inputs: Callable[[], tuple[Any, ...]]
+    metadata: dict[str, Any]
+
+
 def main(argv: list[str] | None = None) -> int:
     parser = argparse.ArgumentParser(description=__doc__)
+    parser.add_argument(
+        "--workload",
+        default="paged_attention",
+        choices=["paged_attention", "bgemm_manual_scope", "bgemm"],
+        help="Benchmark workload. 'bgemm' is an alias for 'bgemm_manual_scope'.",
+    )
     parser.add_argument("--platform", default="a2a3", choices=["a2a3", "a5"])
     parser.add_argument("--device", default=0, type=int)
     parser.add_argument("--rounds", default=100, type=int)
     parser.add_argument("--output", default="build_output/static_template_perf")
     parser.add_argument("--profiling-detail", action="store_true")
+    _add_paged_attention_args(parser)
     args = parser.parse_args(argv)
 
     root = Path(args.output) / datetime.now().strftime("%Y%m%d_%H%M%S")
     root.mkdir(parents=True, exist_ok=True)
     freq_mhz = _FREQ_MHZ[args.platform]
+    try:
+        workload = _build_workload(args)
+    except ValueError as exc:
+        parser.error(str(exc))
 
     variant_results: dict[str, dict[str, Any]] = {}
     with _profiling_env(args.profiling_detail):
@@ -65,6 +89,7 @@ def main(argv: list[str] | None = None) -> int:
             variant_results[variant] = _run_variant(
                 variant=variant,
                 strategy=strategy,
+                workload=workload,
                 root=root,
                 platform=args.platform,
                 device=args.device,
@@ -78,6 +103,8 @@ def main(argv: list[str] | None = None) -> int:
         rounds=args.rounds,
     )
     summary = {
+        "workload": workload.name,
+        "workload_config": workload.metadata,
         "platform": args.platform,
         "device": args.device,
         "rounds": args.rounds,
@@ -94,6 +121,7 @@ def _run_variant(
     *,
     variant: str,
     strategy: ir.OptimizationStrategy,
+    workload: BenchmarkWorkload,
     root: Path,
     platform: str,
     device: int,
@@ -103,7 +131,7 @@ def _run_variant(
     variant_dir = root / variant
     variant_dir.mkdir(parents=True, exist_ok=True)
     compiled = ir.compile(
-        BgemmManualScopeProgram,
+        workload.program,
         output_dir=str(variant_dir),
         strategy=strategy,
         backend_type=platform_to_backend(platform),
@@ -121,7 +149,7 @@ def _run_variant(
     before_logs = _snapshot_logs(log_dir)
     config = RunConfig(platform=platform, device_id=device)
     for _ in range(rounds):
-        tensors = make_bgemm_manual_scope_inputs()
+        tensors = workload.make_inputs()
         compiled(*tensors, config=config)
 
     device_log_text = _collect_new_log_text(log_dir, before_logs)
@@ -133,6 +161,94 @@ def _run_variant(
         "runtime": runtime_metrics.to_dict(),
         "output_dir": str(Path(compiled.output_dir)),
     }
+
+
+def _add_paged_attention_args(parser: argparse.ArgumentParser) -> None:
+    parser.add_argument("--pa-batch", default=1, type=int)
+    parser.add_argument("--pa-num-heads", default=16, type=int)
+    parser.add_argument("--pa-head-dim", default=128, type=int)
+    parser.add_argument("--pa-block-size", default=128, type=int)
+    parser.add_argument("--pa-context-len", default=1024, type=int)
+    parser.add_argument("--pa-max-model-len", default=4096, type=int)
+    parser.add_argument("--pa-scale", default=1.0, type=float)
+
+
+def _build_workload(args: argparse.Namespace) -> BenchmarkWorkload:
+    if args.workload in {"bgemm", "bgemm_manual_scope"}:
+        return BenchmarkWorkload(
+            name="bgemm_manual_scope",
+            program=BgemmManualScopeProgram,
+            make_inputs=make_bgemm_manual_scope_inputs,
+            metadata={"description": "small BGEMM manual-scope smoke workload"},
+        )
+
+    _validate_paged_attention_args(args)
+    max_num_blocks_per_req = args.pa_max_model_len // args.pa_block_size
+    program = build_paged_attention_program(
+        batch=args.pa_batch,
+        num_heads=args.pa_num_heads,
+        head_dim=args.pa_head_dim,
+        block_size=args.pa_block_size,
+        max_num_blocks_per_req=max_num_blocks_per_req,
+    )
+
+    def make_inputs() -> tuple[Any, ...]:
+        return build_paged_attention_tensors(
+            batch=args.pa_batch,
+            num_heads=args.pa_num_heads,
+            head_dim=args.pa_head_dim,
+            block_size=args.pa_block_size,
+            max_num_blocks_per_req=max_num_blocks_per_req,
+            context_len=args.pa_context_len,
+            scale=args.pa_scale,
+        )
+
+    return BenchmarkWorkload(
+        name="paged_attention",
+        program=program,
+        make_inputs=make_inputs,
+        metadata={
+            "batch": args.pa_batch,
+            "num_heads": args.pa_num_heads,
+            "head_dim": args.pa_head_dim,
+            "block_size": args.pa_block_size,
+            "context_len": args.pa_context_len,
+            "max_model_len": args.pa_max_model_len,
+            "max_num_blocks_per_req": max_num_blocks_per_req,
+            "scale": args.pa_scale,
+            "graph": (
+                "kernel_init_inplace -> kernel_qk_matmul -> kernel_softmax_prepare -> "
+                "kernel_pv_matmul -> kernel_online_update"
+            ),
+        },
+    )
+
+
+def _validate_paged_attention_args(args: argparse.Namespace) -> None:
+    positive_fields = [
+        "pa_batch",
+        "pa_num_heads",
+        "pa_head_dim",
+        "pa_block_size",
+        "pa_context_len",
+        "pa_max_model_len",
+    ]
+    for field in positive_fields:
+        value = getattr(args, field)
+        if value <= 0:
+            raise ValueError(f"--{field.replace('_', '-')} must be positive, got {value}")
+    if args.pa_num_heads % 16 != 0:
+        raise ValueError(f"--pa-num-heads must be a multiple of 16, got {args.pa_num_heads}")
+    if args.pa_max_model_len % args.pa_block_size != 0:
+        raise ValueError(
+            "--pa-max-model-len must be divisible by --pa-block-size, got "
+            f"{args.pa_max_model_len} and {args.pa_block_size}"
+        )
+    if args.pa_context_len > args.pa_max_model_len:
+        raise ValueError(
+            f"--pa-context-len must be <= --pa-max-model-len, got {args.pa_context_len} "
+            f"and {args.pa_max_model_len}"
+        )
 
 
 def _read_orchestration_cpp(output_dir: Path) -> str:
@@ -200,13 +316,22 @@ def _format_summary(summary: dict[str, Any]) -> str:
     lines = [
         "# Static Template Performance Summary",
         "",
+        f"- Workload: `{summary['workload']}`",
         f"- Platform: `{summary['platform']}`",
         f"- Device: `{summary['device']}`",
         f"- Rounds: `{summary['rounds']}`",
-        "",
-        "| Variant | Manual scope | Compile frontend sched (us) | Orch trimmed avg (us) | Sched trimmed avg (us) | Elapsed trimmed avg (us) |",
-        "| --- | ---: | ---: | ---: | ---: | ---: |",
     ]
+    if summary["workload_config"]:
+        lines.extend(["", "## Workload Config", ""])
+        for key, value in summary["workload_config"].items():
+            lines.append(f"- `{key}`: `{value}`")
+    lines.extend(
+        [
+            "",
+            "| Variant | Manual scope | Runtime rounds | Compile frontend sched (us) | Orch trimmed avg (us) | Sched trimmed avg (us) | Elapsed trimmed avg (us) |",
+            "| --- | ---: | ---: | ---: | ---: | ---: | ---: |",
+        ]
+    )
     for name, data in summary["variants"].items():
         compile_data = data["compile"]
         runtime_data = data["runtime"]
@@ -214,6 +339,7 @@ def _format_summary(summary: dict[str, Any]) -> str:
             "| "
             f"{name} | "
             f"{'yes' if data['manual_scope'] else 'no'} | "
+            f"{runtime_data['rounds']} | "
             f"{compile_data['compile_frontend_sched_us']:.3f} | "
             f"{_fmt_optional(runtime_data['orch_trimmed_avg_us'])} | "
             f"{_fmt_optional(runtime_data['sched_trimmed_avg_us'])} | "

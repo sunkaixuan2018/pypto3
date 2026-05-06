@@ -10,6 +10,13 @@ traditional AUTO-scope path on the same program and runtime.
 
 ## Run
 
+The recommended workload is the full paged attention graph. It exercises:
+
+```text
+kernel_init_inplace -> kernel_qk_matmul -> kernel_softmax_prepare
+  -> kernel_pv_matmul -> kernel_online_update
+```
+
 ```bash
 export PYTHONPATH=$(pwd)/python:$(pwd)/tests/st:${PYTHONPATH}
 export PTOAS_ROOT=/path/to/ptoas
@@ -18,6 +25,7 @@ export PTO2_ORCH_PROFILING=1
 export PTO2_TENSORMAP_PROFILING=1
 
 python3 tests/st/runtime/manual_scope_template_perf.py \
+  --workload paged_attention \
   --platform a2a3 \
   --device 0 \
   --rounds 100 \
@@ -27,10 +35,25 @@ python3 tests/st/runtime/manual_scope_template_perf.py \
 cat build_output/static_template_perf/*/summary.md
 ```
 
+Paged attention shape knobs:
+
+```bash
+--pa-batch 1 \
+--pa-num-heads 16 \
+--pa-head-dim 128 \
+--pa-block-size 128 \
+--pa-context-len 1024 \
+--pa-max-model-len 4096 \
+--pa-scale 1.0
+```
+
+Use `--workload bgemm_manual_scope` for the small BGEMM smoke workload.
+
 ## Metrics
 
 | Metric | Meaning |
 | ------ | ------- |
+| `Runtime rounds` | Parsed device-log rounds; should be close to the requested `--rounds` for each variant |
 | `Compile frontend sched (us)` | `IdentifyStableRegions + LowerStableRegionsToManualScope + orchestration_codegen` |
 | `Orch trimmed avg (us)` | Device orchestrator time after dropping fixed low/high outliers |
 | `Sched trimmed avg (us)` | Device scheduler loop time, useful as a secondary signal |
