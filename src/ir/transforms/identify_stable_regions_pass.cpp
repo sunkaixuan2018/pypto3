@@ -510,10 +510,10 @@ class StableRegionIdentifier : public IRMutator {
   std::unordered_map<const Call*, RegionCallAttrs> TryMatchLoopBodyTemplate(const ForStmtPtr& for_stmt,
                                                                              const SeqStmtsPtr& body_seq,
                                                                              const StableRegionTemplate& templ) {
-    if (templ.loop_iter_arg_count != 0 && for_stmt->iter_args_.size() != templ.loop_iter_arg_count) {
+    if (templ.loop_iter_arg_count != 0 && for_stmt->iter_args_.size() < templ.loop_iter_arg_count) {
       return {};
     }
-    if (templ.loop_return_var_count != 0 && for_stmt->return_vars_.size() != templ.loop_return_var_count) {
+    if (templ.loop_return_var_count != 0 && for_stmt->return_vars_.size() < templ.loop_return_var_count) {
       return {};
     }
 
