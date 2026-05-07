@@ -9,8 +9,10 @@
 
 """Tests for stable orchestration region identification and manual-scope lowering."""
 
-import pypto.language as pl
 import pytest
+
+from examples.models.paged_attention import build_paged_attention_program
+import pypto.language as pl
 from pypto import passes
 from pypto.pypto_core import ir
 
@@ -273,6 +275,16 @@ def _build_loop_body_paged_attention_like_program():
     return LoopBodyStableRegionProgram
 
 
+def _build_real_paged_attention_program():
+    return build_paged_attention_program(
+        batch=1,
+        num_heads=16,
+        head_dim=128,
+        block_size=128,
+        max_num_blocks_per_req=32,
+    )
+
+
 def _collect_user_calls(program: ir.Program) -> list[ir.Call]:
     class _Collector(ir.IRVisitor):
         def __init__(self) -> None:
@@ -429,6 +441,47 @@ def test_lower_stable_regions_wraps_bgemm_template_in_manual_scope():
 
 def test_lower_stable_regions_wraps_loop_body_template_in_manual_scope():
     program = passes.derive_call_directions()(_build_loop_body_paged_attention_like_program())
+    program = passes.simplify()(program)
+    identified = passes.identify_stable_regions()(program)
+
+    lowered = passes.lower_stable_regions_to_manual_scope()(identified)
+
+    manual_scopes = _collect_manual_scopes(lowered)
+    assert len(manual_scopes) == 1
+    assert manual_scopes[0].template_key == "paged_attention_loop_body_v1"
+    assert len(_collect_orchestration_return_stmts(lowered)) == 1
+
+
+def test_identify_stable_regions_marks_real_paged_attention_loop_body_calls():
+    program = passes.derive_call_directions()(_build_real_paged_attention_program())
+    program = passes.simplify()(program)
+
+    identified = passes.identify_stable_regions()(program)
+
+    calls = [
+        call
+        for call in _collect_user_calls(identified)
+        if call.op.name
+        in {
+            "kernel_qk_matmul",
+            "kernel_softmax_prepare",
+            "kernel_pv_matmul",
+            "kernel_online_update",
+        }
+    ]
+    assert len(calls) == 4
+    assert [call.attrs["stable_region_template_key"] for call in calls] == [
+        "paged_attention_loop_body_v1",
+        "paged_attention_loop_body_v1",
+        "paged_attention_loop_body_v1",
+        "paged_attention_loop_body_v1",
+    ]
+    assert [call.attrs["manual_task_index"] for call in calls] == [0, 1, 2, 3]
+    assert [call.attrs["manual_dep_indices"] for call in calls] == [[], [0], [1], [2]]
+
+
+def test_lower_stable_regions_wraps_real_paged_attention_loop_body_in_manual_scope():
+    program = passes.derive_call_directions()(_build_real_paged_attention_program())
     program = passes.simplify()(program)
     identified = passes.identify_stable_regions()(program)
 

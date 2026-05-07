@@ -141,6 +141,9 @@ bool IsAllowedBetweenTemplateTasks(const StmtPtr& stmt, const std::unordered_set
   if (!call) {
     return true;
   }
+  if (As<ScalarType>(call->GetType()) != nullptr) {
+    return true;
+  }
   if (!IsTensorOp(call->op_->name_)) {
     return false;
   }
