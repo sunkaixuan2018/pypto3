@@ -4,7 +4,7 @@ Optimizes tensor buffer usage across orchestration and InCore functions by elimi
 
 ## Overview
 
-After `ConvertTensorToTileOps`, orchestration functions allocate output tensors (`tensor.create`) at every InCore call site, even inside loops where the same buffer could be reused. This pass applies three optimization patterns to reduce allocations and improve buffer layout information.
+After `ConvertTensorToTileOps`, orchestration functions may still carry redundant output buffers, lose parent-stride information, or submit kernels against full parent tensors when only a window is actually written. This pass applies five optimization patterns to reduce allocations and improve buffer/layout information.
 
 **Requirements**:
 
@@ -29,7 +29,7 @@ program_opt = opt_pass(program)
 
 ## Patterns
 
-The pass applies four patterns in sequence. Each pattern sees the results of the previous one.
+The pass applies five patterns in sequence. Each pattern sees the results of the previous one.
 
 ### Pattern 1: Iter-Arg Reuse (IterArgReuseOptimizer)
 
@@ -71,6 +71,12 @@ for i in pl.range(N, init_values=[init_buf]):
 **Problem**: An InCore function contains a `for` loop that accumulates results via `tile.assemble` into an iter-arg, then stores the final result. The `tile.assemble` creates intermediate tile copies each iteration.
 
 **Solution**: Rewrite the loop body to use `tile.store` directly (writing into the `Out` param), initializing the iter-arg from the `Out` param instead of a `tile.create`.
+
+### Pattern 5: Out Window Externalization (OutWindowExternalizer)
+
+**Problem**: Some InCore kernels keep a full parent tensor in their `Out` signature, but their final `tile.store` writes only a smaller window at non-zero offsets. In orchestration and `manual_scope`, that shape causes runtime dependencies to be built on the whole parent tensor rather than the written subview.
+
+**Solution**: Clone the kernel into a `__windowed` variant whose final `tile.store` writes at local zero offsets into a narrowed `Out` window. Rewrite eligible orchestration call sites from `self.kernel(..., out)` to `slice(out, window_shape, offsets) -> self.kernel__windowed(..., out_window) -> tensor.assemble(out, result, offsets)`, so later passes and runtime dependency tracking can operate on the sliced window instead of the whole tensor.
 
 ## Example (Pattern 1)
 
@@ -143,6 +149,7 @@ The `tensor.create` is eliminated; the iter-arg buffer is reused across iteratio
 | `IterArgReuseOptimizer` | Pattern 1 — merges Out params into In params for loop-carried buffers |
 | `AssembleParentStridesOptimizer` | Pattern 2 — attaches parent strides via TensorView |
 | `SliceInputStridesOptimizer` | Pattern 4 — attaches parent strides to In params via TensorView for slice patterns |
+| `OutWindowExternalizer` | Pattern 5 — clones full-Out kernels into windowed variants and rewrites direct Out call sites through `slice + cloned call + assemble` |
 | `AssembleLoopRewriter` | Pattern 3 — rewrites tile.assemble loops to tile.store loops |
 | `BuildOutParamReturnMappings` | Shared helper — maps Out params to return indices via tile.store |
 | `ComputeRowMajorStrides` | Shared helper — computes row-major strides from a shape |
@@ -152,5 +159,5 @@ The `tensor.create` is eliminated; the iter-arg buffer is reused across iteratio
 | Function type | Action |
 | ------------- | ------ |
 | InCore | Params/body rewritten (Patterns 1, 3, 4) |
-| Orchestration / Opaque | Call sites rewritten (Patterns 1, 2) |
+| Orchestration / Opaque | Call sites rewritten (Patterns 1, 2; Pattern 5 applies to orchestration only) |
 | Group | Unchanged |

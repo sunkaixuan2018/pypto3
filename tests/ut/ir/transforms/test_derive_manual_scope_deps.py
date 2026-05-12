@@ -9,9 +9,11 @@
 
 """Unit tests for the DeriveManualScopeDeps pass."""
 
+from collections.abc import Iterable
+
 import pypto.language as pl
 import pytest
-from pypto import passes
+from pypto import ir, passes
 from pypto.pypto_core import passes as _core_passes
 
 
@@ -23,6 +25,7 @@ def pass_verification_context():
     internal post-pass attr), so the roundtrip would always fail after this
     pass. Property verification still runs.
     """
+
     instruments: list[_core_passes.PassInstrument] = [
         _core_passes.VerificationInstrument(_core_passes.VerificationMode.BEFORE_AND_AFTER)
     ]
@@ -46,8 +49,70 @@ class TestDeriveManualScopeDeps:
         ssa = passes.convert_to_ssa()(Prog)
         ddir = passes.derive_call_directions()(ssa)
         ddep = passes.derive_manual_scope_deps()(ddir)
-        # No manual scope ⇒ pass is a no-op (returns same Program).
         assert ddep.same_as(ddir)
+
+    def test_tensor_assemble_alias_forwards_task_id(self):
+        @pl.program
+        class Prog:
+            @pl.function(type=pl.FunctionType.InCore)
+            def prod(
+                self,
+                x: pl.Tensor[[64, 64], pl.FP32],
+                row: pl.Scalar[pl.INDEX],
+                out: pl.Out[pl.Tensor[[1, 64], pl.FP32]],
+            ) -> pl.Tensor[[1, 64], pl.FP32]:
+                tile: pl.Tile[[1, 64], pl.FP32] = pl.load(x, [row, 0], [1, 64])
+                ret: pl.Tensor[[1, 64], pl.FP32] = pl.store(tile, [0, 0], out)
+                return ret
+
+            @pl.function(type=pl.FunctionType.InCore)
+            def consume(
+                self,
+                x: pl.Tensor[[64, 64], pl.FP32],
+                row: pl.Scalar[pl.INDEX],
+                out: pl.Out[pl.Tensor[[1, 64], pl.FP32]],
+            ) -> pl.Tensor[[1, 64], pl.FP32]:
+                tile: pl.Tile[[1, 64], pl.FP32] = pl.load(x, [row, 0], [1, 64])
+                ret: pl.Tensor[[1, 64], pl.FP32] = pl.store(tile, [0, 0], out)
+                return ret
+
+            @pl.function(type=pl.FunctionType.Orchestration)
+            def main(
+                self,
+                x: pl.Tensor[[64, 64], pl.FP32],
+                out: pl.Out[pl.Tensor[[64, 64], pl.FP32]],
+            ) -> pl.Tensor[[64, 64], pl.FP32]:
+                with pl.manual_scope():
+                    row: pl.Scalar[pl.INDEX] = 0
+                    scratch: pl.Tensor[[1, 64], pl.FP32] = pl.slice(out, [1, 64], [row, 0])
+                    produced: pl.Tensor[[1, 64], pl.FP32] = self.prod(x, row, scratch)
+                    carried: pl.Tensor[[64, 64], pl.FP32] = pl.assemble(out, produced, [row, 0])
+                    scratch2: pl.Tensor[[1, 64], pl.FP32] = pl.slice(carried, [1, 64], [row, 0])
+                    consumed: pl.Tensor[[1, 64], pl.FP32] = self.consume(x, row, scratch2, deps=[carried])
+                return carried
+
+        ssa = passes.convert_to_ssa()(Prog)
+        ddir = passes.derive_call_directions()(ssa)
+        ddep = passes.derive_manual_scope_deps()(ddir)
+        fn = ddep.get_function("main")
+        assert fn is not None
+
+        calls: list[ir.Call] = []
+
+        def walk(stmts: Iterable[object]) -> None:
+            for stmt in stmts:
+                if isinstance(stmt, ir.SeqStmts):
+                    walk(stmt.stmts)
+                elif isinstance(stmt, ir.RuntimeScopeStmt):
+                    walk([stmt.body])
+                elif isinstance(stmt, ir.AssignStmt) and isinstance(stmt.value, ir.Call):
+                    calls.append(stmt.value)
+
+        walk([fn.body])
+        consume_call = next(call for call in calls if call.op.name == "consume")
+        deps = consume_call.attrs.get("manual_dep_edges", [])
+        assert len(deps) == 1
+        assert deps[0].name_hint.endswith("__tid")
 
 
 class TestManualScopeNesting:
@@ -61,6 +126,7 @@ class TestManualScopeNesting:
 
     def test_nested_manual_scope_rejected(self):
         """The runtime forbids MANUAL inside MANUAL; reject at parse time."""
+
         with pytest.raises(Exception, match="manual_scope"):  # noqa: B017
 
             @pl.program
@@ -73,7 +139,7 @@ class TestManualScopeNesting:
                 def main(self, x: pl.Tensor[[64], pl.FP32]) -> pl.Tensor[[64], pl.FP32]:
                     with pl.manual_scope():
                         a = self.k1(x)
-                        with pl.manual_scope():  # nested — must error
+                        with pl.manual_scope():
                             b = self.k1(a)
                     return b
 

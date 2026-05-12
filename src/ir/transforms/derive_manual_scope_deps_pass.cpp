@@ -212,6 +212,11 @@ class TaskRelevantVarCollector : public IRVisitor {
         }
       }
       if (auto call = As<Call>(assign->value_)) {
+        if (call->op_->name_ == "tensor.assemble" && call->args_.size() == 3) {
+          if (auto source_var = AsVarLike(call->args_[1])) {
+            alias_[assign->var_.get()] = source_var;
+          }
+        }
         if (!IsBuiltinOp(call->op_->name_)) {
           kernel_lhs_.insert(assign->var_.get());
         }
@@ -329,6 +334,13 @@ class TaskIdLoweringMutator : public IRMutator {
                                      std::make_shared<ScalarType>(DataType::TASK_ID), assign->span_);
           new_stmts.push_back(std::make_shared<AssignStmt>(tid_var, tid_call, assign->span_));
           changed = true;
+        } else if (call->op_->name_ == "tensor.assemble" && call->args_.size() == 3) {
+          if (auto source_var = AsVarLike(call->args_[1])) {
+            if (auto source_tid = LookupOrAllocateTid(source_var)) {
+              new_stmts.push_back(std::make_shared<AssignStmt>(tid_var, source_tid, assign->span_));
+              changed = true;
+            }
+          }
         }
       } else if (auto rhs_var = AsVarLike(assign->value_)) {
         // Plain Var alias: forward the source's tid companion.

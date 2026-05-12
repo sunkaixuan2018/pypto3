@@ -4,7 +4,7 @@
 
 ## 概述
 
-`ConvertTensorToTileOps` 之后，编排函数在每个 InCore 调用点分配输出张量（`tensor.create`），即使在循环内同一缓冲区可以复用。本 pass 应用三个优化模式来减少分配并改善缓冲区布局信息。
+`ConvertTensorToTileOps` 之后，编排函数仍可能保留冗余输出缓冲区、丢失父张量步长信息，或在实际只写入局部窗口时仍以整块父张量提交 kernel。本 pass 应用五个优化模式来减少分配并改善缓冲区/布局信息。
 
 **前置条件**：
 
@@ -29,7 +29,7 @@ program_opt = opt_pass(program)
 
 ## 优化模式
 
-本 pass 按顺序应用四个模式。每个模式可以看到前一个模式的结果。
+本 pass 按顺序应用五个模式。每个模式可以看到前一个模式的结果。
 
 ### 模式 1：迭代参数复用（IterArgReuseOptimizer）
 
@@ -71,6 +71,12 @@ for i in pl.range(N, init_values=[init_buf]):
 **问题**：InCore 函数包含一个通过 `tile.assemble` 将结果累积到 iter-arg 的 `for` 循环，然后存储最终结果。`tile.assemble` 每次迭代都创建中间 tile 副本。
 
 **方案**：将循环体重写为直接使用 `tile.store`（写入 `Out` 参数），用 `Out` 参数初始化 iter-arg 代替 `tile.create`。
+
+### 模式 5：输出窗口外提（OutWindowExternalizer）
+
+**问题**：有些 InCore kernel 的 `Out` 签名仍然是整块父张量，但最终 `tile.store` 实际只会在非零 offset 处写入一个更小的窗口。在 orchestration 和 `manual_scope` 中，这会让 runtime 基于整块父张量建立依赖，而不是基于真正写入的子视图。
+
+**方案**：克隆一个 `__windowed` 版本的 kernel，使其最终 `tile.store` 以局部零 offset 写入收窄后的 `Out` 窗口。然后把符合条件的 orchestration 调用从 `self.kernel(..., out)` 重写为 `slice(out, window_shape, offsets) -> self.kernel__windowed(..., out_window) -> tensor.assemble(out, result, offsets)`，让后续 pass 和 runtime 依赖跟踪都能针对切出的窗口，而不是整块张量。
 
 ## 示例（模式 1）
 
@@ -143,6 +149,7 @@ class After:
 | `IterArgReuseOptimizer` | 模式 1 — 合并 Out 参数到 In 参数以复用循环携带缓冲区 |
 | `AssembleParentStridesOptimizer` | 模式 2 — 通过 TensorView 附加父张量步长 |
 | `SliceInputStridesOptimizer` | 模式 4 — 通过 TensorView 为切片输入的 In 参数附加父张量步长 |
+| `OutWindowExternalizer` | 模式 5 — 将整块 Out kernel 克隆为窗口化变体，并把直接 Out 调用点重写为 `slice + cloned call + assemble` |
 | `AssembleLoopRewriter` | 模式 3 — 将 tile.assemble 循环重写为 tile.store 循环 |
 | `BuildOutParamReturnMappings` | 共享辅助函数 — 通过 tile.store 映射 Out 参数到返回索引 |
 | `ComputeRowMajorStrides` | 共享辅助函数 — 从形状计算行主序步长 |
@@ -152,5 +159,5 @@ class After:
 | 函数类型 | 操作 |
 | -------- | ---- |
 | InCore | 参数/函数体重写（模式 1、3、4） |
-| Orchestration / Opaque | 调用点重写（模式 1、2） |
+| Orchestration / Opaque | 调用点重写（模式 1、2；模式 5 仅作用于 Orchestration） |
 | Group | 不变 |
