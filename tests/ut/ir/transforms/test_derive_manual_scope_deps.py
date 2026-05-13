@@ -114,6 +114,70 @@ class TestDeriveManualScopeDeps:
         assert len(deps) == 1
         assert deps[0].name_hint.endswith("__tid")
 
+    def test_tensor_slice_alias_forwards_task_id(self):
+        @pl.program
+        class Prog:
+            @pl.function(type=pl.FunctionType.InCore)
+            def kernel_stripe(
+                self,
+                data: pl.Tensor[[256, 64], pl.FP32],
+                row_offset: pl.Scalar[pl.INDEX],
+                bias: pl.Scalar[pl.FP32],
+                out: pl.Out[pl.Tensor[[256, 64], pl.FP32]],
+            ) -> pl.Tensor[[256, 64], pl.FP32]:
+                tile: pl.Tile[[64, 64], pl.FP32] = pl.load(data, [row_offset, 0], [64, 64])
+                result: pl.Tile[[64, 64], pl.FP32] = pl.add(tile, bias)
+                ret: pl.Tensor[[256, 64], pl.FP32] = pl.store(result, [row_offset, 0], out)
+                return ret
+
+            @pl.function(type=pl.FunctionType.Orchestration)
+            def main(
+                self,
+                data: pl.Tensor[[256, 64], pl.FP32],
+                out: pl.Out[pl.Tensor[[256, 64], pl.FP32]],
+            ) -> pl.Tensor[[256, 64], pl.FP32]:
+                with pl.manual_scope():
+                    row: pl.Scalar[pl.INDEX] = 64
+                    out_next: pl.Tensor[[256, 64], pl.FP32] = self.kernel_stripe(
+                        data, row, 1.0, out, deps=[out]
+                    )
+                return out_next
+
+        optimized = passes.optimize_orch_tensors()(Prog)
+        ssa = passes.convert_to_ssa()(optimized)
+        ddir = passes.derive_call_directions()(ssa)
+        ddep = passes.derive_manual_scope_deps()(ddir)
+        fn = ddep.get_function("main")
+        assert fn is not None
+
+        scope = next(stmt for stmt in fn.body.stmts if isinstance(stmt, ir.RuntimeScopeStmt))
+        slice_assign = next(
+            stmt
+            for stmt in scope.body.stmts
+            if isinstance(stmt, ir.AssignStmt)
+            and isinstance(stmt.value, ir.Call)
+            and stmt.value.op.name == "tensor.slice"
+        )
+        kernel_call_assign = next(
+            stmt
+            for stmt in scope.body.stmts
+            if isinstance(stmt, ir.AssignStmt)
+            and isinstance(stmt.value, ir.Call)
+            and stmt.value.op.name == "kernel_stripe__windowed"
+        )
+        slice_tid_assign = next(
+            stmt
+            for stmt in scope.body.stmts
+            if isinstance(stmt, ir.AssignStmt)
+            and stmt.var.name_hint == f"{slice_assign.var.name_hint}__tid"
+        )
+
+        deps = kernel_call_assign.value.attrs.get("manual_dep_edges", [])
+        assert len(deps) == 1
+        assert deps[0].same_as(slice_tid_assign.var)
+        assert isinstance(slice_tid_assign.value, ir.Var)
+        assert slice_tid_assign.value.name_hint.endswith("__tid")
+
 
 class TestManualScopeNesting:
     @pytest.fixture(autouse=True)

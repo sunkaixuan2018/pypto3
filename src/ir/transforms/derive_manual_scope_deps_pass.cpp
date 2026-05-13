@@ -216,6 +216,10 @@ class TaskRelevantVarCollector : public IRVisitor {
           if (auto source_var = AsVarLike(call->args_[1])) {
             alias_[assign->var_.get()] = source_var;
           }
+        } else if (call->op_->name_ == "tensor.slice" && !call->args_.empty()) {
+          if (auto source_var = AsVarLike(call->args_[0])) {
+            alias_[assign->var_.get()] = source_var;
+          }
         }
         if (!IsBuiltinOp(call->op_->name_)) {
           kernel_lhs_.insert(assign->var_.get());
@@ -336,6 +340,13 @@ class TaskIdLoweringMutator : public IRMutator {
           changed = true;
         } else if (call->op_->name_ == "tensor.assemble" && call->args_.size() == 3) {
           if (auto source_var = AsVarLike(call->args_[1])) {
+            if (auto source_tid = LookupOrAllocateTid(source_var)) {
+              new_stmts.push_back(std::make_shared<AssignStmt>(tid_var, source_tid, assign->span_));
+              changed = true;
+            }
+          }
+        } else if (call->op_->name_ == "tensor.slice" && !call->args_.empty()) {
+          if (auto source_var = AsVarLike(call->args_[0])) {
             if (auto source_tid = LookupOrAllocateTid(source_var)) {
               new_stmts.push_back(std::make_shared<AssignStmt>(tid_var, source_tid, assign->span_));
               changed = true;
