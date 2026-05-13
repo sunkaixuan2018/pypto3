@@ -3199,7 +3199,7 @@ class TestManualScopeCodegen:
         code = _generate_orch_code(transformed)
 
         assert "PTO2_SCOPE(PTO2ScopeMode::MANUAL)" in code, code
-        assert "make_tensor_external(" in code, code
+        assert "Tensor ext_out = from_tensor_arg(orch_args.tensor(1));" in code, code
         assert "__windowed" in code, code
         assert ".view(" in code, code
         assert ".assemble(" not in code, code
