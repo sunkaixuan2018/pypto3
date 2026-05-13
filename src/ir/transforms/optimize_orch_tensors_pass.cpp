@@ -2107,7 +2107,9 @@ class OutWindowExternalizer {
       return std::nullopt;
     }
     if (loop->iter_args_[0]->initValue_.get() != func->params_[out_param_index].get()) return std::nullopt;
-    if (loop->GetAttr<LoopOrigin>("loop_origin", LoopOrigin::None) != LoopOrigin::ChunkInner) return std::nullopt;
+    if (loop->GetAttr<LoopOrigin>("loop_origin", LoopOrigin::Original) != LoopOrigin::ChunkInner) {
+      return std::nullopt;
+    }
 
     auto trip_count = GetConstIntValue(loop->stop_);
     auto start = GetConstIntValue(loop->start_);
