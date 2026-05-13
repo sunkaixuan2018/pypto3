@@ -97,6 +97,9 @@ class RunConfig:
         disabled_diagnostics: Set of diagnostic checks to disable during
             compilation (covers warnings and perf hints). ``None`` uses the
             default (``UnusedControlFlowResult`` disabled, perf hints enabled).
+        enable_out_window_rewrite: Whether OptimizeOrchTensors Pattern 5 may
+            rewrite direct full-Out orchestration calls into windowed form.
+            Defaults to ``True``.
         golden_data_dir: Target directory for ``.pt`` data files.  When set,
             the generated ``golden.py`` always loads tensors from this path.
             If the directory already contains all required ``.pt`` files they
@@ -123,6 +126,7 @@ class RunConfig:
     compile_profiling: bool = False
     diagnostic_phase: DiagnosticPhase | None = None
     disabled_diagnostics: DiagnosticCheckSet | None = None
+    enable_out_window_rewrite: bool = True
     golden_data_dir: str | None = None
 
     def __post_init__(self) -> None:
@@ -197,6 +201,7 @@ def compile_program(
     dump_passes: bool = False,
     diagnostic_phase: DiagnosticPhase | None = None,
     disabled_diagnostics: DiagnosticCheckSet | None = None,
+    enable_out_window_rewrite: bool = True,
     profiling: bool = False,
 ) -> None:
     """Compile *program* to *work_dir* and patch orchestration headers.
@@ -212,6 +217,8 @@ def compile_program(
         dump_passes: If ``True``, dump intermediate IR after each pass.
         diagnostic_phase: Override the diagnostic phase gate for compilation.
         disabled_diagnostics: Set of diagnostic checks to disable.
+        enable_out_window_rewrite: Whether OptimizeOrchTensors Pattern 5 may
+            rewrite direct full-Out orchestration calls into windowed form.
         profiling: If ``True``, enable compile profiling.
     """
     from pypto import ir  # noqa: PLC0415
@@ -224,6 +231,7 @@ def compile_program(
         backend_type=backend_type,
         diagnostic_phase=diagnostic_phase,
         disabled_diagnostics=disabled_diagnostics,
+        enable_out_window_rewrite=enable_out_window_rewrite,
         profiling=profiling,
     )
     _patch_orchestration_headers(work_dir)

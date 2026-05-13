@@ -2164,6 +2164,9 @@ namespace pass {
 
 Pass OptimizeOrchTensors() {
   auto pass_func = [](const ProgramPtr& program) -> ProgramPtr {
+    auto* ctx = PassContext::Current();
+    const bool enable_out_window_rewrite = ctx == nullptr || ctx->GetEnableOutWindowRewrite();
+
     // Collect InCore function names
     std::unordered_set<std::string> incore_names;
     for (const auto& [gvar, func] : program->functions_) {
@@ -2184,6 +2187,8 @@ Pass OptimizeOrchTensors() {
 
     // Pattern 4: Slice input strides (propagate parent strides to In params)
     auto p4 = SliceInputStridesOptimizer().Run(p3, incore_names);
+
+    if (!enable_out_window_rewrite) return p4;
 
     // Pattern 5: Externalize Out windows through orch create+assemble wrappers
     return OutWindowExternalizer().Run(p4, incore_names);

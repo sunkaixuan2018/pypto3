@@ -428,6 +428,18 @@ class _PhaseFenceAutoPTO(PTOTestCase):
             out[r0 : r0 + _PHASE_FENCE_TILE_M, :] = data[r0 : r0 + _PHASE_FENCE_TILE_M, :] + 1.0
 
 
+class _PhaseFenceAutoNoRewritePTO(_PhaseFenceAutoPTO):
+    """Same auto control, but with Pattern 5 OutWindow rewrite disabled."""
+
+    __test__ = False
+
+    def get_name(self) -> str:
+        return f"phase_fence_auto_no_out_window_{_PHASE_FENCE_N_PHASES}x{_PHASE_FENCE_N_BRANCHES}"
+
+    def get_enable_out_window_rewrite(self) -> bool:
+        return False
+
+
 class TestPhaseFenceAuto:
     """Numerical correctness for the auto-scope control topology."""
 
@@ -435,6 +447,15 @@ class TestPhaseFenceAuto:
     def test_correctness(self, test_runner, platform):
         result = test_runner.run(_PhaseFenceAutoPTO(platform=platform))
         assert result.passed, f"phase-fence auto control execution failed: {result.error}"
+
+
+class TestPhaseFenceAutoNoRewrite:
+    """Numerical correctness for the original large-out auto topology."""
+
+    @pytest.mark.parametrize("platform", PLATFORMS)
+    def test_correctness(self, test_runner, platform):
+        result = test_runner.run(_PhaseFenceAutoNoRewritePTO(platform=platform))
+        assert result.passed, f"phase-fence auto no-rewrite execution failed: {result.error}"
 
 
 class _PhaseFenceManualScopePTO(PTOTestCase):

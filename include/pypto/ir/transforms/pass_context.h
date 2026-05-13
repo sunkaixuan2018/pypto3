@@ -250,7 +250,8 @@ class PassContext {
   explicit PassContext(std::vector<PassInstrumentPtr> instruments,
                        VerificationLevel verification_level = VerificationLevel::Basic,
                        DiagnosticPhase diagnostic_phase = DiagnosticPhase::PrePipeline,
-                       DiagnosticCheckSet disabled_diagnostics = {DiagnosticCheck::UnusedControlFlowResult});
+                       DiagnosticCheckSet disabled_diagnostics = {DiagnosticCheck::UnusedControlFlowResult},
+                       bool enable_out_window_rewrite = true);
 
   /**
    * @brief Push this context onto the thread-local stack
@@ -298,6 +299,8 @@ class PassContext {
    */
   [[nodiscard]] const DiagnosticCheckSet& GetDisabledDiagnostics() const;
 
+  [[nodiscard]] bool GetEnableOutWindowRewrite() const;
+
   /**
    * @brief Get the instruments registered on this context
    */
@@ -327,6 +330,7 @@ class PassContext {
   VerificationLevel verification_level_;
   DiagnosticPhase diagnostic_phase_;
   DiagnosticCheckSet disabled_diagnostics_;
+  bool enable_out_window_rewrite_;
   PassContext* previous_;
 
   static thread_local PassContext* current_;

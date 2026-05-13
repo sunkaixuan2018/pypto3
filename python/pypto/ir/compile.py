@@ -60,6 +60,7 @@ def compile(  # noqa: PLR0913
     verification_level: _passes.VerificationLevel | None = None,
     diagnostic_phase: _passes.DiagnosticPhase | None = None,
     disabled_diagnostics: _passes.DiagnosticCheckSet | None = None,
+    enable_out_window_rewrite: bool | None = None,
     profiling: bool = False,
     platform: str | None = None,
     distributed_config: Any = None,
@@ -89,6 +90,10 @@ def compile(  # noqa: PLR0913
         disabled_diagnostics: Set of diagnostic checks to disable (covers both
             warnings and performance hints). None uses the default
             (UnusedControlFlowResult disabled, perf hints enabled).
+        enable_out_window_rewrite: Override whether OptimizeOrchTensors Pattern 5
+            rewrites direct full-Out orchestration calls into windowed form.
+            None inherits the active PassContext value when present, otherwise
+            defaults to True.
         profiling: If True, enable compile profiling that records per-stage
             wall-clock timings.  Results are written to ``output_dir/report/``.
         platform: Target execution platform.  One of ``"a2a3sim"``,
@@ -133,6 +138,11 @@ def compile(  # noqa: PLR0913
             "compile() was called with diagnostic_phase while a PassContext is already active. "
             "Set the diagnostic phase on the existing PassContext instead."
         )
+    if enable_out_window_rewrite is not None and outer is not None:
+        raise RuntimeError(
+            "compile() was called with enable_out_window_rewrite while a PassContext is already active. "
+            "Set the switch on the existing PassContext instead."
+        )
 
     # --- Compile profiling ---------------------------------------------------
     prof = get_active_profiler()
@@ -158,13 +168,19 @@ def compile(  # noqa: PLR0913
         disabled = (
             disabled_diagnostics if disabled_diagnostics is not None else outer.get_disabled_diagnostics()
         )
+        out_window_rewrite = (
+            enable_out_window_rewrite
+            if enable_out_window_rewrite is not None
+            else outer.get_enable_out_window_rewrite()
+        )
     else:
         vlevel = (
             verification_level if verification_level is not None else _passes.get_default_verification_level()
         )
         dphase = diagnostic_phase if diagnostic_phase is not None else _passes.get_default_diagnostic_phase()
         disabled = disabled_diagnostics if disabled_diagnostics is not None else default_disabled
-    ctx = _passes.PassContext(instruments, vlevel, dphase, disabled)
+        out_window_rewrite = enable_out_window_rewrite if enable_out_window_rewrite is not None else True
+    ctx = _passes.PassContext(instruments, vlevel, dphase, disabled, out_window_rewrite)
 
     def _stage(name: str) -> AbstractContextManager[Any]:
         if prof is not None:
