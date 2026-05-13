@@ -21,6 +21,7 @@
 
 #include "pypto/core/dtype.h"
 #include "pypto/core/logging.h"
+#include "pypto/ir/arith/analyzer.h"
 #include "pypto/ir/expr.h"
 #include "pypto/ir/function.h"
 #include "pypto/ir/kind_traits.h"
@@ -1798,9 +1799,15 @@ class OutWindowExternalizer {
 
  private:
   struct IncoreRewriteAnalysis {
+    enum class Kind {
+      FinalStore,
+      ChunkInnerLoop,
+    };
+
+    Kind kind = Kind::FinalStore;
     size_t out_param_index;
     std::vector<ExprPtr> window_shape;
-    std::vector<ExprPtr> original_store_offsets;
+    std::vector<ExprPtr> callsite_offsets;
     std::vector<ExprPtr> local_store_offsets;
   };
 
@@ -1938,8 +1945,8 @@ class OutWindowExternalizer {
       auto shape_tuple = std::make_shared<MakeTuple>(shape_exprs, call_assign->span_);
 
       std::vector<ExprPtr> offset_exprs;
-      offset_exprs.reserve(analysis.original_store_offsets.size());
-      for (const auto& offset : analysis.original_store_offsets) {
+      offset_exprs.reserve(analysis.callsite_offsets.size());
+      for (const auto& offset : analysis.callsite_offsets) {
         offset_exprs.push_back(transform_utils::Substitute(offset, callsite_subst));
       }
       auto offset_tuple = std::make_shared<MakeTuple>(offset_exprs, call_assign->span_);
@@ -2009,6 +2016,201 @@ class OutWindowExternalizer {
     std::vector<ExprPtr> offsets;
   };
 
+  struct ChunkInnerLoopInfo {
+    std::vector<ExprPtr> window_shape;
+    std::vector<ExprPtr> base_offsets;
+    std::vector<ExprPtr> local_offsets;
+  };
+
+  class ChunkLoopBodyLocalizer : public IRMutator {
+   public:
+    ChunkLoopBodyLocalizer(const IterArg* old_iter_arg, const IterArgPtr& new_iter_arg,
+                           const std::vector<ExprPtr>& new_offsets, const TypePtr& new_store_type)
+        : old_iter_arg_(old_iter_arg),
+          new_iter_arg_(new_iter_arg),
+          new_offsets_(new_offsets),
+          new_store_type_(new_store_type) {}
+
+   protected:
+    ExprPtr VisitExpr_(const VarPtr& op) override {
+      auto remap_it = result_var_remap_.find(op.get());
+      if (remap_it != result_var_remap_.end()) return remap_it->second;
+      return IRMutator::VisitExpr_(op);
+    }
+
+    ExprPtr VisitExpr_(const IterArgPtr& op) override {
+      if (op.get() == old_iter_arg_) return new_iter_arg_;
+      return IRMutator::VisitExpr_(op);
+    }
+
+    StmtPtr VisitStmt_(const AssignStmtPtr& op) override {
+      auto visited_value = VisitExpr(op->value_);
+      auto assign = MutableCopy(op);
+      assign->value_ = visited_value;
+      auto call = As<Call>(assign->value_);
+      if (!call || call->op_->name_ != "tile.store" || call->args_.size() < 3) return assign;
+
+      auto out_var = AsVarLike(call->args_[2]);
+      if (!out_var || out_var.get() != new_iter_arg_.get()) return assign;
+
+      auto new_offset_tuple = std::make_shared<MakeTuple>(new_offsets_, call->span_);
+      std::vector<ExprPtr> new_args = call->args_;
+      new_args[1] = new_offset_tuple;
+      new_args[2] = new_iter_arg_;
+      auto new_call =
+          std::make_shared<Call>(call->op_, new_args, call->kwargs_, call->attrs_, new_store_type_, call->span_);
+
+      auto new_result_var = std::make_shared<Var>(assign->var_->name_hint_, new_store_type_, assign->var_->span_);
+      result_var_remap_[assign->var_.get()] = new_result_var;
+      assign->var_ = new_result_var;
+      assign->value_ = new_call;
+      return assign;
+    }
+
+   private:
+    const IterArg* old_iter_arg_;
+    IterArgPtr new_iter_arg_;
+    const std::vector<ExprPtr>& new_offsets_;
+    TypePtr new_store_type_;
+    std::unordered_map<const Var*, VarPtr> result_var_remap_;
+  };
+
+  static std::optional<int64_t> GetConstIntValue(const ExprPtr& expr) {
+    auto ci = As<ConstInt>(expr);
+    if (!ci) return std::nullopt;
+    return ci->value_;
+  }
+
+  static std::optional<ExprPtr> SimplifyWithLoopBound(const ExprPtr& expr, const VarPtr& loop_var, int64_t value) {
+    if (!expr) return std::nullopt;
+    arith::Analyzer analyzer;
+    analyzer.Bind(loop_var, value, value + 1);
+    return analyzer.Simplify(expr);
+  }
+
+  static std::optional<ExprPtr> ExpandLoopLocalExpr(
+      const ExprPtr& expr, const std::unordered_map<const Var*, ExprPtr>& scalar_defs) {
+    if (!expr) return std::nullopt;
+    return transform_utils::Substitute(expr, scalar_defs);
+  }
+
+  static std::optional<ChunkInnerLoopInfo> AnalyzeChunkInnerLoop(const FunctionPtr& func, size_t out_param_index) {
+    if (!func || out_param_index >= func->params_.size()) return std::nullopt;
+
+    auto body_stmts = FlattenToStmts(func->body_);
+    if (body_stmts.size() != 2) return std::nullopt;
+
+    auto loop = As<ForStmt>(body_stmts[0]);
+    auto ret_stmt = As<ReturnStmt>(body_stmts[1]);
+    if (!loop || !ret_stmt || loop->iter_args_.size() != 1 || loop->return_vars_.size() != 1 ||
+        ret_stmt->value_.size() != 1) {
+      return std::nullopt;
+    }
+    if (loop->iter_args_[0]->initValue_.get() != func->params_[out_param_index].get()) return std::nullopt;
+    if (loop->GetAttr<LoopOrigin>("loop_origin", LoopOrigin::None) != LoopOrigin::ChunkInner) return std::nullopt;
+
+    auto trip_count = GetConstIntValue(loop->stop_);
+    auto start = GetConstIntValue(loop->start_);
+    auto step = GetConstIntValue(loop->step_);
+    if (!trip_count.has_value() || !start.has_value() || !step.has_value()) return std::nullopt;
+    if (*start != 0 || *step != 1 || *trip_count <= 0) return std::nullopt;
+
+    auto loop_body_stmts = FlattenToStmts(loop->body_);
+    AssignStmtPtr store_assign;
+    YieldStmtPtr yield_stmt;
+    std::unordered_map<const Var*, ExprPtr> scalar_defs;
+    for (const auto& stmt : loop_body_stmts) {
+      if (auto assign = As<AssignStmt>(stmt)) {
+        auto call = As<Call>(assign->value_);
+        if (call && call->op_->name_ == "tile.store" && call->args_.size() >= 3) {
+          auto out_arg = AsVarLike(call->args_[2]);
+          if (!out_arg || out_arg.get() != loop->iter_args_[0].get()) return std::nullopt;
+          if (store_assign) return std::nullopt;
+          store_assign = assign;
+          continue;
+        }
+        if (As<ScalarType>(assign->var_->GetType())) {
+          scalar_defs[assign->var_.get()] = assign->value_;
+        }
+        continue;
+      }
+      if (auto yield = As<YieldStmt>(stmt)) {
+        if (yield_stmt || yield->value_.size() != 1) return std::nullopt;
+        yield_stmt = yield;
+      }
+    }
+
+    if (!store_assign || !yield_stmt) return std::nullopt;
+    auto yielded = AsVarLike(yield_stmt->value_[0]);
+    auto returned = AsVarLike(ret_stmt->value_[0]);
+    if (!yielded || !returned || yielded.get() != store_assign->var_.get() ||
+        returned.get() != loop->return_vars_[0].get()) {
+      return std::nullopt;
+    }
+
+    if (!As<TensorType>(loop->iter_args_[0]->GetType()) || !As<TensorType>(loop->return_vars_[0]->GetType())) {
+      return std::nullopt;
+    }
+
+    size_t total_out_refs = CountVarRefsInStmt(func->body_, func->params_[out_param_index].get());
+    if (total_out_refs != 1) return std::nullopt;
+
+    size_t total_iter_refs = CountVarRefsInStmt(loop->body_, loop->iter_args_[0].get());
+    size_t store_iter_refs = CountVarRefsInStmt(store_assign, loop->iter_args_[0].get());
+    if (total_iter_refs != store_iter_refs) return std::nullopt;
+
+    auto store_call = As<Call>(store_assign->value_);
+    auto offsets = As<MakeTuple>(store_call->args_[1]);
+    auto tile_type = As<TileType>(store_call->args_[0]->GetType());
+    auto out_tensor_type = As<TensorType>(func->params_[out_param_index]->GetType());
+    if (!offsets || !tile_type || !out_tensor_type) return std::nullopt;
+    if (offsets->elements_.size() != tile_type->shape_.size() ||
+        offsets->elements_.size() != out_tensor_type->shape_.size()) {
+      return std::nullopt;
+    }
+
+    std::unordered_set<const Var*> allowed;
+    for (const auto& param : func->params_) allowed.insert(param.get());
+    allowed.insert(loop->loop_var_.get());
+
+    std::vector<ExprPtr> base_offsets;
+    std::vector<ExprPtr> local_offsets;
+    std::vector<ExprPtr> window_shape;
+    base_offsets.reserve(offsets->elements_.size());
+    local_offsets.reserve(offsets->elements_.size());
+    window_shape.reserve(offsets->elements_.size());
+
+    for (size_t i = 0; i < offsets->elements_.size(); ++i) {
+      auto expanded = ExpandLoopLocalExpr(offsets->elements_[i], scalar_defs);
+      if (!expanded.has_value()) return std::nullopt;
+      if (!ExprReferencesOnlyVarsIn(*expanded, allowed)) return std::nullopt;
+
+      auto min_offset = SimplifyWithLoopBound(*expanded, loop->loop_var_, 0);
+      auto max_offset = SimplifyWithLoopBound(*expanded, loop->loop_var_, *trip_count - 1);
+      if (!min_offset.has_value() || !max_offset.has_value()) return std::nullopt;
+
+      auto span_expr = arith::Analyzer().Simplify(
+          MakeAdd(MakeSub(*max_offset, *min_offset, func->span_), tile_type->shape_[i], func->span_));
+      auto span_ci = As<ConstInt>(span_expr);
+      if (!span_ci || span_ci->value_ <= 0) return std::nullopt;
+
+      base_offsets.push_back(*min_offset);
+      local_offsets.push_back(arith::Analyzer().Simplify(
+          MakeSub(offsets->elements_[i], *min_offset, offsets->elements_[i]->span_)));
+      window_shape.push_back(std::make_shared<ConstInt>(span_ci->value_, DataType::INDEX, func->span_));
+    }
+
+    if (AreExprVectorsEqual(window_shape, out_tensor_type->shape_) && IsAllZeroOffsets(base_offsets)) {
+      return std::nullopt;
+    }
+
+    ChunkInnerLoopInfo info;
+    info.window_shape = std::move(window_shape);
+    info.base_offsets = std::move(base_offsets);
+    info.local_offsets = std::move(local_offsets);
+    return info;
+  }
+
   static std::optional<FinalStoreInfo> AnalyzeFinalStore(const FunctionPtr& func, size_t out_param_index) {
     if (!func || out_param_index >= func->params_.size()) return std::nullopt;
 
@@ -2059,7 +2261,19 @@ class OutWindowExternalizer {
       auto out_index = GetSingleOutParamIndex(func);
       if (!out_index.has_value()) continue;
       auto store_info = AnalyzeFinalStore(func, *out_index);
-      if (!store_info.has_value()) continue;
+      if (!store_info.has_value()) {
+        auto chunk_info = AnalyzeChunkInnerLoop(func, *out_index);
+        if (!chunk_info.has_value()) continue;
+
+        IncoreRewriteAnalysis analysis;
+        analysis.kind = IncoreRewriteAnalysis::Kind::ChunkInnerLoop;
+        analysis.out_param_index = *out_index;
+        analysis.window_shape = chunk_info->window_shape;
+        analysis.callsite_offsets = chunk_info->base_offsets;
+        analysis.local_store_offsets = chunk_info->local_offsets;
+        analyses.emplace(func->name_, std::move(analysis));
+        continue;
+      }
       auto out_tensor_type = As<TensorType>(func->params_[*out_index]->GetType());
       if (!out_tensor_type) continue;
 
@@ -2093,9 +2307,10 @@ class OutWindowExternalizer {
       }
 
       IncoreRewriteAnalysis analysis;
+      analysis.kind = IncoreRewriteAnalysis::Kind::FinalStore;
       analysis.out_param_index = *out_index;
       analysis.window_shape = store_info->window_shape;
-      analysis.original_store_offsets = store_info->offsets;
+      analysis.callsite_offsets = store_info->offsets;
       analysis.local_store_offsets = std::move(local_zero_offsets);
       analyses.emplace(func->name_, std::move(analysis));
     }
@@ -2136,17 +2351,50 @@ class OutWindowExternalizer {
       seed[func->params_[i].get()] = new_param;
     }
 
-    std::vector<ExprPtr> cloned_original_offsets;
-    cloned_original_offsets.reserve(analysis.original_store_offsets.size());
-    for (const auto& offset : analysis.original_store_offsets) {
-      cloned_original_offsets.push_back(transform_utils::Substitute(offset, seed));
-    }
-
     auto cloned = DeepClone(func->body_, seed);
-    StoreOffsetLocalizer localizer(func->params_[analysis.out_param_index].get(),
-                                   new_params[analysis.out_param_index],
-                                   cloned_original_offsets, analysis.local_store_offsets, new_out_type);
-    auto new_body = localizer.VisitStmt(cloned.cloned_body);
+    StmtPtr new_body;
+    if (analysis.kind == IncoreRewriteAnalysis::Kind::ChunkInnerLoop) {
+      auto body_stmts = FlattenToStmts(cloned.cloned_body);
+      if (body_stmts.size() != 2) return nullptr;
+      auto loop = As<ForStmt>(body_stmts[0]);
+      auto ret_stmt = As<ReturnStmt>(body_stmts[1]);
+      if (!loop || !ret_stmt || loop->iter_args_.size() != 1 || loop->return_vars_.size() != 1) return nullptr;
+
+      auto new_iter_arg = std::make_shared<IterArg>(loop->iter_args_[0]->name_hint_, new_out_type,
+                                                    new_params[analysis.out_param_index], loop->iter_args_[0]->span_);
+      auto new_return_var =
+          std::make_shared<Var>(loop->return_vars_[0]->name_hint_, new_out_type, loop->return_vars_[0]->span_);
+
+      std::unordered_map<const Var*, ExprPtr> local_offset_subst = seed;
+      for (const auto& [old_var, new_var] : cloned.var_map) {
+        local_offset_subst[old_var] = new_var;
+      }
+      std::vector<ExprPtr> cloned_local_offsets;
+      cloned_local_offsets.reserve(analysis.local_store_offsets.size());
+      for (const auto& offset : analysis.local_store_offsets) {
+        cloned_local_offsets.push_back(transform_utils::Substitute(offset, local_offset_subst));
+      }
+
+      ChunkLoopBodyLocalizer localizer(loop->iter_args_[0].get(), new_iter_arg, cloned_local_offsets, new_out_type);
+      auto new_loop_body = localizer.VisitStmt(loop->body_);
+      auto new_loop = std::make_shared<ForStmt>(loop->loop_var_, loop->start_, loop->stop_, loop->step_,
+                                                std::vector<IterArgPtr>{new_iter_arg}, new_loop_body,
+                                                std::vector<VarPtr>{new_return_var}, loop->span_, loop->kind_,
+                                                loop->chunk_config_, loop->attrs_);
+      auto new_return = std::make_shared<ReturnStmt>(std::vector<ExprPtr>{new_return_var}, ret_stmt->span_);
+      new_body = SeqStmts::Flatten(std::vector<StmtPtr>{new_loop, new_return}, cloned.cloned_body->span_);
+    } else {
+      std::vector<ExprPtr> cloned_callsite_offsets;
+      cloned_callsite_offsets.reserve(analysis.callsite_offsets.size());
+      for (const auto& offset : analysis.callsite_offsets) {
+        cloned_callsite_offsets.push_back(transform_utils::Substitute(offset, seed));
+      }
+
+      StoreOffsetLocalizer localizer(func->params_[analysis.out_param_index].get(),
+                                     new_params[analysis.out_param_index],
+                                     cloned_callsite_offsets, analysis.local_store_offsets, new_out_type);
+      new_body = localizer.VisitStmt(cloned.cloned_body);
+    }
     std::vector<TypePtr> new_return_types = {new_out_type};
 
     return std::make_shared<Function>(cloned_name, new_params, func->param_directions_, new_return_types, new_body,

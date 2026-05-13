@@ -74,9 +74,24 @@ for i in pl.range(N, init_values=[init_buf]):
 
 ### Pattern 5: Out Window Externalization (OutWindowExternalizer)
 
-**Problem**: Some InCore kernels keep a full parent tensor in their `Out` signature, but their final `tile.store` writes only a smaller window at non-zero offsets. In orchestration and `manual_scope`, that shape causes runtime dependencies to be built on the whole parent tensor rather than the written subview.
+**Problem**: Some InCore kernels keep a full parent tensor in their `Out` signature, but only write a smaller sub-window. Two narrow shapes matter here:
 
-**Solution**: Clone the kernel into a `__windowed` variant whose final `tile.store` writes at local zero offsets into a narrowed `Out` window. Rewrite eligible orchestration call sites from `self.kernel(..., out)` to `slice(out, window_shape, offsets) -> self.kernel__windowed(..., out_window) -> tensor.assemble(out, result, offsets)`, so later passes and runtime dependency tracking can operate on the sliced window instead of the whole tensor.
+- a direct final `tile.store` writes a smaller window at non-zero offsets
+- a top-level `ChunkInner` loop carries the full `Out` tensor, while each iteration writes one disjoint window through a loop-carried `tile.store`
+
+In orchestration and `manual_scope`, those shapes cause runtime dependencies to be built on the whole parent tensor rather than the written subview.
+
+**Solution**: Clone the kernel into a `__windowed` variant whose write becomes local to a narrowed `Out` window. Rewrite eligible orchestration call sites from `self.kernel(..., out)` to `slice(out, window_shape, offsets) -> self.kernel__windowed(..., out_window) -> tensor.assemble(out, result, offsets)`, so later passes and runtime dependency tracking can operate on the sliced window instead of the whole tensor.
+
+For the first-stage `ChunkInner` loop case, the pass intentionally stays narrow:
+
+- exactly one `Out` param
+- top-level loop marked with `loop_origin = ChunkInner`
+- one loop-carried tensor iter-arg initialized from that `Out`
+- one yielded `tile.store(..., offsets, iter_arg)`
+- window shape and base offsets must be derivable from the loop trip range plus the store tile shape
+
+The rewrite still preserves orchestration-side `tensor.assemble(...)` so the full parent tensor SSA value and downstream dependencies remain explicit.
 
 ## Example (Pattern 1)
 
@@ -149,7 +164,7 @@ The `tensor.create` is eliminated; the iter-arg buffer is reused across iteratio
 | `IterArgReuseOptimizer` | Pattern 1 — merges Out params into In params for loop-carried buffers |
 | `AssembleParentStridesOptimizer` | Pattern 2 — attaches parent strides via TensorView |
 | `SliceInputStridesOptimizer` | Pattern 4 — attaches parent strides to In params via TensorView for slice patterns |
-| `OutWindowExternalizer` | Pattern 5 — clones full-Out kernels into windowed variants and rewrites direct Out call sites through `slice + cloned call + assemble` |
+| `OutWindowExternalizer` | Pattern 5 — clones full-Out kernels into windowed variants and rewrites direct Out call sites through `slice + cloned call + assemble`, including the first-stage narrow `ChunkInner` loop case |
 | `AssembleLoopRewriter` | Pattern 3 — rewrites tile.assemble loops to tile.store loops |
 | `BuildOutParamReturnMappings` | Shared helper — maps Out params to return indices via tile.store |
 | `ComputeRowMajorStrides` | Shared helper — computes row-major strides from a shape |

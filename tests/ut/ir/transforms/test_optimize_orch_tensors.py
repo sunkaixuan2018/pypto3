@@ -1054,6 +1054,88 @@ class TestOutWindowExternalizer:
         assert len(edges) == 1
         assert edges[0].same_as(slice_assign.var)
 
+    def test_chunk_inner_parallel_loop_rewrites_to_windowed_clone(self):
+        @pl.program
+        class Before:
+            @pl.function(type=pl.FunctionType.InCore)
+            def q_proj_chunk_group(
+                self,
+                x: pl.Tensor[[16, 512], pl.FP32],
+                group_base: pl.Scalar[pl.INDEX],
+                out: pl.Out[pl.Tensor[[16, 512], pl.FP32]],
+            ) -> pl.Tensor[[16, 512], pl.FP32]:
+                for ob_ci, (out_iter,) in pl.parallel(
+                    4, init_values=(out,), attrs={"loop_origin": pl.LoopOrigin.ChunkInner}
+                ):
+                    q0: pl.Scalar[pl.INDEX] = group_base + ob_ci * 64
+                    tile: pl.Tile[[16, 64], pl.FP32] = pl.load(x, [0, q0], [16, 64])
+                    out_next: pl.Tensor[[16, 512], pl.FP32] = pl.store(tile, [0, q0], out_iter)
+                    q_rv = pl.yield_(out_next)
+                return q_rv
+
+            @pl.function(type=pl.FunctionType.Orchestration)
+            def main(
+                self,
+                x: pl.Tensor[[16, 512], pl.FP32],
+                out: pl.Out[pl.Tensor[[16, 512], pl.FP32]],
+            ) -> pl.Tensor[[16, 512], pl.FP32]:
+                group_base: pl.Scalar[pl.INDEX] = 128
+                out_next: pl.Tensor[[16, 512], pl.FP32] = self.q_proj_chunk_group(x, group_base, out)
+                return out_next
+
+        After = passes.optimize_orch_tensors()(Before)
+
+        kernel_orig = After.get_function("q_proj_chunk_group")
+        kernel_windowed = After.get_function("q_proj_chunk_group__windowed")
+        main = After.get_function("main")
+
+        assert kernel_orig is not None
+        assert kernel_windowed is not None
+        assert main is not None
+
+        printed_windowed = ir.python_print(kernel_windowed)
+        assert 'attrs={"loop_origin": pl.LoopOrigin.ChunkInner}' in printed_windowed
+        assert "pl.Tensor[[16, 256], pl.FP32" in printed_windowed
+        assert "pl.tile.store(tile, [0, q0 - group_base], out_iter)" in printed_windowed
+
+        printed_main = ir.python_print(main)
+        assert "pl.tensor.slice(out, [16, 256], [0, group_base])" in printed_main
+        assert "q_proj_chunk_group__windowed(x, group_base, out__window)" in printed_main
+        assert "pl.tensor.assemble(out, out_next__windowed, [0, group_base])" in printed_main
+
+    def test_chunk_inner_parallel_loop_respects_out_window_switch(self):
+        @pl.program
+        class Before:
+            @pl.function(type=pl.FunctionType.InCore)
+            def q_proj_chunk_group(
+                self,
+                x: pl.Tensor[[16, 512], pl.FP32],
+                group_base: pl.Scalar[pl.INDEX],
+                out: pl.Out[pl.Tensor[[16, 512], pl.FP32]],
+            ) -> pl.Tensor[[16, 512], pl.FP32]:
+                for ob_ci, (out_iter,) in pl.parallel(
+                    4, init_values=(out,), attrs={"loop_origin": pl.LoopOrigin.ChunkInner}
+                ):
+                    q0: pl.Scalar[pl.INDEX] = group_base + ob_ci * 64
+                    tile: pl.Tile[[16, 64], pl.FP32] = pl.load(x, [0, q0], [16, 64])
+                    out_next: pl.Tensor[[16, 512], pl.FP32] = pl.store(tile, [0, q0], out_iter)
+                    q_rv = pl.yield_(out_next)
+                return q_rv
+
+            @pl.function(type=pl.FunctionType.Orchestration)
+            def main(
+                self,
+                x: pl.Tensor[[16, 512], pl.FP32],
+                out: pl.Out[pl.Tensor[[16, 512], pl.FP32]],
+            ) -> pl.Tensor[[16, 512], pl.FP32]:
+                group_base: pl.Scalar[pl.INDEX] = 128
+                out_next: pl.Tensor[[16, 512], pl.FP32] = self.q_proj_chunk_group(x, group_base, out)
+                return out_next
+
+        with passes.PassContext([], enable_out_window_rewrite=False):
+            After = passes.optimize_orch_tensors()(Before)
+        ir.assert_structural_equal(After, Before)
+
 
 if __name__ == "__main__":
     pytest.main([__file__, "-v"])

@@ -74,9 +74,24 @@ for i in pl.range(N, init_values=[init_buf]):
 
 ### 模式 5：输出窗口外提（OutWindowExternalizer）
 
-**问题**：有些 InCore kernel 的 `Out` 签名仍然是整块父张量，但最终 `tile.store` 实际只会在非零 offset 处写入一个更小的窗口。在 orchestration 和 `manual_scope` 中，这会让 runtime 基于整块父张量建立依赖，而不是基于真正写入的子视图。
+**问题**：有些 InCore kernel 的 `Out` 签名仍然是整块父张量，但实际只写其中一个子窗口。这里当前覆盖两类收紧场景：
 
-**方案**：克隆一个 `__windowed` 版本的 kernel，使其最终 `tile.store` 以局部零 offset 写入收窄后的 `Out` 窗口。然后把符合条件的 orchestration 调用从 `self.kernel(..., out)` 重写为 `slice(out, window_shape, offsets) -> self.kernel__windowed(..., out_window) -> tensor.assemble(out, result, offsets)`，让后续 pass 和 runtime 依赖跟踪都能针对切出的窗口，而不是整块张量。
+- 最终 `tile.store` 直接把一个更小窗口写到非零 offset
+- 顶层 `ChunkInner` 循环把整块 `Out` 作为 loop-carried tensor 传递，但每次迭代只通过 `tile.store(..., offsets, iter_arg)` 写一个独立窗口
+
+在 orchestration 和 `manual_scope` 中，这会让 runtime 基于整块父张量建立依赖，而不是基于真正写入的子视图。
+
+**方案**：克隆一个 `__windowed` 版本的 kernel，使其写回动作局部化到收窄后的 `Out` 窗口。然后把符合条件的 orchestration 调用从 `self.kernel(..., out)` 重写为 `slice(out, window_shape, offsets) -> self.kernel__windowed(..., out_window) -> tensor.assemble(out, result, offsets)`，让后续 pass 和 runtime 依赖跟踪都能针对切出的窗口，而不是整块张量。
+
+对第一阶段 `ChunkInner` 场景，匹配条件刻意保持收紧：
+
+- 只有一个 `Out` 参数
+- 顶层循环带有 `loop_origin = ChunkInner`
+- 只有一个由该 `Out` 初始化的 loop-carried tensor iter-arg
+- 只有一个被 `yield` 返回的 `tile.store(..., offsets, iter_arg)`
+- 窗口 shape 与 call-site base offsets 必须能由循环 trip range 和 store 的 tile shape 推导出来
+
+这个改写仍然保留 orchestration 侧的 `tensor.assemble(...)`，以显式保留整块父张量的 SSA 值和后续依赖关系。
 
 ## 示例（模式 1）
 
@@ -149,7 +164,7 @@ class After:
 | `IterArgReuseOptimizer` | 模式 1 — 合并 Out 参数到 In 参数以复用循环携带缓冲区 |
 | `AssembleParentStridesOptimizer` | 模式 2 — 通过 TensorView 附加父张量步长 |
 | `SliceInputStridesOptimizer` | 模式 4 — 通过 TensorView 为切片输入的 In 参数附加父张量步长 |
-| `OutWindowExternalizer` | 模式 5 — 将整块 Out kernel 克隆为窗口化变体，并把直接 Out 调用点重写为 `slice + cloned call + assemble` |
+| `OutWindowExternalizer` | 模式 5 — 将整块 Out kernel 克隆为窗口化变体，并把直接 Out 调用点重写为 `slice + cloned call + assemble`，同时覆盖第一阶段收紧的 `ChunkInner` 循环场景 |
 | `AssembleLoopRewriter` | 模式 3 — 将 tile.assemble 循环重写为 tile.store 循环 |
 | `BuildOutParamReturnMappings` | 共享辅助函数 — 通过 tile.store 映射 Out 参数到返回索引 |
 | `ComputeRowMajorStrides` | 共享辅助函数 — 从形状计算行主序步长 |
