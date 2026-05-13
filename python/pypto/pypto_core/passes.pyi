@@ -257,6 +257,7 @@ class PassContext:
         verification_level: VerificationLevel = VerificationLevel.BASIC,
         diagnostic_phase: DiagnosticPhase = DiagnosticPhase.PRE_PIPELINE,
         disabled_diagnostics: DiagnosticCheckSet = ...,  # default: {UnusedControlFlowResult}
+        enable_out_window_rewrite: bool = True,
     ) -> None:
         """Create a PassContext with instruments, verification level, phase, and disabled diagnostics."""
         ...
@@ -278,6 +279,10 @@ class PassContext:
 
     def get_disabled_diagnostics(self) -> DiagnosticCheckSet:
         """Get the diagnostic checks suppressed by this context."""
+        ...
+
+    def get_enable_out_window_rewrite(self) -> bool:
+        """Get whether OptimizeOrchTensors Pattern 5 is enabled in this context."""
         ...
 
     def get_instruments(self) -> list[PassInstrument]:

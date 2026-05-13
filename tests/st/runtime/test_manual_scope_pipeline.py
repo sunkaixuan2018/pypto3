@@ -347,6 +347,117 @@ def _build_phase_fence_program():
     return PhaseFenceManualScope
 
 
+def _build_phase_fence_program_auto():
+    """4-phase × 4-branch outer-seq / inner-parallel auto-scope control program.
+
+    This keeps the same direct full-Out call shape as the manual_scope
+    PhaseFence case but removes both ``with pl.manual_scope():`` and
+    ``deps=[out]`` so the runtime falls back to ordinary auto dependency
+    tracking. It serves as a control case for the base Scenario A out-window
+    rewrite independent of TaskId / explicit-dep lowering.
+    """
+    N_PHASES = _PHASE_FENCE_N_PHASES
+    N_BRANCHES = _PHASE_FENCE_N_BRANCHES
+    TILE_M = _PHASE_FENCE_TILE_M
+    BIG_N = _PHASE_FENCE_BIG_N
+    BIG_M = _PHASE_FENCE_BIG_M
+
+    @pl.program
+    class PhaseFenceAuto:
+        @pl.function(type=pl.FunctionType.InCore)
+        def kernel_stripe(
+            self,
+            data: pl.Tensor[[BIG_M, BIG_N], pl.FP32],
+            row_offset: pl.Scalar[pl.INDEX],
+            bias: pl.Scalar[pl.FP32],
+            out: pl.Out[pl.Tensor[[BIG_M, BIG_N], pl.FP32]],
+        ) -> pl.Tensor[[BIG_M, BIG_N], pl.FP32]:
+            tile: pl.Tile[[TILE_M, BIG_N], pl.FP32] = pl.load(data, [row_offset, 0], [TILE_M, BIG_N])
+            result: pl.Tile[[TILE_M, BIG_N], pl.FP32] = pl.add(tile, bias)
+            ret: pl.Tensor[[BIG_M, BIG_N], pl.FP32] = pl.store(result, [row_offset, 0], out)
+            return ret
+
+        @pl.function(type=pl.FunctionType.Orchestration)
+        def main(
+            self,
+            data: pl.Tensor[[BIG_M, BIG_N], pl.FP32],
+            out: pl.Out[pl.Tensor[[BIG_M, BIG_N], pl.FP32]],
+        ) -> pl.Tensor[[BIG_M, BIG_N], pl.FP32]:
+            for phase in pl.range(N_PHASES):
+                for branch in pl.parallel(N_BRANCHES):
+                    row = (phase * N_BRANCHES + branch) * TILE_M
+                    out = self.kernel_stripe(data, row, 1.0, out)
+            return out
+
+    return PhaseFenceAuto
+
+
+class _PhaseFenceAutoPTO(PTOTestCase):
+    """Auto-scope control for the outer-seq × inner-parallel PhaseFence shape."""
+
+    __test__ = False
+
+    def __init__(self, *, platform: str | None = None, config=None):
+        super().__init__(config, platform=platform)
+
+    def get_name(self) -> str:
+        return f"phase_fence_auto_{_PHASE_FENCE_N_PHASES}x{_PHASE_FENCE_N_BRANCHES}"
+
+    def get_strategy(self) -> OptimizationStrategy:
+        return OptimizationStrategy.Default
+
+    def define_tensors(self) -> list[TensorSpec]:
+        return [
+            TensorSpec(
+                "data", [_PHASE_FENCE_BIG_M, _PHASE_FENCE_BIG_N], DataType.FP32, init_value=torch.randn
+            ),
+            TensorSpec(
+                "out", [_PHASE_FENCE_BIG_M, _PHASE_FENCE_BIG_N], DataType.FP32, init_value=0.0, is_output=True
+            ),
+        ]
+
+    def get_program(self) -> Any:
+        return _build_phase_fence_program_auto()
+
+    def compute_expected(self, tensors, params=None):
+        data = tensors["data"]
+        out = tensors["out"]
+        out.zero_()
+        for i in range(_PHASE_FENCE_N_PHASES * _PHASE_FENCE_N_BRANCHES):
+            r0 = i * _PHASE_FENCE_TILE_M
+            out[r0 : r0 + _PHASE_FENCE_TILE_M, :] = data[r0 : r0 + _PHASE_FENCE_TILE_M, :] + 1.0
+
+
+class _PhaseFenceAutoNoRewritePTO(_PhaseFenceAutoPTO):
+    """Same auto control, but with Pattern 5 OutWindow rewrite disabled."""
+
+    __test__ = False
+
+    def get_name(self) -> str:
+        return f"phase_fence_auto_no_out_window_{_PHASE_FENCE_N_PHASES}x{_PHASE_FENCE_N_BRANCHES}"
+
+    def get_enable_out_window_rewrite(self) -> bool:
+        return False
+
+
+class TestPhaseFenceAuto:
+    """Numerical correctness for the auto-scope control topology."""
+
+    @pytest.mark.parametrize("platform", PLATFORMS)
+    def test_correctness(self, test_runner, platform):
+        result = test_runner.run(_PhaseFenceAutoPTO(platform=platform))
+        assert result.passed, f"phase-fence auto control execution failed: {result.error}"
+
+
+class TestPhaseFenceAutoNoRewrite:
+    """Numerical correctness for the original large-out auto topology."""
+
+    @pytest.mark.parametrize("platform", PLATFORMS)
+    def test_correctness(self, test_runner, platform):
+        result = test_runner.run(_PhaseFenceAutoNoRewritePTO(platform=platform))
+        assert result.passed, f"phase-fence auto no-rewrite execution failed: {result.error}"
+
+
 class _PhaseFenceManualScopePTO(PTOTestCase):
     """Outer SEQ × inner PARALLEL under manual_scope (multi-deps phase fence)."""
 
