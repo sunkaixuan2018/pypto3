@@ -714,18 +714,22 @@ class OrchestrationStmtCodegen : public CodegenBase {
     code_ << Indent() << "PTO2_SCOPE(" << (scope->manual_ ? "PTO2ScopeMode::MANUAL" : "") << ") {\n";
     indent_ += 4;
     decltype(manual_task_id_map_) saved_map;
+    decltype(guarded_manual_task_ids_) saved_guarded_ids;
     decltype(array_carry_vars_) saved_array_carry;
     if (scope->manual_) {
       ++in_manual_scope_depth_;
       saved_map = std::move(manual_task_id_map_);
+      saved_guarded_ids = std::move(guarded_manual_task_ids_);
       saved_array_carry = std::move(array_carry_vars_);
       manual_task_id_map_.clear();
+      guarded_manual_task_ids_.clear();
       array_carry_vars_.clear();
     }
     VisitStmt(scope->body_);
     if (scope->manual_) {
       --in_manual_scope_depth_;
       manual_task_id_map_ = std::move(saved_map);
+      guarded_manual_task_ids_ = std::move(saved_guarded_ids);
       array_carry_vars_ = std::move(saved_array_carry);
     }
     indent_ -= 4;
@@ -820,6 +824,8 @@ class OrchestrationStmtCodegen : public CodegenBase {
       // Special-case TaskId synthesis ops (synthesized by LowerManualDepsToTaskId).
       if (op_name == "system.task_invalid") {
         code_ << Indent() << "PTO2TaskId " << var_name << " = PTO2TaskId::invalid();\n";
+        manual_task_id_map_[assign->var_.get()] = var_name;
+        guarded_manual_task_ids_.insert(assign->var_.get());
         return;
       }
       if (op_name == "system.task_id_of") {
@@ -916,6 +922,19 @@ class OrchestrationStmtCodegen : public CodegenBase {
       }
       code_ << Indent() << GetCppType(assign->var_->GetType()) << " " << var_name << " = " << value_expr
             << ";\n";
+      if (in_manual_scope_depth_ > 0) {
+        auto lhs_scalar = As<ScalarType>(assign->var_->GetType());
+        auto rhs_var = AsVarLike(assign->value_);
+        if (lhs_scalar && lhs_scalar->dtype_ == DataType::TASK_ID && rhs_var) {
+          auto rhs_it = manual_task_id_map_.find(rhs_var.get());
+          if (rhs_it != manual_task_id_map_.end()) {
+            manual_task_id_map_[assign->var_.get()] = rhs_it->second;
+            if (rhs_var->GetKind() == ObjectKind::IterArg || guarded_manual_task_ids_.count(rhs_var.get())) {
+              guarded_manual_task_ids_.insert(assign->var_.get());
+            }
+          }
+        }
+      }
     }
   }
 
@@ -1382,7 +1401,7 @@ class OrchestrationStmtCodegen : public CodegenBase {
           // first loop iteration; guard with is_valid(). For non-iter-arg
           // string entries (e.g. task_id_of LHS) the value is always valid,
           // so emit unguarded.
-          if (edge->GetKind() == ObjectKind::IterArg) {
+          if (edge->GetKind() == ObjectKind::IterArg || guarded_manual_task_ids_.count(edge.get())) {
             code_ << Indent() << "if (" << name << ".is_valid()) {\n";
             code_ << Indent() << "    " << task_var << ".add_dep(" << name << ");\n";
             code_ << Indent() << "}\n";
@@ -2044,6 +2063,7 @@ class OrchestrationStmtCodegen : public CodegenBase {
   /// Cleared on entry to each manual scope.
   std::unordered_map<const Var*, std::variant<int, std::string, std::vector<std::string>>>
       manual_task_id_map_;
+  std::unordered_set<const Var*> guarded_manual_task_ids_;
   /// Records the C++ array allocation backing a TaskId carry that holds an
   /// array of task ids (not a scalar). Used by ``YieldStmt`` to decide how
   /// to write into the carry:
