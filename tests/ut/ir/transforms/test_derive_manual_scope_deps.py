@@ -143,9 +143,9 @@ class TestDeriveManualScopeDeps:
                     )
                 return out_next
 
-        optimized = passes.optimize_orch_tensors()(Prog)
-        ssa = passes.convert_to_ssa()(optimized)
-        ddir = passes.derive_call_directions()(ssa)
+        ssa = passes.convert_to_ssa()(Prog)
+        optimized = passes.optimize_orch_tensors()(ssa)
+        ddir = passes.derive_call_directions()(optimized)
         ddep = passes.derive_manual_scope_deps()(ddir)
         fn = ddep.get_function("main")
         assert fn is not None
