@@ -94,6 +94,71 @@ class TestOutlineIncoreScopes:
         # Should be structurally equal
         ir.assert_structural_equal(After, Expected)
 
+    def test_parallel_and_range_inside_single_pl_at_outline_to_one_kernel(self):
+        """parallel/range inside one pl.at stay inside one outlined InCore kernel.
+
+        This validates the specific case where the chunked parallel loop lives
+        *inside* the InCore scope. We expect:
+        1. split_chunked_loops lowers the chunked parallel into nested chunk
+           loops inside the scope body;
+        2. outline_incore_scopes still emits exactly one corresponding InCore
+           function for the whole pl.at body, not one kernel per parallel
+           iteration/chunk; and
+        3. the lowered parallel/range structure remains visible inside that one
+           outlined kernel.
+        """
+
+        @pl.program
+        class Before:
+            @pl.function
+            def main(
+                self,
+                normed_tile: pl.Tensor[[16, 512], pl.BF16],
+                wq: pl.Tensor[[512, 256], pl.BF16],
+                q_proj: pl.Out[pl.Tensor[[16, 256], pl.FP32]],
+            ) -> pl.Tensor[[16, 256], pl.FP32]:
+                with pl.at(level=pl.Level.CORE_GROUP, optimization=pl.chunked_loop_optimizer, name_hint="q_proj"):
+                    for ob in pl.parallel(0, 4, 1, chunk=4, chunk_policy="leading_full"):
+                        q0: pl.Scalar[pl.INDEX] = ob * 64
+                        tile_a: pl.Tensor[[16, 128], pl.BF16] = pl.slice(normed_tile, [16, 128], [0, 0])
+                        tile_b: pl.Tensor[[128, 64], pl.BF16] = pl.slice(wq, [128, 64], [0, q0])
+                        q_acc: pl.Tensor[[16, 64], pl.FP32] = pl.matmul(tile_a, tile_b, out_dtype=pl.FP32)
+                        for kb in pl.range(1, 4):
+                            k0: pl.Scalar[pl.INDEX] = kb * 128
+                            tile_a_i: pl.Tensor[[16, 128], pl.BF16] = pl.slice(normed_tile, [16, 128], [0, k0])
+                            tile_b_i: pl.Tensor[[128, 64], pl.BF16] = pl.slice(wq, [128, 64], [k0, q0])
+                            q_acc = pl.matmul_acc(q_acc, tile_a_i, tile_b_i)
+                        q_proj = pl.assemble(q_proj, q_acc, [0, q0])
+                return q_proj
+
+        program = passes.unroll_loops()(Before)
+        program = passes.convert_to_ssa()(program)
+        program = passes.flatten_call_expr()(program)
+        program = passes.split_chunked_loops()(program)
+
+        split_printed = python_print(program)
+        assert "for ob_0_out" in split_printed or "LoopOrigin.ChunkOuter" in split_printed, split_printed
+        assert "for ob_0_in" in split_printed or "LoopOrigin.ChunkInner" in split_printed, split_printed
+        assert "pl.parallel" in split_printed, split_printed
+        assert "for kb" in split_printed, split_printed
+
+        program = passes.interchange_chunk_loops()(program)
+        program = passes.outline_incore_scopes()(program)
+
+        q_proj_funcs = [f for f in program.functions.values() if f.name == "q_proj"]
+        orch_funcs = [f for f in program.functions.values() if f.func_type == ir.FunctionType.Orchestration]
+        assert len(q_proj_funcs) == 1, [f.name for f in program.functions.values()]
+        assert len(orch_funcs) == 1
+
+        outlined = q_proj_funcs[0]
+        assert outlined.func_type == ir.FunctionType.InCore
+
+        outlined_printed = python_print(outlined)
+        assert "pl.parallel" in outlined_printed, outlined_printed
+        assert "for kb" in outlined_printed, outlined_printed
+        assert "matmul_acc" in outlined_printed, outlined_printed
+        assert ".assemble(" in outlined_printed, outlined_printed
+
     def test_outline_preserves_non_incore_functions(self):
         """Test that non-InCore functions are preserved unchanged."""
 
