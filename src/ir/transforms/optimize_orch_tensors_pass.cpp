@@ -2123,22 +2123,30 @@ class OutWindowExternalizer {
         std::make_shared<TensorType>(analysis.window_shape, out_tensor_type->dtype_, out_tensor_type->memref_, new_view);
 
     auto cloned_name = MakeUniqueFunctionName(program, func->name_ + "__windowed");
-    auto new_out_param = std::make_shared<Var>(func->params_[analysis.out_param_index]->name_hint_, new_out_type,
-                                               func->params_[analysis.out_param_index]->span_);
+
+    std::vector<VarPtr> new_params;
+    new_params.reserve(func->params_.size());
 
     std::unordered_map<const Var*, ExprPtr> seed;
     for (size_t i = 0; i < func->params_.size(); ++i) {
-      seed[func->params_[i].get()] = (i == analysis.out_param_index) ? ExprPtr(new_out_param)
-                                                                      : ExprPtr(func->params_[i]);
+      auto param_type = (i == analysis.out_param_index) ? TypePtr(new_out_type) : func->params_[i]->GetType();
+      auto new_param =
+          std::make_shared<Var>(func->params_[i]->name_hint_, param_type, func->params_[i]->span_);
+      new_params.push_back(new_param);
+      seed[func->params_[i].get()] = new_param;
+    }
+
+    std::vector<ExprPtr> cloned_original_offsets;
+    cloned_original_offsets.reserve(analysis.original_store_offsets.size());
+    for (const auto& offset : analysis.original_store_offsets) {
+      cloned_original_offsets.push_back(transform_utils::Substitute(offset, seed));
     }
 
     auto cloned = DeepClone(func->body_, seed);
-    StoreOffsetLocalizer localizer(func->params_[analysis.out_param_index].get(), new_out_param,
-                                   analysis.original_store_offsets, analysis.local_store_offsets, new_out_type);
+    StoreOffsetLocalizer localizer(func->params_[analysis.out_param_index].get(),
+                                   new_params[analysis.out_param_index],
+                                   cloned_original_offsets, analysis.local_store_offsets, new_out_type);
     auto new_body = localizer.VisitStmt(cloned.cloned_body);
-
-    std::vector<VarPtr> new_params = func->params_;
-    new_params[analysis.out_param_index] = new_out_param;
     std::vector<TypePtr> new_return_types = {new_out_type};
 
     return std::make_shared<Function>(cloned_name, new_params, func->param_directions_, new_return_types, new_body,

@@ -644,6 +644,19 @@ class StructuralEqualImpl {
         const auto& lhs_expr = AnyCast<ExprPtr>(lhs_val, "comparing kwarg: " + lhs[i].first);
         const auto& rhs_expr = AnyCast<ExprPtr>(rhs_val, "comparing kwarg: " + lhs[i].first);
         values_equal = Equal(lhs_expr, rhs_expr);
+      } else if (lhs_val.type() == typeid(std::vector<VarPtr>)) {
+        const auto& lhs_vars = AnyCast<std::vector<VarPtr>>(lhs_val, "comparing kwarg: " + lhs[i].first);
+        const auto& rhs_vars = AnyCast<std::vector<VarPtr>>(rhs_val, "comparing kwarg: " + lhs[i].first);
+        if (lhs_vars.size() != rhs_vars.size()) {
+          values_equal = false;
+        } else {
+          for (size_t j = 0; j < lhs_vars.size(); ++j) {
+            if (!EqualVar(lhs_vars[j], rhs_vars[j])) {
+              values_equal = false;
+              break;
+            }
+          }
+        }
       } else {
         INTERNAL_CHECK(false) << "Unsupported kwargs value type for key '" << lhs[i].first
                               << "': " << DemangleTypeName(lhs_val.type().name());

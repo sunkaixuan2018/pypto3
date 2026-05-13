@@ -991,13 +991,13 @@ class TestOutWindowExternalizer:
         assert main is not None
 
         printed_windowed = ir.python_print(kernel_windowed)
-        assert "pl.store(result, [0, 0], out)" in printed_windowed
+        assert "pl.tile.store(result, [0, 0], out)" in printed_windowed
         assert "pl.Tensor[[64, 64], pl.FP32" in printed_windowed
 
         printed_main = ir.python_print(main)
-        assert "pl.slice(out, [64, 64], [row, 0])" in printed_main
-        assert "self.kernel_stripe__windowed(data, row, 1.0, out__window)" in printed_main
-        assert "pl.assemble(out, out_next__windowed, [row, 0])" in printed_main
+        assert "pl.tensor.slice(out, [64, 64], [row, 0])" in printed_main
+        assert "kernel_stripe__windowed(data, row, 1.0, out__window)" in printed_main
+        assert "pl.tensor.assemble(out, out_next__windowed, [row, 0])" in printed_main
 
     def test_manual_scope_dep_retargets_window(self):
         @pl.program
@@ -1033,7 +1033,26 @@ class TestOutWindowExternalizer:
         assert main is not None
 
         printed_main = ir.python_print(main)
-        assert "deps=[out__window]" in printed_main
+        assert "pl.tensor.slice(out, [64, 64], [row, 0])" in printed_main
+
+        scope = next(stmt for stmt in main.body.stmts if isinstance(stmt, ir.RuntimeScopeStmt))
+        slice_assign = next(
+            stmt
+            for stmt in scope.body.stmts
+            if isinstance(stmt, ir.AssignStmt)
+            and isinstance(stmt.value, ir.Call)
+            and stmt.value.op.name == "tensor.slice"
+        )
+        kernel_call_assign = next(
+            stmt
+            for stmt in scope.body.stmts
+            if isinstance(stmt, ir.AssignStmt)
+            and isinstance(stmt.value, ir.Call)
+            and stmt.value.op.name == "kernel_stripe__windowed"
+        )
+        edges = kernel_call_assign.value.attrs.get("user_manual_dep_edges", [])
+        assert len(edges) == 1
+        assert edges[0].same_as(slice_assign.var)
 
 
 if __name__ == "__main__":
