@@ -125,7 +125,7 @@ class TestQwen3JITCompile:
         backend.set_backend_type(BackendType.Ascend910B)
 
         post_pass = qwen3_decode.compile_for_test(*_make_args())
-        q_proj_funcs = sorted(name for name in post_pass.functions if name.startswith("q_proj"))
+        q_proj_funcs = sorted(func.name for func in post_pass.functions.values() if func.name.startswith("q_proj"))
         assert q_proj_funcs == ["q_proj"], f"Expected one outlined q_proj kernel, got {q_proj_funcs}"
 
         files = generate(post_pass, str(tmp_path), skip_ptoas=True)

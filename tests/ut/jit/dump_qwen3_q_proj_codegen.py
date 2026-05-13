@@ -75,9 +75,9 @@ def main() -> None:
     post_pass = qwen3_decode.compile_for_test(*_make_args())
     files = generate(post_pass, str(out_dir / "backend_generate"), skip_ptoas=True)
 
-    q_proj_funcs = sorted(name for name in post_pass.functions if name.startswith("q_proj"))
+    q_proj_funcs = sorted(func.name for func in post_pass.functions.values() if func.name.startswith("q_proj"))
     (out_dir / "post_pass_function_names.txt").write_text(
-        "\n".join(sorted(post_pass.functions.keys())) + "\n", encoding="utf-8"
+        "\n".join(sorted(func.name for func in post_pass.functions.values())) + "\n", encoding="utf-8"
     )
     (out_dir / "q_proj_functions.txt").write_text("\n".join(q_proj_funcs) + "\n", encoding="utf-8")
 
