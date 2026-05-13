@@ -20,6 +20,7 @@ import pypto.language as pl
 from pypto import backend, passes
 from pypto.backend import BackendType
 from pypto.backend.pto_backend import generate
+from pypto.ir.pass_manager import OptimizationStrategy, PassManager
 from pypto.ir.printer import python_print
 
 
@@ -55,22 +56,28 @@ def main() -> None:
     out_dir = args.output_dir.resolve()
     out_dir.mkdir(parents=True, exist_ok=True)
 
-    program = passes.unroll_loops()(ParallelInsidePlAtProgram)
-    program = passes.convert_to_ssa()(program)
-    program = passes.flatten_call_expr()(program)
-    program = passes.split_chunked_loops()(program)
-    (out_dir / "after_split.py").write_text(python_print(program), encoding="utf-8")
+    # Stage 1: stop early after split/outline so we can inspect the exact
+    # evidence for "parallel stays inside one outlined kernel".
+    split_outline = passes.unroll_loops()(ParallelInsidePlAtProgram)
+    split_outline = passes.convert_to_ssa()(split_outline)
+    split_outline = passes.flatten_call_expr()(split_outline)
+    split_outline = passes.split_chunked_loops()(split_outline)
+    (out_dir / "after_split.py").write_text(python_print(split_outline), encoding="utf-8")
 
-    program = passes.interchange_chunk_loops()(program)
-    program = passes.outline_incore_scopes()(program)
-    (out_dir / "after_outline.py").write_text(python_print(program), encoding="utf-8")
+    split_outline = passes.interchange_chunk_loops()(split_outline)
+    split_outline = passes.outline_incore_scopes()(split_outline)
+    (out_dir / "after_outline.py").write_text(python_print(split_outline), encoding="utf-8")
 
-    q_proj_func = next(func for func in program.functions.values() if func.name == "q_proj")
+    q_proj_func = next(func for func in split_outline.functions.values() if func.name == "q_proj")
     (out_dir / "outlined_q_proj.py").write_text(python_print(q_proj_func), encoding="utf-8")
 
+    # Stage 2: run the full default pipeline so backend codegen sees the
+    # expected lowered AIC/AIV form instead of raw InCore + tensor.slice ops.
     backend.reset_for_testing()
     backend.set_backend_type(BackendType.Ascend910B)
-    files = generate(program, str(out_dir / "backend_generate"), skip_ptoas=True)
+    full_program = PassManager.get_strategy(OptimizationStrategy.Default).run_passes(ParallelInsidePlAtProgram)
+    (out_dir / "after_default_pipeline.py").write_text(python_print(full_program), encoding="utf-8")
+    files = generate(full_program, str(out_dir / "backend_generate"), skip_ptoas=True)
 
     for rel_path, content in files.items():
         path = out_dir / rel_path
@@ -81,6 +88,7 @@ def main() -> None:
     print(f"  {out_dir / 'after_split.py'}")
     print(f"  {out_dir / 'after_outline.py'}")
     print(f"  {out_dir / 'outlined_q_proj.py'}")
+    print(f"  {out_dir / 'after_default_pipeline.py'}")
     print(f"  {out_dir / 'orchestration' / 'main.cpp'}")
     print(f"  {out_dir / 'kernels' / 'aic' / 'q_proj.pto'}")
 
