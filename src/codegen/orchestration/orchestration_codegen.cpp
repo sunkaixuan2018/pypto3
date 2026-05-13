@@ -919,9 +919,10 @@ class OrchestrationStmtCodegen : public CodegenBase {
           auto rhs_it = manual_task_id_map_.find(rhs_var.get());
           if (rhs_it != manual_task_id_map_.end()) {
             manual_task_id_map_[assign->var_.get()] = rhs_it->second;
-            if (auto* rhs_name = std::get_if<std::string>(&rhs_it->second)) {
-              emit_name_map_[assign->var_.get()] = *rhs_name;
-            }
+            // Keep plain TaskId alias AssignStmts in lockstep with the RHS emit
+            // name so later GenerateExprString()/YieldStmt lookups never fall
+            // back to the raw SSA name after direct-out window rewriting.
+            emit_name_map_[assign->var_.get()] = GetVarName(rhs_var);
             if (rhs_var->GetKind() == ObjectKind::IterArg || guarded_manual_task_ids_.count(rhs_var.get())) {
               guarded_manual_task_ids_.insert(assign->var_.get());
             }
