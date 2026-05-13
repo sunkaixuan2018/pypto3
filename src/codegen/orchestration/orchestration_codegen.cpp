@@ -922,7 +922,13 @@ class OrchestrationStmtCodegen : public CodegenBase {
             // Keep plain TaskId alias AssignStmts in lockstep with the RHS emit
             // name so later GenerateExprString()/YieldStmt lookups never fall
             // back to the raw SSA name after direct-out window rewriting.
-            emit_name_map_[assign->var_.get()] = GetVarName(rhs_var);
+            const std::string rhs_name = GetVarName(rhs_var);
+            const std::string lhs_name = ReserveVarEmitName(assign->var_.get());
+            emit_name_map_[assign->var_.get()] = rhs_name;
+            if (!declared_var_ptrs_.count(assign->var_.get()) && !param_name_set_.count(lhs_name) && lhs_name != rhs_name) {
+              declared_var_ptrs_.insert(assign->var_.get());
+              code_ << Indent() << "PTO2TaskId " << lhs_name << " = " << rhs_name << ";\n";
+            }
             if (rhs_var->GetKind() == ObjectKind::IterArg || guarded_manual_task_ids_.count(rhs_var.get())) {
               guarded_manual_task_ids_.insert(assign->var_.get());
             }
