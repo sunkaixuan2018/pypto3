@@ -3149,6 +3149,117 @@ class TestManualScopeCodegen:
         # Cross-iteration parallel: the ONLY add_dep is the intra-iteration one.
         assert code.count("add_dep(") == 1, code
 
+    def test_manual_scope_phase_fence_direct_out_rewrite(self):
+        """Scenario A: direct full-Out carries become per-window deps in codegen.
+
+        The original source form is ``out = self.kernel_stripe(..., out, deps=[out])``.
+        After OptimizeOrchTensors + DeriveManualScopeDeps, codegen should still
+        emit the intended phase fence, but the dep carrier must be the sliced
+        window / assembled alias rather than the whole parent tensor.
+        """
+        backend.reset_for_testing()
+        backend.set_backend_type(BackendType.Ascend910B)
+
+        N_PHASES = 4
+        N_BRANCHES = 4
+        TILE_M = 64
+        BIG_N = 64
+        BIG_M = N_PHASES * N_BRANCHES * TILE_M
+
+        @pl.program
+        class Prog:
+            @pl.function(type=pl.FunctionType.InCore)
+            def kernel_stripe(
+                self,
+                data: pl.Tensor[[BIG_M, BIG_N], pl.FP32],
+                row_offset: pl.Scalar[pl.INDEX],
+                bias: pl.Scalar[pl.FP32],
+                out: pl.Out[pl.Tensor[[BIG_M, BIG_N], pl.FP32]],
+            ) -> pl.Tensor[[BIG_M, BIG_N], pl.FP32]:
+                tile: pl.Tile[[TILE_M, BIG_N], pl.FP32] = pl.load(data, [row_offset, 0], [TILE_M, BIG_N])
+                result: pl.Tile[[TILE_M, BIG_N], pl.FP32] = pl.add(tile, bias)
+                ret: pl.Tensor[[BIG_M, BIG_N], pl.FP32] = pl.store(result, [row_offset, 0], out)
+                return ret
+
+            @pl.function(type=pl.FunctionType.Orchestration)
+            def main(
+                self,
+                data: pl.Tensor[[BIG_M, BIG_N], pl.FP32],
+                out: pl.Out[pl.Tensor[[BIG_M, BIG_N], pl.FP32]],
+            ) -> pl.Tensor[[BIG_M, BIG_N], pl.FP32]:
+                with pl.manual_scope():
+                    for phase in pl.range(N_PHASES):
+                        for branch in pl.parallel(N_BRANCHES):
+                            row = (phase * N_BRANCHES + branch) * TILE_M
+                            out = self.kernel_stripe(data, row, 1.0, out, deps=[out])
+                return out
+
+        pm = PassManager.get_strategy(OptimizationStrategy.Default)
+        transformed = pm.run_passes(Prog)
+        code = _generate_orch_code(transformed)
+
+        assert "PTO2_SCOPE(PTO2ScopeMode::MANUAL)" in code, code
+        assert "make_tensor_external(" in code, code
+        assert "__windowed" in code, code
+        assert ".view(" in code, code
+        assert ".assemble(" not in code, code
+
+        # Phase fence survives as array-carry multi-deps: every phase-(n+1)
+        # task depends on all N_BRANCHES slots from the previous phase.
+        assert code.count("add_dep(") == N_BRANCHES, code
+        assert ".is_valid()" in code, code
+
+    def test_manual_scope_branch_chain_direct_out_rewrite(self):
+        """Scenario A under outer-parallel / inner-seq should remain per-branch chains."""
+        backend.reset_for_testing()
+        backend.set_backend_type(BackendType.Ascend910B)
+
+        N_BRANCHES = 4
+        N_STEPS = 4
+        TILE_M = 64
+        BIG_N = 64
+        BIG_M = N_BRANCHES * N_STEPS * TILE_M
+
+        @pl.program
+        class Prog:
+            @pl.function(type=pl.FunctionType.InCore)
+            def kernel_stripe(
+                self,
+                data: pl.Tensor[[BIG_M, BIG_N], pl.FP32],
+                row_offset: pl.Scalar[pl.INDEX],
+                bias: pl.Scalar[pl.FP32],
+                out: pl.Out[pl.Tensor[[BIG_M, BIG_N], pl.FP32]],
+            ) -> pl.Tensor[[BIG_M, BIG_N], pl.FP32]:
+                tile: pl.Tile[[TILE_M, BIG_N], pl.FP32] = pl.load(data, [row_offset, 0], [TILE_M, BIG_N])
+                result: pl.Tile[[TILE_M, BIG_N], pl.FP32] = pl.add(tile, bias)
+                ret: pl.Tensor[[BIG_M, BIG_N], pl.FP32] = pl.store(result, [row_offset, 0], out)
+                return ret
+
+            @pl.function(type=pl.FunctionType.Orchestration)
+            def main(
+                self,
+                data: pl.Tensor[[BIG_M, BIG_N], pl.FP32],
+                out: pl.Out[pl.Tensor[[BIG_M, BIG_N], pl.FP32]],
+            ) -> pl.Tensor[[BIG_M, BIG_N], pl.FP32]:
+                with pl.manual_scope():
+                    for branch in pl.parallel(N_BRANCHES):
+                        for step in pl.range(N_STEPS):
+                            row = step * N_BRANCHES * TILE_M + branch * TILE_M
+                            out = self.kernel_stripe(data, row, 1.0, out, deps=[out])
+                return out
+
+        pm = PassManager.get_strategy(OptimizationStrategy.Default)
+        transformed = pm.run_passes(Prog)
+        code = _generate_orch_code(transformed)
+
+        assert "PTO2_SCOPE(PTO2ScopeMode::MANUAL)" in code, code
+        assert "__windowed" in code, code
+        assert ".view(" in code, code
+
+        # Per-branch linear chain: only one dep slot should feed each next step.
+        assert code.count("add_dep(") == 1, code
+        assert ".is_valid()" in code, code
+
     def test_manual_scope_parallel_dynamic_trip_count_rejected(self):
         """``pl.parallel(<dynamic>)`` carrying a manual_scope dep must error.
 
