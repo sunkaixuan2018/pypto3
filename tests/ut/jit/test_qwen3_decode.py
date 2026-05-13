@@ -14,11 +14,16 @@ Verifies that the cross-file ``@pl.jit.inline`` composition in
 pass pipeline, producing the expected post-pass IR shape (one
 Orchestration entry + several InCore-class kernels)."""
 
+from pathlib import Path
+
 import pytest
 
 # Module-level skip — tests need torch to build random input tensors.
 torch = pytest.importorskip("torch")
 
+from pypto import backend  # noqa: E402
+from pypto.backend import BackendType  # noqa: E402
+from pypto.backend.pto_backend import generate  # noqa: E402
 from pypto.pypto_core import ir  # noqa: E402
 
 from examples.models.qwen3_jit.config import (  # noqa: E402
@@ -107,6 +112,51 @@ class TestQwen3JITCompile:
         entry = post_pass.get_function("qwen3_decode")
         assert entry is not None
         assert entry.func_type == ir.FunctionType.Orchestration
+
+    def test_q_projection_parallel_does_not_split_into_per_iter_kernels(self, tmp_path: Path):
+        """Parallel/chunked Q projection should still outline as one kernel.
+
+        This validates the conclusion we want to preserve: later compilation
+        stages may rewrite the loop shape, but they do not automatically split
+        the q_projection "big kernel" into multiple sibling kernels per
+        parallel/range iteration.
+        """
+        backend.reset_for_testing()
+        backend.set_backend_type(BackendType.Ascend910B)
+
+        post_pass = qwen3_decode.compile_for_test(*_make_args())
+        q_proj_funcs = sorted(name for name in post_pass.functions if name.startswith("q_proj"))
+        assert q_proj_funcs == ["q_proj"], f"Expected one outlined q_proj kernel, got {q_proj_funcs}"
+
+        files = generate(post_pass, str(tmp_path), skip_ptoas=True)
+        orch_path = "orchestration/qwen3_decode.cpp"
+        q_proj_kernel_paths = sorted(path for path in files if path.endswith("/q_proj.pto"))
+        all_kernel_paths = sorted(path for path in files if path.startswith("kernels/") and path.endswith(".pto"))
+
+        assert orch_path in files, f"Expected {orch_path} in generated files: {sorted(files)}"
+        assert q_proj_kernel_paths == ["kernels/aic/q_proj.pto"], (
+            "Expected exactly one q_proj kernel artifact; automatic per-iteration "
+            "kernel splitting would create multiple q_proj-derived artifacts."
+        )
+        assert not any("q_proj_" in path for path in all_kernel_paths), (
+            "Unexpected per-iteration/per-chunk q_proj kernel artifacts found: "
+            f"{[path for path in all_kernel_paths if 'q_proj_' in path]}"
+        )
+
+        orch_code = files[orch_path]
+        q_proj_kernel_code = files[q_proj_kernel_paths[0]]
+
+        assert "rt_submit_aic_task" in orch_code or "rt_submit_task" in orch_code
+        assert "q_proj" in orch_code
+        assert "q_proj_" not in orch_code
+
+        assert "func.func @q_proj" in q_proj_kernel_code
+        assert "pto.tmatmul" in q_proj_kernel_code
+
+        # Keep concrete artifacts in the pytest temp dir so the generated code
+        # is easy to inspect when running this test manually on a server.
+        (tmp_path / "qwen3_decode_orch.cpp").write_text(orch_code, encoding="utf-8")
+        (tmp_path / "q_proj.pto").write_text(q_proj_kernel_code, encoding="utf-8")
 
 
 if __name__ == "__main__":
