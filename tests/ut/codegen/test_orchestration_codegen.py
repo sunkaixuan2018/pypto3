@@ -3264,6 +3264,50 @@ class TestManualScopeCodegen:
         assert "out__rv_v4__tid_1 = out__ssa_v5__windowed__tid;" in code, code
         assert "out__rv_v4__tid_1 = out__ssa_v5__tid;" not in code, code
 
+    def test_chunk_inner_parallel_loop_out_window_rewrite_visible_in_orchestration_codegen(self):
+        """Scenario B should expose the ChunkInner write window in final orch C++."""
+        backend.reset_for_testing()
+        backend.set_backend_type(BackendType.Ascend910B)
+
+        @pl.program
+        class Prog:
+            @pl.function(type=pl.FunctionType.InCore)
+            def q_proj_chunk_group(
+                self,
+                x: pl.Tensor[[16, 512], pl.FP32],
+                group_base: pl.Scalar[pl.INDEX],
+                out: pl.Out[pl.Tensor[[16, 512], pl.FP32]],
+            ) -> pl.Tensor[[16, 512], pl.FP32]:
+                for ob_ci, (out_iter,) in pl.parallel(
+                    4, init_values=(out,), attrs={"loop_origin": pl.LoopOrigin.ChunkInner}
+                ):
+                    q0: pl.Scalar[pl.INDEX] = group_base + ob_ci * 64
+                    tile: pl.Tile[[16, 64], pl.FP32] = pl.load(x, [0, q0], [16, 64])
+                    out_next: pl.Tensor[[16, 512], pl.FP32] = pl.store(tile, [0, q0], out_iter)
+                    q_rv = pl.yield_(out_next)
+                return q_rv
+
+            @pl.function(type=pl.FunctionType.Orchestration)
+            def main(
+                self,
+                x: pl.Tensor[[16, 512], pl.FP32],
+                out: pl.Out[pl.Tensor[[16, 512], pl.FP32]],
+            ) -> pl.Tensor[[16, 512], pl.FP32]:
+                group_base: pl.Scalar[pl.INDEX] = 128
+                out_next: pl.Tensor[[16, 512], pl.FP32] = self.q_proj_chunk_group(x, group_base, out)
+                return out_next
+
+        pm = PassManager.get_strategy(OptimizationStrategy.Default)
+        transformed = pm.run_passes(Prog)
+        code = _generate_orch_code(transformed)
+
+        assert "Tensor ext_out = from_tensor_arg(orch_args.tensor(1));" in code, code
+        assert "__windowed" in code, code
+        assert "{16, 256}" in code, code
+        assert re.search(r"Tensor\s+\w*window\w*\s*=\s*ext_out\.view\(", code), code
+        assert re.search(r"params_t\d+\.add_(?:output|inout)\(\w*window\w*\);", code), code
+        assert re.search(r"params_t\d+\.add_(?:output|inout)\(ext_out\);", code) is None, code
+
     def test_manual_scope_parallel_dynamic_trip_count_rejected(self):
         """``pl.parallel(<dynamic>)`` carrying a manual_scope dep must error.
 

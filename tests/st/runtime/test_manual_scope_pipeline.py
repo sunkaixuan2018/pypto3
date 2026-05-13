@@ -55,6 +55,7 @@ How to run
 """
 
 import json
+import re
 from pathlib import Path
 from typing import Any
 
@@ -786,6 +787,130 @@ class TestBranchChainSwimlane:
             assert len(step0_cores) >= 2, (
                 f"branches should spread across cores; step-0 core_ids = {sorted(step0_cores)}"
             )
+
+
+# ---------------------------------------------------------------------------
+# ChunkInner out-window rewrite: first-stage q_proj-like scenario B.
+# ---------------------------------------------------------------------------
+
+
+_CHUNK_INNER_ROWS = 16
+_CHUNK_INNER_COLS = 512
+_CHUNK_INNER_GROUP_BASE = 128
+_CHUNK_INNER_WINDOW_COLS = 256
+_CHUNK_INNER_CHUNK = 64
+_CHUNK_INNER_INNER_ITERS = _CHUNK_INNER_WINDOW_COLS // _CHUNK_INNER_CHUNK
+
+
+def _build_chunk_inner_out_window_program():
+    """q_proj-like ChunkInner writeback shape for runtime validation."""
+    ROWS = _CHUNK_INNER_ROWS
+    COLS = _CHUNK_INNER_COLS
+    GROUP_BASE = _CHUNK_INNER_GROUP_BASE
+    CHUNK = _CHUNK_INNER_CHUNK
+    INNER_ITERS = _CHUNK_INNER_INNER_ITERS
+
+    @pl.program
+    class ChunkInnerOutWindowProgram:
+        @pl.function(type=pl.FunctionType.InCore)
+        def q_proj_chunk_group(
+            self,
+            x: pl.Tensor[[ROWS, COLS], pl.FP32],
+            group_base: pl.Scalar[pl.INDEX],
+            out: pl.Out[pl.Tensor[[ROWS, COLS], pl.FP32]],
+        ) -> pl.Tensor[[ROWS, COLS], pl.FP32]:
+            for ob_ci, (out_iter,) in pl.parallel(
+                INNER_ITERS, init_values=(out,), attrs={"loop_origin": pl.LoopOrigin.ChunkInner}
+            ):
+                q0: pl.Scalar[pl.INDEX] = group_base + ob_ci * CHUNK
+                tile: pl.Tile[[ROWS, CHUNK], pl.FP32] = pl.load(x, [0, q0], [ROWS, CHUNK])
+                out_next: pl.Tensor[[ROWS, COLS], pl.FP32] = pl.store(tile, [0, q0], out_iter)
+                q_rv = pl.yield_(out_next)
+            return q_rv
+
+        @pl.function(type=pl.FunctionType.Orchestration)
+        def main(
+            self,
+            x: pl.Tensor[[ROWS, COLS], pl.FP32],
+            out: pl.Out[pl.Tensor[[ROWS, COLS], pl.FP32]],
+        ) -> pl.Tensor[[ROWS, COLS], pl.FP32]:
+            group_base: pl.Scalar[pl.INDEX] = GROUP_BASE
+            out_next: pl.Tensor[[ROWS, COLS], pl.FP32] = self.q_proj_chunk_group(x, group_base, out)
+            return out_next
+
+    return ChunkInnerOutWindowProgram
+
+
+class _ChunkInnerOutWindowPTO(PTOTestCase):
+    """Runtime correctness case for first-stage ChunkInner out-window rewrite."""
+
+    __test__ = False
+
+    def __init__(self, *, platform: str | None = None, config=None):
+        super().__init__(config, platform=platform)
+
+    def get_name(self) -> str:
+        return f"chunk_inner_out_window_{_CHUNK_INNER_ROWS}x{_CHUNK_INNER_COLS}"
+
+    def get_strategy(self) -> OptimizationStrategy:
+        return OptimizationStrategy.Default
+
+    def define_tensors(self) -> list[TensorSpec]:
+        return [
+            TensorSpec("x", [_CHUNK_INNER_ROWS, _CHUNK_INNER_COLS], DataType.FP32, init_value=torch.randn),
+            TensorSpec(
+                "out",
+                [_CHUNK_INNER_ROWS, _CHUNK_INNER_COLS],
+                DataType.FP32,
+                init_value=0.0,
+                is_output=True,
+            ),
+        ]
+
+    def get_program(self) -> Any:
+        return _build_chunk_inner_out_window_program()
+
+    def compute_expected(self, tensors, params=None):
+        x = tensors["x"]
+        out = tensors["out"]
+        out.zero_()
+        c0 = _CHUNK_INNER_GROUP_BASE
+        c1 = c0 + _CHUNK_INNER_WINDOW_COLS
+        out[:, c0:c1] = x[:, c0:c1]
+
+
+class TestChunkInnerOutWindowRuntime:
+    """Numerical + saved-artifact checks for the ChunkInner rewrite shape."""
+
+    @pytest.mark.parametrize("platform", PLATFORMS)
+    def test_correctness(self, test_runner, platform):
+        result = test_runner.run(_ChunkInnerOutWindowPTO(platform=platform))
+        assert result.passed, f"chunk-inner out-window execution failed: {result.error}"
+
+    @pytest.mark.parametrize("platform", PLATFORMS)
+    def test_saved_artifact_contains_windowed_orchestration(self, test_runner, test_config, platform):
+        if not test_config.save_kernels:
+            pytest.skip("pass --save-kernels to inspect the rewritten orchestration artifact")
+
+        tc = _ChunkInnerOutWindowPTO(platform=platform)
+        result = test_runner.run(tc)
+        assert result.passed, f"chunk-inner out-window execution failed: {result.error}"
+
+        test_name = tc.get_name()
+        if test_config.save_kernels_dir:
+            work_dir = Path(test_config.save_kernels_dir) / test_name
+        else:
+            matches = sorted(_BUILD_OUTPUT_DIR.glob(f"{test_name}_*"), key=lambda p: p.stat().st_mtime)
+            assert matches, f"No saved artifact directory found for {test_name}"
+            work_dir = matches[-1]
+
+        orch_path = work_dir / "orchestration" / "main.cpp"
+        assert orch_path.exists(), f"Missing orchestration artifact: {orch_path}"
+        code = orch_path.read_text(encoding="utf-8")
+
+        assert "__windowed" in code, code
+        assert ".view(" in code, code
+        assert re.search(r"Tensor\s+\w*window\w*\s*=\s*ext_out\.view\(", code), code
 
 
 if __name__ == "__main__":

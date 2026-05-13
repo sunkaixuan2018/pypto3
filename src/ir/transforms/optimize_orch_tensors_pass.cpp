@@ -111,10 +111,12 @@ size_t CountVarRefsInStmt(const StmtPtr& stmt, const Var* target) {
    protected:
     void VisitExpr_(const VarPtr& op) override {
       if (op.get() == target_) ++count_;
+      IRVisitor::VisitExpr_(op);
     }
 
     void VisitExpr_(const IterArgPtr& op) override {
       if (op.get() == target_) ++count_;
+      IRVisitor::VisitExpr_(op);
     }
 
    private:
