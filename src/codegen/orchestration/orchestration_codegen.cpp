@@ -845,6 +845,14 @@ class OrchestrationStmtCodegen : public CodegenBase {
             << "Internal error: system.task_id_of producer '" << producer->name_hint_
             << "' has no task counter in current manual scope";
         const int* idx = std::get_if<int>(&it->second);
+        auto existing_it = manual_task_id_map_.find(assign->var_.get());
+        if (existing_it != manual_task_id_map_.end()) {
+          if (auto* existing_name = std::get_if<std::string>(&existing_it->second)) {
+            if (*existing_name == var_name) {
+              return;
+            }
+          }
+        }
         INTERNAL_CHECK_SPAN(idx, assign->span_)
             << "Internal error: system.task_id_of producer '" << producer->name_hint_
             << "' is not a kernel-Call LHS (variant holds non-int)";
@@ -1343,17 +1351,22 @@ class OrchestrationStmtCodegen : public CodegenBase {
     }
   }
 
-  void EmitTaskSubmitAndBind(const std::string& submit_expr) {
+  void EmitTaskSubmitAndBind(const CallPtr& call, const std::string& submit_expr) {
     if (in_manual_scope_depth_ > 0) {
       // Manual scope: capture the submit's outputs so later code can call
-      // ``.task_id()`` on it. We do NOT pre-emit a ``PTO2TaskId task_<n>``
-      // variable — instead, downstream consumers (system.task_id_of in IR,
-      // EmitManualDeps for direct deps) emit ``task_<n>_outs.task_id()``
-      // expressions directly. This avoids a redundant variable in the common
-      // case where the caller threads the task id through a TaskId iter_arg
-      // carry rather than referring to the kernel's task counter by name.
+      // ``.task_id()`` on it. If the IR attached a TaskId companion via
+      // ``kAttrTaskIdVar``, emit that exact C++ identifier here so carry/yield
+      // code can reference it even when the tensor result aliases a rewritten
+      // external-out window name.
       const std::string outs_var = "task_" + std::to_string(task_counter_) + "_outs";
       code_ << Indent() << "TaskOutputTensors " << outs_var << " = " << submit_expr << ";\n";
+      if (call) {
+        if (auto task_id_var = call->GetAttr<VarPtr>(kAttrTaskIdVar, nullptr)) {
+          const std::string task_id_name = ReserveVarEmitName(task_id_var.get());
+          code_ << Indent() << "PTO2TaskId " << task_id_name << " = " << outs_var << ".task_id();\n";
+          manual_task_id_map_[task_id_var.get()] = task_id_name;
+        }
+      }
     } else {
       code_ << Indent() << submit_expr << ";\n";
     }
@@ -1650,7 +1663,7 @@ class OrchestrationStmtCodegen : public CodegenBase {
 
     std::string submit_expr =
         CoreTypeToSubmitPrefix(core_type) + std::to_string(func_id) + ", " + task_var + ")";
-    EmitTaskSubmitAndBind(submit_expr);
+    EmitTaskSubmitAndBind(call, submit_expr);
   }
 
   void GenerateSpmdCallCode(const CallPtr& call, const FunctionPtr& spmd_func) {
@@ -1683,7 +1696,7 @@ class OrchestrationStmtCodegen : public CodegenBase {
 
     std::string submit_expr =
         CoreTypeToSubmitPrefix(core_type) + std::to_string(func_id) + ", " + task_var + ")";
-    EmitTaskSubmitAndBind(submit_expr);
+    EmitTaskSubmitAndBind(call, submit_expr);
   }
 
   void GenerateGroupCallCode(const CallPtr& call, const FunctionPtr& group_func,
@@ -1723,7 +1736,7 @@ class OrchestrationStmtCodegen : public CodegenBase {
 
       std::string submit_expr =
           CoreTypeToSubmitPrefix(CoreType::VECTOR) + std::to_string(aiv_id) + ", " + task_var + ")";
-      EmitTaskSubmitAndBind(submit_expr);
+      EmitTaskSubmitAndBind(call, submit_expr);
       return;
     }
 
@@ -1769,7 +1782,7 @@ class OrchestrationStmtCodegen : public CodegenBase {
     EmitManualDeps(call, task_var);
 
     std::string submit_expr = "rt_submit_task(mixed_" + std::to_string(task_counter_) + ", " + task_var + ")";
-    EmitTaskSubmitAndBind(submit_expr);
+    EmitTaskSubmitAndBind(call, submit_expr);
   }
 
   // --- Alias generation helpers ---

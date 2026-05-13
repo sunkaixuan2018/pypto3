@@ -3259,6 +3259,9 @@ class TestManualScopeCodegen:
         # Per-branch linear chain: only one dep slot should feed each next step.
         assert code.count("add_dep(") == 1, code
         assert ".is_valid()" in code, code
+        assert "PTO2TaskId out__ssa_v5__windowed__tid = task_0_outs.task_id();" in code, code
+        assert "out__rv_v4__tid_1 = out__ssa_v5__windowed__tid;" in code, code
+        assert "out__rv_v4__tid_1 = out__ssa_v5__tid;" not in code, code
 
     def test_manual_scope_parallel_dynamic_trip_count_rejected(self):
         """``pl.parallel(<dynamic>)`` carrying a manual_scope dep must error.
