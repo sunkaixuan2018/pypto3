@@ -83,9 +83,12 @@ def main() -> None:
 
     orch_code = files["orchestration/qwen3_decode.cpp"]
     q_proj_code = files["kernels/aic/q_proj.pto"]
+    q_proj_windowed_code = files.get("kernels/aic/q_proj__windowed.pto")
 
     (out_dir / "qwen3_decode_orch.cpp").write_text(orch_code, encoding="utf-8")
     (out_dir / "q_proj.pto").write_text(q_proj_code, encoding="utf-8")
+    if q_proj_windowed_code is not None:
+        (out_dir / "q_proj__windowed.pto").write_text(q_proj_windowed_code, encoding="utf-8")
 
     print(f"Wrote artifacts to: {out_dir}")
     print(f"Outlined q_proj-like functions: {q_proj_funcs}")
@@ -94,6 +97,8 @@ def main() -> None:
     print(f"  {out_dir / 'q_proj_functions.txt'}")
     print(f"  {out_dir / 'qwen3_decode_orch.cpp'}")
     print(f"  {out_dir / 'q_proj.pto'}")
+    if q_proj_windowed_code is not None:
+        print(f"  {out_dir / 'q_proj__windowed.pto'}")
 
 
 if __name__ == "__main__":

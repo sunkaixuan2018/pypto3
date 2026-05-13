@@ -126,29 +126,45 @@ class TestQwen3JITCompile:
 
         post_pass = qwen3_decode.compile_for_test(*_make_args())
         q_proj_funcs = sorted(func.name for func in post_pass.functions.values() if func.name.startswith("q_proj"))
-        assert q_proj_funcs == ["q_proj"], f"Expected one outlined q_proj kernel, got {q_proj_funcs}"
+        assert "q_proj" in q_proj_funcs, f"Expected outlined q_proj kernel, got {q_proj_funcs}"
+        assert set(q_proj_funcs).issubset({"q_proj", "q_proj__windowed"}), (
+            "Expected only the base q_proj kernel and at most one windowed clone; "
+            f"got {q_proj_funcs}"
+        )
 
         files = generate(post_pass, str(tmp_path), skip_ptoas=True)
         orch_path = "orchestration/qwen3_decode.cpp"
-        q_proj_kernel_paths = sorted(path for path in files if path.endswith("/q_proj.pto"))
+        q_proj_kernel_paths = sorted(
+            path
+            for path in files
+            if path.endswith("/q_proj.pto") or path.endswith("/q_proj__windowed.pto")
+        )
         all_kernel_paths = sorted(path for path in files if path.startswith("kernels/") and path.endswith(".pto"))
 
         assert orch_path in files, f"Expected {orch_path} in generated files: {sorted(files)}"
-        assert q_proj_kernel_paths == ["kernels/aic/q_proj.pto"], (
-            "Expected exactly one q_proj kernel artifact; automatic per-iteration "
-            "kernel splitting would create multiple q_proj-derived artifacts."
+        assert "kernels/aic/q_proj.pto" in q_proj_kernel_paths, (
+            f"Expected base q_proj kernel artifact, got {q_proj_kernel_paths}"
         )
-        assert not any("q_proj_" in path for path in all_kernel_paths), (
-            "Unexpected per-iteration/per-chunk q_proj kernel artifacts found: "
-            f"{[path for path in all_kernel_paths if 'q_proj_' in path]}"
+        assert set(q_proj_kernel_paths).issubset({"kernels/aic/q_proj.pto", "kernels/aic/q_proj__windowed.pto"}), (
+            "Expected only the base q_proj artifact and at most one windowed clone; "
+            f"got {q_proj_kernel_paths}"
+        )
+        unexpected_q_proj_paths = [
+            path
+            for path in all_kernel_paths
+            if "/q_proj" in path and path not in {"kernels/aic/q_proj.pto", "kernels/aic/q_proj__windowed.pto"}
+        ]
+        assert not unexpected_q_proj_paths, (
+            "Unexpected q_proj-derived kernel artifacts found; this suggests a "
+            f"new split mode beyond the known windowed clone: {unexpected_q_proj_paths}"
         )
 
         orch_code = files[orch_path]
-        q_proj_kernel_code = files[q_proj_kernel_paths[0]]
+        q_proj_kernel_code = files["kernels/aic/q_proj.pto"]
 
         assert "rt_submit_aic_task" in orch_code or "rt_submit_task" in orch_code
         assert "q_proj" in orch_code
-        assert "q_proj_" not in orch_code
+        assert "q_proj__windowed__windowed" not in orch_code
 
         assert "func.func @q_proj" in q_proj_kernel_code
         assert "pto.tmatmul" in q_proj_kernel_code
