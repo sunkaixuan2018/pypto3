@@ -904,6 +904,20 @@ class OrchestrationStmtCodegen : public CodegenBase {
     } else if (As<TupleGetItemExpr>(assign->value_)) {
       // No-op: tuple elements handled via tuple_var_to_elements_
     } else {
+      if (in_manual_scope_depth_ > 0) {
+        auto lhs_scalar = As<ScalarType>(assign->var_->GetType());
+        auto rhs_var = AsVarLike(assign->value_);
+        if (lhs_scalar && lhs_scalar->dtype_ == DataType::TASK_ID && rhs_var) {
+          auto rhs_it = manual_task_id_map_.find(rhs_var.get());
+          if (rhs_it != manual_task_id_map_.end()) {
+            manual_task_id_map_[assign->var_.get()] = rhs_it->second;
+            if (rhs_var->GetKind() == ObjectKind::IterArg || guarded_manual_task_ids_.count(rhs_var.get())) {
+              guarded_manual_task_ids_.insert(assign->var_.get());
+            }
+            return;
+          }
+        }
+      }
       std::string value_expr = GenerateExprString(assign->value_);
       // Drop a no-op `X = X;` that arises when VarLineageCollector has
       // collapsed both LHS and RHS onto the same param-rooted emit name
@@ -922,19 +936,6 @@ class OrchestrationStmtCodegen : public CodegenBase {
       }
       code_ << Indent() << GetCppType(assign->var_->GetType()) << " " << var_name << " = " << value_expr
             << ";\n";
-      if (in_manual_scope_depth_ > 0) {
-        auto lhs_scalar = As<ScalarType>(assign->var_->GetType());
-        auto rhs_var = AsVarLike(assign->value_);
-        if (lhs_scalar && lhs_scalar->dtype_ == DataType::TASK_ID && rhs_var) {
-          auto rhs_it = manual_task_id_map_.find(rhs_var.get());
-          if (rhs_it != manual_task_id_map_.end()) {
-            manual_task_id_map_[assign->var_.get()] = rhs_it->second;
-            if (rhs_var->GetKind() == ObjectKind::IterArg || guarded_manual_task_ids_.count(rhs_var.get())) {
-              guarded_manual_task_ids_.insert(assign->var_.get());
-            }
-          }
-        }
-      }
     }
   }
 
