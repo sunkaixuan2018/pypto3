@@ -127,6 +127,7 @@ class TaskRelevantVarCollector : public IRVisitor {
   std::unordered_set<const Var*> has_def_;     // Vars that have any AssignStmt def in the body
   std::unordered_map<const Var*, VarPtr>
       import_vars_;  // Vars in needs_tid_ with NO def (e.g. function params)
+  std::unordered_map<const Var*, VarPtr> seen_vars_;  // Every Var encountered during collection
 
   // Maps for closure analysis.
   std::unordered_map<const Var*, VarPtr> alias_;           // var -> aliased var (Var-to-Var copy / tuple_get)
@@ -173,16 +174,16 @@ class TaskRelevantVarCollector : public IRVisitor {
     // Identify "import" Vars: in needs_tid_ but with no AssignStmt def
     // anywhere in the body AND not an IterArg of an enclosing ForStmt
     // (IterArgs are defined by their ForStmt header, not by AssignStmt).
-    // These are typically function parameters used as implicit iter_arg
-    // init values; they need a synthesized
+    // These are typically function parameters or outer carries that need a synthesized
     // ``<var>__tid = system.task_invalid()`` AssignStmt at body entry so
     // the TaskId companion has an SSA def.
-    for (const auto& [ia, init] : iter_arg_init_) {
-      if (!init) continue;
-      if (!needs_tid_.count(init.get())) continue;
-      if (has_def_.count(init.get())) continue;
-      if (init->GetKind() == ObjectKind::IterArg) continue;
-      import_vars_[init.get()] = init;
+    for (const auto* raw : needs_tid_) {
+      if (!raw) continue;
+      if (has_def_.count(raw)) continue;
+      if (raw->GetKind() == ObjectKind::IterArg) continue;
+      auto it = seen_vars_.find(raw);
+      if (it == seen_vars_.end() || !it->second) continue;
+      import_vars_[raw] = it->second;
     }
   }
 
@@ -193,7 +194,10 @@ class TaskRelevantVarCollector : public IRVisitor {
       const auto* edges = std::any_cast<std::vector<VarPtr>>(&v);
       if (edges) {
         for (const auto& e : *edges) {
-          if (e) needs_tid_.insert(e.get());
+          if (e) {
+            RememberVar(e);
+            needs_tid_.insert(e.get());
+          }
         }
       }
     }
@@ -202,22 +206,27 @@ class TaskRelevantVarCollector : public IRVisitor {
 
   void VisitStmt_(const AssignStmtPtr& assign) override {
     if (assign->var_ && assign->value_) {
+      RememberVar(assign->var_);
       has_def_.insert(assign->var_.get());
       if (auto rhs_var = AsVarLike(assign->value_)) {
+        RememberVar(rhs_var);
         alias_[assign->var_.get()] = rhs_var;
       }
       if (auto get_item = As<TupleGetItemExpr>(assign->value_)) {
         if (auto tup_var = AsVarLike(get_item->tuple_)) {
+          RememberVar(tup_var);
           alias_[assign->var_.get()] = tup_var;
         }
       }
       if (auto call = As<Call>(assign->value_)) {
         if (call->op_->name_ == "tensor.assemble" && call->args_.size() == 3) {
           if (auto source_var = AsVarLike(call->args_[1])) {
+            RememberVar(source_var);
             alias_[assign->var_.get()] = source_var;
           }
         } else if (call->op_->name_ == "tensor.slice" && !call->args_.empty()) {
           if (auto source_var = AsVarLike(call->args_[0])) {
+            RememberVar(source_var);
             alias_[assign->var_.get()] = source_var;
           }
         }
@@ -233,10 +242,13 @@ class TaskRelevantVarCollector : public IRVisitor {
     for (size_t i = 0; i < for_stmt->iter_args_.size(); ++i) {
       const auto& ia = for_stmt->iter_args_[i];
       if (!ia) continue;
+      RememberVar(ia);
       if (auto init_var = AsVarLike(ia->initValue_)) {
+        RememberVar(init_var);
         iter_arg_init_[ia.get()] = init_var;
       }
       if (i < for_stmt->return_vars_.size() && for_stmt->return_vars_[i]) {
+        RememberVar(for_stmt->return_vars_[i]);
         rv_to_iter_arg_[for_stmt->return_vars_[i].get()] = ia;
       }
     }
@@ -247,6 +259,9 @@ class TaskRelevantVarCollector : public IRVisitor {
   }
 
   void VisitStmt_(const IfStmtPtr& if_stmt) override {
+    for (const auto& rv : if_stmt->return_vars_) {
+      RememberVar(rv);
+    }
     scope_dest_stack_.push_back(if_stmt->return_vars_);
     IRVisitor::VisitStmt_(if_stmt);
     scope_dest_stack_.pop_back();
@@ -258,6 +273,8 @@ class TaskRelevantVarCollector : public IRVisitor {
       for (size_t i = 0; i < y->value_.size() && i < dests.size(); ++i) {
         auto src = AsVarLike(y->value_[i]);
         if (src && dests[i]) {
+          RememberVar(src);
+          RememberVar(dests[i]);
           yield_pairs_.emplace_back(src, dests[i]);
         }
       }
@@ -266,6 +283,10 @@ class TaskRelevantVarCollector : public IRVisitor {
   }
 
  private:
+  void RememberVar(const VarPtr& var) {
+    if (var) seen_vars_[var.get()] = var;
+  }
+
   std::vector<std::vector<VarPtr>> scope_dest_stack_;
 };
 
