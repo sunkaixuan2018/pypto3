@@ -2157,7 +2157,11 @@ class OutWindowExternalizer {
     }
 
     size_t total_out_refs = CountVarRefsInStmt(func->body_, func->params_[out_param_index].get());
-    if (total_out_refs != 1) return std::nullopt;
+    size_t store_out_refs = CountVarRefsInStmt(store_assign, func->params_[out_param_index].get());
+    // CountVarRefsInStmt follows IterArg.initValue_, so the unique store
+    // contributes one transitive Out-param reference through the loop-carried
+    // iter arg in addition to the loop init itself.
+    if (total_out_refs != store_out_refs + 1) return std::nullopt;
 
     size_t total_iter_refs = CountVarRefsInStmt(loop->body_, loop->iter_args_[0].get());
     size_t store_iter_refs = CountVarRefsInStmt(store_assign, loop->iter_args_[0].get());
