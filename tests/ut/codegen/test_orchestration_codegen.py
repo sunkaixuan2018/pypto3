@@ -3208,6 +3208,7 @@ class TestManualScopeCodegen:
         # task depends on all N_BRANCHES slots from the previous phase.
         assert code.count("add_dep(") == N_BRANCHES, code
         assert ".is_valid()" in code, code
+        assert "PTO2TaskId out__iter_v3__window__tid = out;" not in code, code
 
     def test_manual_scope_branch_chain_direct_out_rewrite(self):
         """Scenario A under outer-parallel / inner-seq should remain per-branch chains."""

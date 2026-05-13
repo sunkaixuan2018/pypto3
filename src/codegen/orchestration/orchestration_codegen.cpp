@@ -290,6 +290,16 @@ class OrchestrationStmtCodegen : public CodegenBase {
     if (it != emit_name_map_.end()) {
       return it->second;
     }
+    if (auto scalar_type = As<ScalarType>(var->GetType())) {
+      if (scalar_type->dtype_ == DataType::TASK_ID) {
+        auto tid_it = manual_task_id_map_.find(var.get());
+        if (tid_it != manual_task_id_map_.end()) {
+          if (auto* tid_name = std::get_if<std::string>(&tid_it->second)) {
+            return *tid_name;
+          }
+        }
+      }
+    }
     return GetSSABaseName(var->name_hint_);
   }
   [[nodiscard]] std::string TryGetVarName(const ir::ExprPtr& expr) const override {
@@ -919,10 +929,27 @@ class OrchestrationStmtCodegen : public CodegenBase {
           auto rhs_it = manual_task_id_map_.find(rhs_var.get());
           if (rhs_it != manual_task_id_map_.end()) {
             manual_task_id_map_[assign->var_.get()] = rhs_it->second;
+            if (auto* rhs_names = std::get_if<std::vector<std::string>>(&rhs_it->second)) {
+              // Array-carry aliases stay array-backed: emitting a scalar
+              // ``PTO2TaskId lhs = rhs;`` here would collapse the per-slot
+              // carry into an invalid single name (for example a bare tensor
+              // param-root like ``out``), which breaks outer-seq / inner-
+              // parallel manual-scope fences. Preserve the carry metadata so
+              // downstream dep emission still expands one add_dep per slot.
+              auto arr_it = array_carry_vars_.find(rhs_var.get());
+              if (arr_it != array_carry_vars_.end()) {
+                array_carry_vars_[assign->var_.get()] = arr_it->second;
+              }
+              return;
+            }
+            auto* rhs_task_name = std::get_if<std::string>(&rhs_it->second);
+            INTERNAL_CHECK_SPAN(rhs_task_name, assign->span_)
+                << "Internal error: plain TaskId alias expects a string or array "
+                << "manual_task_id_map_ entry";
             // Keep plain TaskId alias AssignStmts in lockstep with the RHS emit
             // name so later GenerateExprString()/YieldStmt lookups never fall
             // back to the raw SSA name after direct-out window rewriting.
-            const std::string rhs_name = GetVarName(rhs_var);
+            const std::string& rhs_name = *rhs_task_name;
             const std::string lhs_name = ReserveVarEmitName(assign->var_.get());
             emit_name_map_[assign->var_.get()] = rhs_name;
             if (!declared_var_ptrs_.count(assign->var_.get()) && !param_name_set_.count(lhs_name) && lhs_name != rhs_name) {
