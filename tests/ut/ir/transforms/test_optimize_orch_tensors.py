@@ -1407,7 +1407,7 @@ class TestOutWindowExternalizer:
         assert q_proj_iter is not None
 
         printed_main = ir.python_print(main)
-        assert "for ob_0_in" in printed_main
+        assert 'attrs={"loop_origin": pl.LoopOrigin.ChunkInner}' in printed_main
         assert "in pl.parallel(" in printed_main
         assert "pl.tensor.slice(" in printed_main
         assert "[16, 64]" in printed_main
