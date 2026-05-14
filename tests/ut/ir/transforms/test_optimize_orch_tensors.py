@@ -1488,7 +1488,9 @@ class TestOutWindowExternalizer:
         assert kv_proj is not None
 
         printed_main = ir.python_print(main)
-        assert "for ob_chunk in pl.parallel(0, 8, 4)" in printed_main
+        assert "in pl.parallel(0, 8, 4" in printed_main
+        assert "kv_proj(" in printed_main
+        assert "init_values=(" in printed_main
         assert "kv_proj(" in printed_main
 
         printed_kernel = ir.python_print(kv_proj)
