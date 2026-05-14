@@ -1103,6 +1103,110 @@ class TestOutWindowExternalizer:
         assert "q_proj_chunk_group__windowed(x, group_base, out__window)" in printed_main
         assert "pl.tensor.assemble(out, out_next__windowed, [0, group_base])" in printed_main
 
+    def test_chunk_inner_parallel_loop_task_split_hoists_iters_to_orchestration(self):
+        @pl.program
+        class Before:
+            @pl.function(type=pl.FunctionType.InCore)
+            def q_proj_chunk_group(
+                self,
+                x: pl.Tensor[[16, 512], pl.FP32],
+                group_base: pl.Scalar[pl.INDEX],
+                out: pl.Out[pl.Tensor[[16, 512], pl.FP32]],
+            ) -> pl.Tensor[[16, 512], pl.FP32]:
+                for ob_ci, (out_iter,) in pl.parallel(
+                    4, init_values=(out,), attrs={"loop_origin": pl.LoopOrigin.ChunkInner}
+                ):
+                    q0: pl.Scalar[pl.INDEX] = group_base + ob_ci * 64
+                    tile: pl.Tile[[16, 64], pl.FP32] = pl.load(x, [0, q0], [16, 64])
+                    out_next: pl.Tensor[[16, 512], pl.FP32] = pl.store(tile, [0, q0], out_iter)
+                    q_rv = pl.yield_(out_next)
+                return q_rv
+
+            @pl.function(type=pl.FunctionType.Orchestration)
+            def main(
+                self,
+                x: pl.Tensor[[16, 512], pl.FP32],
+                out: pl.Out[pl.Tensor[[16, 512], pl.FP32]],
+            ) -> pl.Tensor[[16, 512], pl.FP32]:
+                group_base: pl.Scalar[pl.INDEX] = 128
+                out_next: pl.Tensor[[16, 512], pl.FP32] = self.q_proj_chunk_group(x, group_base, out)
+                return out_next
+
+        with passes.PassContext([], enable_out_window_task_split=True):
+            After = passes.optimize_orch_tensors()(Before)
+
+        kernel_orig = After.get_function("q_proj_chunk_group")
+        kernel_iter = After.get_function("q_proj_chunk_group__iter_windowed")
+        main = After.get_function("main")
+
+        assert kernel_orig is not None
+        assert kernel_iter is not None
+        assert main is not None
+
+        printed_iter = ir.python_print(kernel_iter)
+        assert "pl.parallel" not in printed_iter
+        assert "pl.Tensor[[16, 64], pl.FP32" in printed_iter
+        assert "pl.tile.store(tile, [0, 0], out)" in printed_iter
+
+        printed_main = ir.python_print(main)
+        assert "for ob_ci, (out_iter,) in pl.parallel(" in printed_main
+        assert "init_values=(out,)" in printed_main
+        assert "pl.tensor.slice(out_iter, [16, 64], [0, group_base + ob_ci * 64])" in printed_main
+        assert "q_proj_chunk_group__iter_windowed(" in printed_main
+        assert "group_base" in printed_main
+        assert "ob_ci" in printed_main
+        assert "out_iter__window" in printed_main
+        assert "pl.tensor.assemble(out_iter, out_next__iter_windowed, [0, group_base + ob_ci * 64])" in printed_main
+
+    def test_chunk_inner_range_loop_task_split_hoists_iters_to_orchestration(self):
+        @pl.program
+        class Before:
+            @pl.function(type=pl.FunctionType.InCore)
+            def q_proj_chunk_group(
+                self,
+                x: pl.Tensor[[16, 512], pl.FP32],
+                group_base: pl.Scalar[pl.INDEX],
+                out: pl.Out[pl.Tensor[[16, 512], pl.FP32]],
+            ) -> pl.Tensor[[16, 512], pl.FP32]:
+                for ob_ci, (out_iter,) in pl.range(
+                    0, 4, 1, init_values=(out,), attrs={"loop_origin": pl.LoopOrigin.ChunkInner}
+                ):
+                    q0: pl.Scalar[pl.INDEX] = group_base + ob_ci * 64
+                    tile: pl.Tile[[16, 64], pl.FP32] = pl.load(x, [0, q0], [16, 64])
+                    out_next: pl.Tensor[[16, 512], pl.FP32] = pl.store(tile, [0, q0], out_iter)
+                    q_rv = pl.yield_(out_next)
+                return q_rv
+
+            @pl.function(type=pl.FunctionType.Orchestration)
+            def main(
+                self,
+                x: pl.Tensor[[16, 512], pl.FP32],
+                out: pl.Out[pl.Tensor[[16, 512], pl.FP32]],
+            ) -> pl.Tensor[[16, 512], pl.FP32]:
+                group_base: pl.Scalar[pl.INDEX] = 128
+                out_next: pl.Tensor[[16, 512], pl.FP32] = self.q_proj_chunk_group(x, group_base, out)
+                return out_next
+
+        with passes.PassContext([], enable_out_window_task_split=True):
+            After = passes.optimize_orch_tensors()(Before)
+
+        kernel_iter = After.get_function("q_proj_chunk_group__iter_windowed")
+        main = After.get_function("main")
+
+        assert kernel_iter is not None
+        assert main is not None
+
+        printed_iter = ir.python_print(kernel_iter)
+        assert "pl.range" not in printed_iter
+        assert "pl.parallel" not in printed_iter
+        assert "pl.tile.store(tile, [0, 0], out)" in printed_iter
+
+        printed_main = ir.python_print(main)
+        assert "for ob_ci, (out_iter,) in pl.range(" in printed_main
+        assert "pl.tensor.slice(out_iter, [16, 64], [0, group_base + ob_ci * 64])" in printed_main
+        assert "q_proj_chunk_group__iter_windowed(" in printed_main
+        assert "pl.tensor.assemble(out_iter, out_next__iter_windowed, [0, group_base + ob_ci * 64])" in printed_main
+
     def test_chunk_inner_parallel_loop_respects_out_window_switch(self):
         @pl.program
         class Before:
@@ -1135,6 +1239,41 @@ class TestOutWindowExternalizer:
         with passes.PassContext([], enable_out_window_rewrite=False):
             After = passes.optimize_orch_tensors()(Before)
         ir.assert_structural_equal(After, Before)
+
+    def test_chunk_inner_parallel_loop_task_split_respects_switch(self):
+        @pl.program
+        class Before:
+            @pl.function(type=pl.FunctionType.InCore)
+            def q_proj_chunk_group(
+                self,
+                x: pl.Tensor[[16, 512], pl.FP32],
+                group_base: pl.Scalar[pl.INDEX],
+                out: pl.Out[pl.Tensor[[16, 512], pl.FP32]],
+            ) -> pl.Tensor[[16, 512], pl.FP32]:
+                for ob_ci, (out_iter,) in pl.parallel(
+                    4, init_values=(out,), attrs={"loop_origin": pl.LoopOrigin.ChunkInner}
+                ):
+                    q0: pl.Scalar[pl.INDEX] = group_base + ob_ci * 64
+                    tile: pl.Tile[[16, 64], pl.FP32] = pl.load(x, [0, q0], [16, 64])
+                    out_next: pl.Tensor[[16, 512], pl.FP32] = pl.store(tile, [0, q0], out_iter)
+                    q_rv = pl.yield_(out_next)
+                return q_rv
+
+            @pl.function(type=pl.FunctionType.Orchestration)
+            def main(
+                self,
+                x: pl.Tensor[[16, 512], pl.FP32],
+                out: pl.Out[pl.Tensor[[16, 512], pl.FP32]],
+            ) -> pl.Tensor[[16, 512], pl.FP32]:
+                group_base: pl.Scalar[pl.INDEX] = 128
+                out_next: pl.Tensor[[16, 512], pl.FP32] = self.q_proj_chunk_group(x, group_base, out)
+                return out_next
+
+        with passes.PassContext([], enable_out_window_task_split=False):
+            After = passes.optimize_orch_tensors()(Before)
+
+        printed_main = ir.python_print(After.get_function("main"))
+        assert "q_proj_chunk_group__iter_windowed" not in printed_main
 
 
 if __name__ == "__main__":

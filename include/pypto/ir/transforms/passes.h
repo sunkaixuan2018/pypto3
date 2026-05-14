@@ -332,7 +332,7 @@ Pass ConvertTensorToTileOps();
 /**
  * @brief Optimize tensor buffer usage in orchestration and InCore functions
  *
- * Five optimization patterns, applied in order:
+ * Six optimization patterns, applied in order:
  * - Pattern 1 (iter-arg reuse): Merges Out params into In params (promoted
  *   to InOut) when the InCore result feeds back as a ForStmt/WhileStmt
  *   iter-arg, eliminating redundant tensor.create per iteration.
@@ -349,6 +349,11 @@ Pass ConvertTensorToTileOps();
  *   kernels into narrowed `__windowed` variants and rewrites direct
  *   orchestration Out call sites through `tensor.slice + cloned call +
  *   tensor.assemble`, enabling finer-grained runtime dependencies.
+ * - Pattern 6 (ChunkInner task split, default-off): When PassContext
+ *   enables `enable_out_window_task_split`, hoists eligible top-level
+ *   ChunkInner `parallel`/`range` iterations into orch-visible per-iter
+ *   runtime task submissions using `__iter_windowed` clones, while keeping
+ *   nested inner reductions inside each cloned kernel.
  *
  * Requirements:
  * - Input IR must have tile ops in InCore functions (run ConvertTensorToTileOps first)

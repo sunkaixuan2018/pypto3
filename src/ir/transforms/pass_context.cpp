@@ -304,12 +304,13 @@ std::string DiagnosticInstrument::GetName() const { return "DiagnosticInstrument
 
 PassContext::PassContext(std::vector<PassInstrumentPtr> instruments, VerificationLevel verification_level,
                          DiagnosticPhase diagnostic_phase, DiagnosticCheckSet disabled_diagnostics,
-                         bool enable_out_window_rewrite)
+                         bool enable_out_window_rewrite, bool enable_out_window_task_split)
     : instruments_(std::move(instruments)),
       verification_level_(verification_level),
       diagnostic_phase_(diagnostic_phase),
       disabled_diagnostics_(disabled_diagnostics),
       enable_out_window_rewrite_(enable_out_window_rewrite),
+      enable_out_window_task_split_(enable_out_window_task_split),
       previous_(nullptr) {}
 
 VerificationLevel PassContext::GetVerificationLevel() const { return verification_level_; }
@@ -319,6 +320,8 @@ DiagnosticPhase PassContext::GetDiagnosticPhase() const { return diagnostic_phas
 const DiagnosticCheckSet& PassContext::GetDisabledDiagnostics() const { return disabled_diagnostics_; }
 
 bool PassContext::GetEnableOutWindowRewrite() const { return enable_out_window_rewrite_; }
+
+bool PassContext::GetEnableOutWindowTaskSplit() const { return enable_out_window_task_split_; }
 
 const std::vector<PassInstrumentPtr>& PassContext::GetInstruments() const { return instruments_; }
 

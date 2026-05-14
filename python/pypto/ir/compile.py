@@ -61,6 +61,7 @@ def compile(  # noqa: PLR0913
     diagnostic_phase: _passes.DiagnosticPhase | None = None,
     disabled_diagnostics: _passes.DiagnosticCheckSet | None = None,
     enable_out_window_rewrite: bool | None = None,
+    enable_out_window_task_split: bool | None = None,
     profiling: bool = False,
     platform: str | None = None,
     distributed_config: Any = None,
@@ -94,6 +95,10 @@ def compile(  # noqa: PLR0913
             rewrites direct full-Out orchestration calls into windowed form.
             None inherits the active PassContext value when present, otherwise
             defaults to True.
+        enable_out_window_task_split: Override whether OptimizeOrchTensors may
+            hoist eligible ChunkInner per-iteration writes into separate
+            orch-visible runtime tasks. None inherits the active PassContext
+            value when present, otherwise defaults to False.
         profiling: If True, enable compile profiling that records per-stage
             wall-clock timings.  Results are written to ``output_dir/report/``.
         platform: Target execution platform.  One of ``"a2a3sim"``,
@@ -143,6 +148,11 @@ def compile(  # noqa: PLR0913
             "compile() was called with enable_out_window_rewrite while a PassContext is already active. "
             "Set the switch on the existing PassContext instead."
         )
+    if enable_out_window_task_split is not None and outer is not None:
+        raise RuntimeError(
+            "compile() was called with enable_out_window_task_split while a PassContext is already active. "
+            "Set the switch on the existing PassContext instead."
+        )
 
     # --- Compile profiling ---------------------------------------------------
     prof = get_active_profiler()
@@ -173,6 +183,11 @@ def compile(  # noqa: PLR0913
             if enable_out_window_rewrite is not None
             else outer.get_enable_out_window_rewrite()
         )
+        out_window_task_split = (
+            enable_out_window_task_split
+            if enable_out_window_task_split is not None
+            else outer.get_enable_out_window_task_split()
+        )
     else:
         vlevel = (
             verification_level if verification_level is not None else _passes.get_default_verification_level()
@@ -180,7 +195,17 @@ def compile(  # noqa: PLR0913
         dphase = diagnostic_phase if diagnostic_phase is not None else _passes.get_default_diagnostic_phase()
         disabled = disabled_diagnostics if disabled_diagnostics is not None else default_disabled
         out_window_rewrite = enable_out_window_rewrite if enable_out_window_rewrite is not None else True
-    ctx = _passes.PassContext(instruments, vlevel, dphase, disabled, out_window_rewrite)
+        out_window_task_split = (
+            enable_out_window_task_split if enable_out_window_task_split is not None else False
+        )
+    ctx = _passes.PassContext(
+        instruments,
+        vlevel,
+        dphase,
+        disabled,
+        out_window_rewrite,
+        out_window_task_split,
+    )
 
     def _stage(name: str) -> AbstractContextManager[Any]:
         if prof is not None:

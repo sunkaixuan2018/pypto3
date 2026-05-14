@@ -879,6 +879,18 @@ class _ChunkInnerOutWindowPTO(PTOTestCase):
         out[:, c0:c1] = x[:, c0:c1]
 
 
+class _ChunkInnerTaskSplitPTO(_ChunkInnerOutWindowPTO):
+    """Runtime correctness case for ChunkInner task-split mode."""
+
+    __test__ = False
+
+    def get_name(self) -> str:
+        return f"chunk_inner_task_split_{_CHUNK_INNER_ROWS}x{_CHUNK_INNER_COLS}"
+
+    def get_enable_out_window_task_split(self) -> bool:
+        return True
+
+
 class TestChunkInnerOutWindowRuntime:
     """Numerical + saved-artifact checks for the ChunkInner rewrite shape."""
 
@@ -911,6 +923,41 @@ class TestChunkInnerOutWindowRuntime:
         assert "__windowed" in code, code
         assert ".view(" in code, code
         assert re.search(r"Tensor\s+\w*window\w*\s*=\s*ext_out\.view\(", code), code
+
+
+class TestChunkInnerTaskSplitRuntime:
+    """Numerical + artifact checks for the real ChunkInner task-split path."""
+
+    @pytest.mark.parametrize("platform", PLATFORMS)
+    def test_correctness(self, test_runner, platform):
+        result = test_runner.run(_ChunkInnerTaskSplitPTO(platform=platform))
+        assert result.passed, f"chunk-inner task-split execution failed: {result.error}"
+
+    @pytest.mark.parametrize("platform", PLATFORMS)
+    def test_saved_artifact_contains_iter_tasks(self, test_runner, test_config, platform):
+        if not test_config.save_kernels:
+            pytest.skip("pass --save-kernels to inspect the rewritten orchestration artifact")
+
+        tc = _ChunkInnerTaskSplitPTO(platform=platform)
+        result = test_runner.run(tc)
+        assert result.passed, f"chunk-inner task-split execution failed: {result.error}"
+
+        test_name = tc.get_name()
+        if test_config.save_kernels_dir:
+            work_dir = Path(test_config.save_kernels_dir) / test_name
+        else:
+            matches = sorted(_BUILD_OUTPUT_DIR.glob(f"{test_name}_*"), key=lambda p: p.stat().st_mtime)
+            assert matches, f"No saved artifact directory found for {test_name}"
+            work_dir = matches[-1]
+
+        orch_path = work_dir / "orchestration" / "main.cpp"
+        assert orch_path.exists(), f"Missing orchestration artifact: {orch_path}"
+        code = orch_path.read_text(encoding="utf-8")
+
+        assert "q_proj_chunk_group__iter_windowed" in code, code
+        assert ".view(" in code, code
+        assert re.search(r"for \(int64_t ob_ci = 0; ob_ci < 4; ob_ci \+= 1\)", code), code
+        assert "{16, 64}" in code, code
 
 
 if __name__ == "__main__":

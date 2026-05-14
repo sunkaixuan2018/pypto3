@@ -256,6 +256,10 @@ class PTOTestCase(ABC):
         """Return whether OptimizeOrchTensors Pattern 5 is enabled for this test."""
         return self.config.enable_out_window_rewrite
 
+    def get_enable_out_window_task_split(self) -> bool:
+        """Return whether OptimizeOrchTensors task-split mode is enabled for this test."""
+        return self.config.enable_out_window_task_split
+
     def get_platform(self) -> str | None:
         """Return the target platform string ("a2a3"/"a5"/"a2a3sim"/"a5sim").
 

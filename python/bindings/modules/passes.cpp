@@ -247,11 +247,13 @@ void BindPass(nb::module_& m) {
                           "before/after each pass execution. Also controls automatic\n"
                           "verification and the diagnostic channel (warnings + performance\n"
                           "hints) for PassPipeline.")
-      .def(nb::init<std::vector<PassInstrumentPtr>, VerificationLevel, DiagnosticPhase, DiagnosticCheckSet, bool>(),
+      .def(nb::init<std::vector<PassInstrumentPtr>, VerificationLevel, DiagnosticPhase, DiagnosticCheckSet, bool,
+                    bool>(),
            nb::arg("instruments"), nb::arg("verification_level") = VerificationLevel::Basic,
            nb::arg("diagnostic_phase") = DiagnosticPhase::PrePipeline,
            nb::arg("disabled_diagnostics") = DiagnosticCheckSet{DiagnosticCheck::UnusedControlFlowResult},
            nb::arg("enable_out_window_rewrite") = true,
+           nb::arg("enable_out_window_task_split") = false,
            "Create a PassContext with instruments, verification level, diagnostic phase gate, "
            "and optional disabled diagnostic checks")
       .def("__enter__",
@@ -268,6 +270,8 @@ void BindPass(nb::module_& m) {
            "Get the diagnostic checks suppressed by this context")
       .def("get_enable_out_window_rewrite", &PassContext::GetEnableOutWindowRewrite,
            "Get whether OptimizeOrchTensors Pattern 5 is enabled in this context")
+      .def("get_enable_out_window_task_split", &PassContext::GetEnableOutWindowTaskSplit,
+           "Get whether OptimizeOrchTensors task-split mode is enabled in this context")
       .def("get_instruments", &PassContext::GetInstruments, "Get the instruments registered on this context")
       .def_static("current", &PassContext::Current, nb::rv_policy::reference,
                   "Get the currently active context, or None if no context is active");

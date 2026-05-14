@@ -258,6 +258,7 @@ class PassContext:
         diagnostic_phase: DiagnosticPhase = DiagnosticPhase.PRE_PIPELINE,
         disabled_diagnostics: DiagnosticCheckSet = ...,  # default: {UnusedControlFlowResult}
         enable_out_window_rewrite: bool = True,
+        enable_out_window_task_split: bool = False,
     ) -> None:
         """Create a PassContext with instruments, verification level, phase, and disabled diagnostics."""
         ...
@@ -283,6 +284,10 @@ class PassContext:
 
     def get_enable_out_window_rewrite(self) -> bool:
         """Get whether OptimizeOrchTensors Pattern 5 is enabled in this context."""
+        ...
+
+    def get_enable_out_window_task_split(self) -> bool:
+        """Get whether OptimizeOrchTensors task-split mode is enabled in this context."""
         ...
 
     def get_instruments(self) -> list[PassInstrument]:

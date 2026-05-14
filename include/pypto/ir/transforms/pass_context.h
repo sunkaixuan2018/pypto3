@@ -251,7 +251,8 @@ class PassContext {
                        VerificationLevel verification_level = VerificationLevel::Basic,
                        DiagnosticPhase diagnostic_phase = DiagnosticPhase::PrePipeline,
                        DiagnosticCheckSet disabled_diagnostics = {DiagnosticCheck::UnusedControlFlowResult},
-                       bool enable_out_window_rewrite = true);
+                       bool enable_out_window_rewrite = true,
+                       bool enable_out_window_task_split = false);
 
   /**
    * @brief Push this context onto the thread-local stack
@@ -301,6 +302,8 @@ class PassContext {
 
   [[nodiscard]] bool GetEnableOutWindowRewrite() const;
 
+  [[nodiscard]] bool GetEnableOutWindowTaskSplit() const;
+
   /**
    * @brief Get the instruments registered on this context
    */
@@ -331,6 +334,7 @@ class PassContext {
   DiagnosticPhase diagnostic_phase_;
   DiagnosticCheckSet disabled_diagnostics_;
   bool enable_out_window_rewrite_;
+  bool enable_out_window_task_split_;
   PassContext* previous_;
 
   static thread_local PassContext* current_;

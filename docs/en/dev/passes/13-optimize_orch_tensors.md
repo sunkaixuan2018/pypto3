@@ -4,7 +4,7 @@ Optimizes tensor buffer usage across orchestration and InCore functions by elimi
 
 ## Overview
 
-After `ConvertTensorToTileOps`, orchestration functions may still carry redundant output buffers, lose parent-stride information, or submit kernels against full parent tensors when only a window is actually written. This pass applies five optimization patterns to reduce allocations and improve buffer/layout information.
+After `ConvertTensorToTileOps`, orchestration functions may still carry redundant output buffers, lose parent-stride information, or submit kernels against full parent tensors when only a window is actually written. This pass applies six optimization patterns to reduce allocations, improve buffer/layout information, and optionally expose finer-grained ChunkInner runtime tasks.
 
 **Requirements**:
 
@@ -18,6 +18,13 @@ After `ConvertTensorToTileOps`, orchestration functions may still carry redundan
 | --- | ------ | ----- |
 | `pass::OptimizeOrchTensors()` | `passes.optimize_orch_tensors()` | Program-level |
 
+## Related Docs
+
+- Design: [`13b-optimize_orch_tensors_chunk_inner_window_design.md`](13b-optimize_orch_tensors_chunk_inner_window_design.md)
+- Task-split design: [`13c-optimize_orch_tensors_chunk_inner_task_split_design.md`](13c-optimize_orch_tensors_chunk_inner_task_split_design.md)
+- Change summary: [`13d-optimize_orch_tensors_chunk_inner_task_split_change_summary.md`](13d-optimize_orch_tensors_chunk_inner_task_split_change_summary.md)
+- Implementation plan: [`13a-optimize_orch_tensors_chunk_inner_window_plan.md`](13a-optimize_orch_tensors_chunk_inner_window_plan.md)
+
 **Python usage**:
 
 ```python
@@ -29,7 +36,7 @@ program_opt = opt_pass(program)
 
 ## Patterns
 
-The pass applies five patterns in sequence. Each pattern sees the results of the previous one.
+The pass applies six patterns in sequence. Each pattern sees the results of the previous one.
 
 ### Pattern 1: Iter-Arg Reuse (IterArgReuseOptimizer)
 
@@ -92,6 +99,32 @@ For the first-stage `ChunkInner` loop case, the pass intentionally stays narrow:
 - window shape and base offsets must be derivable from the loop trip range plus the store tile shape
 
 The rewrite still preserves orchestration-side `tensor.assemble(...)` so the full parent tensor SSA value and downstream dependencies remain explicit.
+
+### Pattern 6: ChunkInner Task Split (OutWindowExternalizer, optional)
+
+**Problem**: Pattern 5 makes the written window visible at the orchestration boundary, but it still submits one cloned kernel task for the whole top-level `ChunkInner` loop body. Runtime still sees one task, not one task per eligible outer iteration.
+
+**Solution**: When `PassContext(enable_out_window_task_split=True)` is enabled, the same narrow q_proj-like `ChunkInner` shape may be hoisted one step further:
+
+- the original outlined InCore kernel is kept
+- a per-iteration `__iter_windowed` clone is created
+- the original top-level `ChunkInner` `parallel`/`range` loop is rewritten into an orchestration-visible loop
+- each orchestration iteration slices one local output window, submits one cloned kernel task, and rebinds the parent SSA via `tensor.assemble(...)`
+
+This changes runtime task granularity:
+
+- default / Pattern 5 only: one runtime task for the whole outlined kernel call
+- Pattern 6 enabled: one runtime task per top-level eligible `ChunkInner` iteration
+
+The first implementation is intentionally narrow:
+
+- exactly one `Out` param
+- top-level loop marked with `loop_origin = ChunkInner`
+- one loop-carried tensor iter-arg initialized from that `Out`
+- one yielded `tile.store(..., offsets, iter_arg)`
+- nested inner reductions such as `kb` remain inside the per-iteration kernel
+
+This mode is default-off and independent from `enable_out_window_rewrite`.
 
 ## Example (Pattern 1)
 
@@ -163,9 +196,10 @@ The `tensor.create` is eliminated; the iter-arg buffer is reused across iteratio
 | --------- | ---- |
 | `IterArgReuseOptimizer` | Pattern 1 — merges Out params into In params for loop-carried buffers |
 | `AssembleParentStridesOptimizer` | Pattern 2 — attaches parent strides via TensorView |
-| `SliceInputStridesOptimizer` | Pattern 4 — attaches parent strides to In params via TensorView for slice patterns |
-| `OutWindowExternalizer` | Pattern 5 — clones full-Out kernels into windowed variants and rewrites direct Out call sites through `slice + cloned call + assemble`, including the first-stage narrow `ChunkInner` loop case |
-| `AssembleLoopRewriter` | Pattern 3 — rewrites tile.assemble loops to tile.store loops |
+| `SliceInputStridesOptimizer` | Pattern 4 – attaches parent strides to In params via TensorView for slice patterns |
+| `OutWindowExternalizer` | Pattern 5 – clones full-Out kernels into windowed variants and rewrites direct Out call sites through `slice + cloned call + assemble`, including the first-stage narrow `ChunkInner` loop case |
+| `OutWindowExternalizer` | Pattern 6 – optionally hoists eligible top-level `ChunkInner` `parallel`/`range` iterations into orch-visible per-iteration runtime tasks via `__iter_windowed` clones |
+| `AssembleLoopRewriter` | Pattern 3 – rewrites tile.assemble loops to tile.store loops |
 | `BuildOutParamReturnMappings` | Shared helper — maps Out params to return indices via tile.store |
 | `ComputeRowMajorStrides` | Shared helper — computes row-major strides from a shape |
 
@@ -174,5 +208,5 @@ The `tensor.create` is eliminated; the iter-arg buffer is reused across iteratio
 | Function type | Action |
 | ------------- | ------ |
 | InCore | Params/body rewritten (Patterns 1, 3, 4) |
-| Orchestration / Opaque | Call sites rewritten (Patterns 1, 2; Pattern 5 applies to orchestration only) |
+| Orchestration / Opaque | Call sites rewritten (Patterns 1, 2; Patterns 5 and 6 apply to orchestration only) |
 | Group | Unchanged |
