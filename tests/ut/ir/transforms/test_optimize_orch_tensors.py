@@ -1355,7 +1355,8 @@ class TestOutWindowExternalizer:
         assert "pl.Tensor[[16, 256], pl.FP32" in printed_windowed
         assert "matmul_acc" in printed_windowed
         assert "pl.tile.store(q_acc" in printed_windowed
-        assert "[0, q0]" in printed_windowed
+        assert "q0__ssa_v0" in printed_windowed
+        assert "q_proj__co_l1_iter_v1" in printed_windowed
 
     def test_original_q_proj_chunked_loop_optimizer_shape_task_split_is_opt_in(self):
         @pl.program
