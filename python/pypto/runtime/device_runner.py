@@ -541,6 +541,7 @@ def execute_on_device(
 
     enable_profiling = bool(output_prefix)
 
+    from .runner import RunConfig  # noqa: PLC0415
     from .worker import Worker as _PyptoWorker  # noqa: PLC0415
 
     cfg = CallConfig()
@@ -556,9 +557,14 @@ def execute_on_device(
         if active is not None:
             active._run_chip(chip_callable, orch_args, cfg)
             return
-        worker = Worker(level=level, device_id=device_id, platform=platform, runtime=runtime_name)
+        worker = _PyptoWorker(
+            config=RunConfig(platform=platform, device_id=device_id),
+            level=level,
+            runtime=runtime_name,
+            auto_init=False,
+        )
         worker.init()
-        worker.run(chip_callable, orch_args, cfg)
+        worker._run_chip(chip_callable, orch_args, cfg)
         worker.close()
 
 

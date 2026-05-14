@@ -120,6 +120,7 @@ class Worker:
             runtime=runtime,
         )
         self._initialized = False
+        self._chip_callable_cids: dict[int, int] = {}
 
         if auto_init is None:
             auto_init = level == 2
@@ -141,8 +142,11 @@ class Worker:
         """Release device state. Idempotent. The Worker may be re-``init()``'d."""
         if not self._initialized:
             return
-        self._impl.close()
-        self._initialized = False
+        try:
+            self._impl.close()
+        finally:
+            self._initialized = False
+            self._chip_callable_cids.clear()
 
     # ------------------------------------------------------------------
     # Device memory primitives (forwarded to the underlying chip worker)
@@ -322,10 +326,28 @@ class Worker:
     # Internal hook for the runner reuse path
     # ------------------------------------------------------------------
 
+    def _register_chip_callable(self, chip_callable: Any) -> int:
+        key = id(chip_callable)
+        cached = self._chip_callable_cids.get(key)
+        if cached is not None:
+            return cached
+
+        register = getattr(self._impl, "register", None)
+        if register is None:
+            raise RuntimeError(
+                "Underlying simpler.Worker does not support callable registration. "
+                "Update the runtime submodule/runtime package to a cid-based Worker ABI."
+            )
+
+        cid = int(register(chip_callable))
+        self._chip_callable_cids[key] = cid
+        return cid
+
     def _run_chip(self, chip_callable: Any, orch_args: Any, cfg: Any) -> None:
         if not self._initialized:
             raise RuntimeError("Worker is not initialized; call init() or use `with worker:`")
-        self._impl.run(chip_callable, orch_args, cfg)
+        callable_id = chip_callable if isinstance(chip_callable, int) else self._register_chip_callable(chip_callable)
+        self._impl.run(callable_id, orch_args, cfg)
 
     # ------------------------------------------------------------------
     # Context manager — publishes ``self`` on the active stack

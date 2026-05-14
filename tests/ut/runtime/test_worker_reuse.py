@@ -14,7 +14,7 @@ run without a device. The reuse path is observed by counting ``init`` /
 ``run`` / ``close`` calls on the mock.
 """
 
-from unittest.mock import MagicMock, patch
+from unittest.mock import ANY, MagicMock, patch
 
 import pytest
 from pypto.runtime import RunConfig, Worker
@@ -213,6 +213,53 @@ class TestExecuteOnDeviceReuse:
                 device_id=0,
                 level=3,
             )
+
+    def test_reuse_registers_chip_callable_before_run(self, fake_simpler_worker):
+        from pypto.runtime.device_runner import execute_on_device  # noqa: PLC0415
+
+        chip_callable = MagicMock(name="chip_callable")
+        orch_args = MagicMock(name="orch_args")
+        fake_simpler_worker.register.return_value = 7
+
+        with Worker(config=RunConfig(platform="a2a3sim")):
+            fake_simpler_worker.init.reset_mock()
+            fake_simpler_worker.close.reset_mock()
+            fake_simpler_worker.run.reset_mock()
+            fake_simpler_worker.register.reset_mock()
+
+            with patch("pypto.runtime.device_runner.CallConfig", MagicMock):
+                execute_on_device(
+                    chip_callable,
+                    orch_args,
+                    platform="a2a3sim",
+                    runtime_name="host_build_graph",
+                    device_id=0,
+                )
+
+            fake_simpler_worker.register.assert_called_once_with(chip_callable)
+            fake_simpler_worker.run.assert_called_once_with(7, orch_args, ANY)
+            assert fake_simpler_worker.init.call_count == 0
+            assert fake_simpler_worker.close.call_count == 0
+
+    def test_one_shot_registers_chip_callable_before_run(self, fake_simpler_worker):
+        from pypto.runtime.device_runner import execute_on_device  # noqa: PLC0415
+
+        chip_callable = MagicMock(name="chip_callable")
+        orch_args = MagicMock(name="orch_args")
+        fake_simpler_worker.register.return_value = 11
+        with patch("pypto.runtime.device_runner.CallConfig", MagicMock):
+            execute_on_device(
+                chip_callable,
+                orch_args,
+                platform="a2a3sim",
+                runtime_name="host_build_graph",
+                device_id=0,
+            )
+
+        fake_simpler_worker.init.assert_called_once()
+        fake_simpler_worker.register.assert_called_once_with(chip_callable)
+        fake_simpler_worker.run.assert_called_once_with(11, orch_args, ANY)
+        fake_simpler_worker.close.assert_called_once()
 
 
 if __name__ == "__main__":
