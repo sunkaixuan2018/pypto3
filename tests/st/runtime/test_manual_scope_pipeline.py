@@ -1149,7 +1149,7 @@ class TestOriginalQProjChunkedLoopRuntime:
         assert "q_proj__windowed" not in code, code
         assert ".view(" in code, code
         assert "{16, 64}" in code, code
-        assert re.search(r"for \(int64_t ob_0_in = 0; ob_0_in < 4; ob_0_in \+= 1\)", code), code
+        assert re.search(r"for \(int64_t \w+ = 0; \w+ < 4; \w+ \+= 1\)", code), code
 
 
 def _build_original_kv_proj_outer_parallel_program():

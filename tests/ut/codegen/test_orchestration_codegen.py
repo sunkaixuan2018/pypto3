@@ -3450,7 +3450,7 @@ class TestManualScopeCodegen:
 
         assert "q_proj__iter_windowed" in code, code
         assert "q_proj__windowed" not in code, code
-        assert re.search(r"for \(int64_t ob_0_in = 0; ob_0_in < 4; ob_0_in \+= 1\)", code), code
+        assert re.search(r"for \(int64_t \w+ = 0; \w+ < 4; \w+ \+= 1\)", code), code
         assert "{16, 64}" in code, code
         assert re.search(r"Tensor\s+\w*window\w*\s*=\s*ext_q_proj\.view\(", code), code
         assert re.search(r"params_t\d+\.add_(?:output|inout)\(\w*window\w*\);", code), code

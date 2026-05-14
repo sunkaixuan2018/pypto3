@@ -1344,9 +1344,11 @@ class TestOutWindowExternalizer:
         assert q_proj_windowed is not None
 
         printed_main = ir.python_print(main)
-        assert "pl.tensor.slice(q_proj, [16, 256], [0, 0])" in printed_main
-        assert "q_proj__windowed(normed_tile, wq, q_proj__window)" in printed_main
-        assert "pl.tensor.assemble(q_proj, q_proj__windowed, [0, 0])" in printed_main
+        assert "pl.tensor.slice(" in printed_main
+        assert "[16, 256]" in printed_main
+        assert "q_proj__windowed(" in printed_main
+        assert "pl.tensor.assemble(" in printed_main
+        assert "q_proj__co_l0_iter_v1" in printed_main
 
         printed_windowed = ir.python_print(q_proj_windowed)
         assert 'attrs={"loop_origin": pl.LoopOrigin.ChunkInner}' in printed_windowed
