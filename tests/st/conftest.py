@@ -15,6 +15,7 @@ harness package (migrated from pto-testing-framework).
 """
 
 import inspect
+import logging
 import queue
 import random
 import re
@@ -35,6 +36,9 @@ if str(_ST_DIR) not in sys.path:
 _PROJECT_ROOT = _ST_DIR.parent.parent
 if str(_PROJECT_ROOT) not in sys.path:
     sys.path.insert(0, str(_PROJECT_ROOT))
+_SIMPLER_ROOT = _PROJECT_ROOT / "runtime"
+if str(_SIMPLER_ROOT) not in sys.path:
+    sys.path.insert(0, str(_SIMPLER_ROOT))
 
 import pytest  # noqa: E402
 from harness.core.environment import (  # noqa: E402
@@ -42,13 +46,18 @@ from harness.core.environment import (  # noqa: E402
     get_simpler_scripts_path,
 )
 from harness.core.harness import ALL_PLATFORM_IDS, PTOTestCase  # noqa: E402
+from harness.core.log_level_config import (  # noqa: E402
+    ST_LOG_LEVEL_CHOICES,
+    pypto_log_level_for,
+    simpler_logger_level_for,
+)
 from harness.core.test_runner import (  # noqa: E402
     TestRunner,
     _cache_key,
     shutdown_pipeline,
     start_pipeline,
 )
-from pypto import LogLevel, set_log_level  # noqa: E402
+from pypto import set_log_level  # noqa: E402
 from pypto.runtime.runner import RunConfig  # noqa: E402
 
 # Temp directories created for pre-compilation (when --save-kernels is not set).
@@ -158,7 +167,7 @@ def pytest_addoption(parser):
         "--pypto-log-level",
         action="store",
         default="ERROR",
-        choices=["DEBUG", "INFO", "WARN", "ERROR", "FATAL", "EVENT", "NONE"],
+        choices=ST_LOG_LEVEL_CHOICES,
         help="PyPTO C++ log level threshold (default: ERROR)",
     )
     parser.addoption(
@@ -383,7 +392,8 @@ def pytest_configure(config):
     # Forked child processes inherit this setting via os.fork().
     try:
         level_name: str = config.getoption("--pypto-log-level")
-        set_log_level(LogLevel[level_name])
+        set_log_level(pypto_log_level_for(level_name))
+        logging.getLogger("simpler").setLevel(simpler_logger_level_for(level_name))
     except (ValueError, KeyError):
         pass  # option not yet registered (e.g. during --co --help)
 
