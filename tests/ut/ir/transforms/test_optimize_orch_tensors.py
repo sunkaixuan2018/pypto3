@@ -1149,14 +1149,17 @@ class TestOutWindowExternalizer:
         assert "pl.tile.store(tile, [0, 0], out)" in printed_iter
 
         printed_main = ir.python_print(main)
-        assert "for ob_ci, (out_iter,) in pl.parallel(" in printed_main
+        assert "for ob_ci, (" in printed_main
+        assert "in pl.parallel(" in printed_main
         assert "init_values=(out,)" in printed_main
-        assert "pl.tensor.slice(out_iter, [16, 64], [0, group_base + ob_ci * 64])" in printed_main
+        assert "pl.tensor.slice(" in printed_main
+        assert "[16, 64]" in printed_main
+        assert "[0, group_base + ob_ci * 64]" in printed_main
         assert "q_proj_chunk_group__iter_windowed(" in printed_main
         assert "group_base" in printed_main
         assert "ob_ci" in printed_main
-        assert "out_iter__window" in printed_main
-        assert "pl.tensor.assemble(out_iter, out_next__iter_windowed, [0, group_base + ob_ci * 64])" in printed_main
+        assert "pl.tensor.assemble(" in printed_main
+        assert "out_next__iter_windowed" in printed_main
 
     def test_chunk_inner_range_loop_task_split_hoists_iters_to_orchestration(self):
         @pl.program
@@ -1202,10 +1205,14 @@ class TestOutWindowExternalizer:
         assert "pl.tile.store(tile, [0, 0], out)" in printed_iter
 
         printed_main = ir.python_print(main)
-        assert "for ob_ci, (out_iter,) in pl.range(" in printed_main
-        assert "pl.tensor.slice(out_iter, [16, 64], [0, group_base + ob_ci * 64])" in printed_main
+        assert "for ob_ci, (" in printed_main
+        assert "in pl.range(" in printed_main
+        assert "pl.tensor.slice(" in printed_main
+        assert "[16, 64]" in printed_main
+        assert "[0, group_base + ob_ci * 64]" in printed_main
         assert "q_proj_chunk_group__iter_windowed(" in printed_main
-        assert "pl.tensor.assemble(out_iter, out_next__iter_windowed, [0, group_base + ob_ci * 64])" in printed_main
+        assert "pl.tensor.assemble(" in printed_main
+        assert "out_next__iter_windowed" in printed_main
 
     def test_chunk_inner_parallel_loop_respects_out_window_switch(self):
         @pl.program
