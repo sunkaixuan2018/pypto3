@@ -800,6 +800,20 @@ _CHUNK_INNER_GROUP_BASE = 128
 _CHUNK_INNER_WINDOW_COLS = 256
 _CHUNK_INNER_CHUNK = 64
 _CHUNK_INNER_INNER_ITERS = _CHUNK_INNER_WINDOW_COLS // _CHUNK_INNER_CHUNK
+_ORIGINAL_Q_PROJ_ROWS = 16
+_ORIGINAL_Q_PROJ_HIDDEN = 512
+_ORIGINAL_Q_PROJ_OUT = 256
+_ORIGINAL_Q_PROJ_K_CHUNK = 128
+_ORIGINAL_Q_PROJ_Q_CHUNK = 64
+_ORIGINAL_Q_PROJ_K_BLOCKS = _ORIGINAL_Q_PROJ_HIDDEN // _ORIGINAL_Q_PROJ_K_CHUNK
+_ORIGINAL_Q_PROJ_Q_BLOCKS = _ORIGINAL_Q_PROJ_OUT // _ORIGINAL_Q_PROJ_Q_CHUNK
+_ORIGINAL_KV_PROJ_ROWS = 16
+_ORIGINAL_KV_PROJ_HIDDEN = 512
+_ORIGINAL_KV_PROJ_OUT = 512
+_ORIGINAL_KV_PROJ_K_CHUNK = 128
+_ORIGINAL_KV_PROJ_OUT_CHUNK = 64
+_ORIGINAL_KV_PROJ_K_BLOCKS = _ORIGINAL_KV_PROJ_HIDDEN // _ORIGINAL_KV_PROJ_K_CHUNK
+_ORIGINAL_KV_PROJ_OUT_BLOCKS = _ORIGINAL_KV_PROJ_OUT // _ORIGINAL_KV_PROJ_OUT_CHUNK
 
 
 def _build_chunk_inner_out_window_program():
@@ -958,6 +972,380 @@ class TestChunkInnerTaskSplitRuntime:
         assert ".view(" in code, code
         assert re.search(r"for \(int64_t ob_ci = 0; ob_ci < 4; ob_ci \+= 1\)", code), code
         assert "{16, 64}" in code, code
+
+
+def _build_original_q_proj_chunked_loop_program():
+    """Original q_proj-like pl.at/chunked_loop_optimizer Scenario B shape."""
+    ROWS = _ORIGINAL_Q_PROJ_ROWS
+    HIDDEN = _ORIGINAL_Q_PROJ_HIDDEN
+    OUT = _ORIGINAL_Q_PROJ_OUT
+    K_CHUNK = _ORIGINAL_Q_PROJ_K_CHUNK
+    Q_CHUNK = _ORIGINAL_Q_PROJ_Q_CHUNK
+    K_BLOCKS = _ORIGINAL_Q_PROJ_K_BLOCKS
+    Q_BLOCKS = _ORIGINAL_Q_PROJ_Q_BLOCKS
+
+    @pl.program
+    class OriginalQProjChunkedLoopProgram:
+        @pl.function(type=pl.FunctionType.Orchestration)
+        def main(
+            self,
+            normed_tile: pl.Tensor[[ROWS, HIDDEN], pl.BF16],
+            wq: pl.Tensor[[HIDDEN, OUT], pl.BF16],
+            q_proj: pl.Out[pl.Tensor[[ROWS, OUT], pl.FP32]],
+        ) -> pl.Tensor[[ROWS, OUT], pl.FP32]:
+            b0: pl.Scalar[pl.INDEX] = 0
+            layer_hidden_base: pl.Scalar[pl.INDEX] = 0
+            with pl.at(
+                level=pl.Level.CORE_GROUP,
+                optimization=pl.chunked_loop_optimizer,
+                name_hint="q_proj",
+            ):
+                for ob in pl.parallel(0, Q_BLOCKS, 1, chunk=4, chunk_policy="leading_full"):
+                    q0: pl.Scalar[pl.INDEX] = ob * Q_CHUNK
+                    tile_a: pl.Tensor[[ROWS, K_CHUNK], pl.BF16] = pl.slice(
+                        normed_tile, [ROWS, K_CHUNK], [0, 0]
+                    )
+                    tile_b: pl.Tensor[[K_CHUNK, Q_CHUNK], pl.BF16] = pl.slice(
+                        wq, [K_CHUNK, Q_CHUNK], [layer_hidden_base, q0]
+                    )
+                    q_acc: pl.Tensor[[ROWS, Q_CHUNK], pl.FP32] = pl.matmul(tile_a, tile_b, out_dtype=pl.FP32)
+                    for kb in pl.range(1, K_BLOCKS):
+                        k0: pl.Scalar[pl.INDEX] = kb * K_CHUNK
+                        tile_a_i: pl.Tensor[[ROWS, K_CHUNK], pl.BF16] = pl.slice(
+                            normed_tile, [ROWS, K_CHUNK], [0, k0]
+                        )
+                        tile_b_i: pl.Tensor[[K_CHUNK, Q_CHUNK], pl.BF16] = pl.slice(
+                            wq, [K_CHUNK, Q_CHUNK], [layer_hidden_base + k0, q0]
+                        )
+                        q_acc = pl.matmul_acc(q_acc, tile_a_i, tile_b_i)
+                    q_proj = pl.assemble(q_proj, q_acc, [b0, q0])
+            return q_proj
+
+    return OriginalQProjChunkedLoopProgram
+
+
+class _OriginalQProjChunkedLoopPTO(PTOTestCase):
+    """Runtime correctness case for the original q_proj-like Scenario B DSL."""
+
+    __test__ = False
+
+    def __init__(self, *, platform: str | None = None, config=None):
+        super().__init__(config, platform=platform)
+
+    def get_name(self) -> str:
+        return f"original_q_proj_chunked_loop_{_ORIGINAL_Q_PROJ_ROWS}x{_ORIGINAL_Q_PROJ_OUT}"
+
+    def get_strategy(self) -> OptimizationStrategy:
+        return OptimizationStrategy.Default
+
+    def define_tensors(self) -> list[TensorSpec]:
+        return [
+            TensorSpec(
+                "normed_tile",
+                [_ORIGINAL_Q_PROJ_ROWS, _ORIGINAL_Q_PROJ_HIDDEN],
+                DataType.BF16,
+                init_value=torch.randn,
+            ),
+            TensorSpec(
+                "wq",
+                [_ORIGINAL_Q_PROJ_HIDDEN, _ORIGINAL_Q_PROJ_OUT],
+                DataType.BF16,
+                init_value=torch.randn,
+            ),
+            TensorSpec(
+                "q_proj",
+                [_ORIGINAL_Q_PROJ_ROWS, _ORIGINAL_Q_PROJ_OUT],
+                DataType.FP32,
+                init_value=0.0,
+                is_output=True,
+            ),
+        ]
+
+    def get_program(self) -> Any:
+        return _build_original_q_proj_chunked_loop_program()
+
+    def compute_expected(self, tensors, params=None):
+        normed = tensors["normed_tile"].to(torch.float32)
+        wq = tensors["wq"].to(torch.float32)
+        tensors["q_proj"][:] = torch.matmul(normed, wq)
+
+
+class _OriginalQProjChunkedLoopTaskSplitPTO(_OriginalQProjChunkedLoopPTO):
+    """Runtime correctness case for original q_proj-like Scenario B task split."""
+
+    __test__ = False
+
+    def get_name(self) -> str:
+        return f"original_q_proj_chunked_loop_task_split_{_ORIGINAL_Q_PROJ_ROWS}x{_ORIGINAL_Q_PROJ_OUT}"
+
+    def get_enable_out_window_task_split(self) -> bool:
+        return True
+
+
+class TestOriginalQProjChunkedLoopRuntime:
+    """Numerical + artifact checks for the original q_proj-like Scenario B DSL."""
+
+    @pytest.mark.parametrize("platform", PLATFORMS)
+    def test_correctness(self, test_runner, platform):
+        result = test_runner.run(_OriginalQProjChunkedLoopPTO(platform=platform))
+        assert result.passed, f"original q_proj chunked-loop execution failed: {result.error}"
+
+    @pytest.mark.parametrize("platform", PLATFORMS)
+    def test_task_split_correctness(self, test_runner, platform):
+        result = test_runner.run(_OriginalQProjChunkedLoopTaskSplitPTO(platform=platform))
+        assert result.passed, f"original q_proj chunked-loop task split execution failed: {result.error}"
+
+    @pytest.mark.parametrize("platform", PLATFORMS)
+    def test_saved_artifact_contains_original_q_proj_windowed_orchestration(
+        self, test_runner, test_config, platform
+    ):
+        if not test_config.save_kernels:
+            pytest.skip("pass --save-kernels to inspect the rewritten orchestration artifact")
+
+        tc = _OriginalQProjChunkedLoopPTO(platform=platform)
+        result = test_runner.run(tc)
+        assert result.passed, f"original q_proj chunked-loop execution failed: {result.error}"
+
+        test_name = tc.get_name()
+        if test_config.save_kernels_dir:
+            work_dir = Path(test_config.save_kernels_dir) / test_name
+        else:
+            matches = sorted(_BUILD_OUTPUT_DIR.glob(f"{test_name}_*"), key=lambda p: p.stat().st_mtime)
+            assert matches, f"No saved artifact directory found for {test_name}"
+            work_dir = matches[-1]
+
+        orch_path = work_dir / "orchestration" / "main.cpp"
+        assert orch_path.exists(), f"Missing orchestration artifact: {orch_path}"
+        code = orch_path.read_text(encoding="utf-8")
+
+        assert "q_proj__windowed" in code, code
+        assert ".view(" in code, code
+        assert re.search(r"Tensor\s+\w*window\w*\s*=\s*ext_q_proj\.view\(", code), code
+
+    @pytest.mark.parametrize("platform", PLATFORMS)
+    def test_saved_artifact_contains_original_q_proj_iter_windowed_orchestration(
+        self, test_runner, test_config, platform
+    ):
+        if not test_config.save_kernels:
+            pytest.skip("pass --save-kernels to inspect the rewritten orchestration artifact")
+
+        tc = _OriginalQProjChunkedLoopTaskSplitPTO(platform=platform)
+        result = test_runner.run(tc)
+        assert result.passed, f"original q_proj chunked-loop task split execution failed: {result.error}"
+
+        test_name = tc.get_name()
+        if test_config.save_kernels_dir:
+            work_dir = Path(test_config.save_kernels_dir) / test_name
+        else:
+            matches = sorted(_BUILD_OUTPUT_DIR.glob(f"{test_name}_*"), key=lambda p: p.stat().st_mtime)
+            assert matches, f"No saved artifact directory found for {test_name}"
+            work_dir = matches[-1]
+
+        orch_path = work_dir / "orchestration" / "main.cpp"
+        assert orch_path.exists(), f"Missing orchestration artifact: {orch_path}"
+        code = orch_path.read_text(encoding="utf-8")
+
+        assert "q_proj__iter_windowed" in code, code
+        assert "q_proj__windowed" not in code, code
+        assert ".view(" in code, code
+        assert "{16, 64}" in code, code
+        assert re.search(r"for \(int64_t ob_0_in = 0; ob_0_in < 4; ob_0_in \+= 1\)", code), code
+
+
+def _build_original_kv_proj_outer_parallel_program():
+    """Original kv_proj outer-parallel / inner-at multi-output Scenario B shape."""
+    ROWS = _ORIGINAL_KV_PROJ_ROWS
+    HIDDEN = _ORIGINAL_KV_PROJ_HIDDEN
+    OUT = _ORIGINAL_KV_PROJ_OUT
+    K_CHUNK = _ORIGINAL_KV_PROJ_K_CHUNK
+    OUT_CHUNK = _ORIGINAL_KV_PROJ_OUT_CHUNK
+    K_BLOCKS = _ORIGINAL_KV_PROJ_K_BLOCKS
+    OUT_BLOCKS = _ORIGINAL_KV_PROJ_OUT_BLOCKS
+
+    @pl.program
+    class OriginalKVProjOuterParallelProgram:
+        @pl.function(type=pl.FunctionType.Orchestration)
+        def main(
+            self,
+            normed_tile: pl.Tensor[[ROWS, HIDDEN], pl.BF16],
+            wk: pl.Tensor[[HIDDEN, OUT], pl.BF16],
+            wv: pl.Tensor[[HIDDEN, OUT], pl.BF16],
+            k_proj: pl.Out[pl.Tensor[[ROWS, OUT], pl.FP32]],
+            v_proj: pl.Out[pl.Tensor[[ROWS, OUT], pl.FP32]],
+        ) -> tuple[pl.Tensor[[ROWS, OUT], pl.FP32], pl.Tensor[[ROWS, OUT], pl.FP32]]:
+            b0: pl.Scalar[pl.INDEX] = 0
+            layer_hidden_base: pl.Scalar[pl.INDEX] = 0
+            for ob_chunk in pl.parallel(0, OUT_BLOCKS, 4):
+                with pl.at(level=pl.Level.CORE_GROUP, name_hint="kv_proj"):
+                    for ob in pl.range(ob_chunk, ob_chunk + 4):
+                        kv0: pl.Scalar[pl.INDEX] = ob * OUT_CHUNK
+                        tile_a: pl.Tensor[[ROWS, K_CHUNK], pl.BF16] = pl.slice(
+                            normed_tile, [ROWS, K_CHUNK], [0, 0]
+                        )
+                        tile_wk: pl.Tensor[[K_CHUNK, OUT_CHUNK], pl.BF16] = pl.slice(
+                            wk, [K_CHUNK, OUT_CHUNK], [layer_hidden_base, kv0]
+                        )
+                        k_acc: pl.Tensor[[ROWS, OUT_CHUNK], pl.FP32] = pl.matmul(
+                            tile_a, tile_wk, out_dtype=pl.FP32
+                        )
+                        for kb in pl.range(1, K_BLOCKS):
+                            k0: pl.Scalar[pl.INDEX] = kb * K_CHUNK
+                            tile_a_i: pl.Tensor[[ROWS, K_CHUNK], pl.BF16] = pl.slice(
+                                normed_tile, [ROWS, K_CHUNK], [0, k0]
+                            )
+                            tile_wk_i: pl.Tensor[[K_CHUNK, OUT_CHUNK], pl.BF16] = pl.slice(
+                                wk, [K_CHUNK, OUT_CHUNK], [layer_hidden_base + k0, kv0]
+                            )
+                            k_acc = pl.matmul_acc(k_acc, tile_a_i, tile_wk_i)
+                        k_proj = pl.assemble(k_proj, k_acc, [b0, kv0])
+
+                        tile_a = pl.slice(normed_tile, [ROWS, K_CHUNK], [0, 0])
+                        tile_wv: pl.Tensor[[K_CHUNK, OUT_CHUNK], pl.BF16] = pl.slice(
+                            wv, [K_CHUNK, OUT_CHUNK], [layer_hidden_base, kv0]
+                        )
+                        v_acc: pl.Tensor[[ROWS, OUT_CHUNK], pl.FP32] = pl.matmul(
+                            tile_a, tile_wv, out_dtype=pl.FP32
+                        )
+                        for kb in pl.range(1, K_BLOCKS):
+                            k0 = kb * K_CHUNK
+                            tile_a_i = pl.slice(normed_tile, [ROWS, K_CHUNK], [0, k0])
+                            tile_wv_i: pl.Tensor[[K_CHUNK, OUT_CHUNK], pl.BF16] = pl.slice(
+                                wv, [K_CHUNK, OUT_CHUNK], [layer_hidden_base + k0, kv0]
+                            )
+                            v_acc = pl.matmul_acc(v_acc, tile_a_i, tile_wv_i)
+                        v_proj = pl.assemble(v_proj, v_acc, [b0, kv0])
+            return k_proj, v_proj
+
+    return OriginalKVProjOuterParallelProgram
+
+
+class _OriginalKVProjOuterParallelPTO(PTOTestCase):
+    """Runtime correctness case for the original kv_proj multi-output DSL."""
+
+    __test__ = False
+
+    def __init__(self, *, platform: str | None = None, config=None):
+        super().__init__(config, platform=platform)
+
+    def get_name(self) -> str:
+        return f"original_kv_proj_outer_parallel_{_ORIGINAL_KV_PROJ_ROWS}x{_ORIGINAL_KV_PROJ_OUT}"
+
+    def get_strategy(self) -> OptimizationStrategy:
+        return OptimizationStrategy.Default
+
+    def define_tensors(self) -> list[TensorSpec]:
+        return [
+            TensorSpec(
+                "normed_tile",
+                [_ORIGINAL_KV_PROJ_ROWS, _ORIGINAL_KV_PROJ_HIDDEN],
+                DataType.BF16,
+                init_value=torch.randn,
+            ),
+            TensorSpec(
+                "wk",
+                [_ORIGINAL_KV_PROJ_HIDDEN, _ORIGINAL_KV_PROJ_OUT],
+                DataType.BF16,
+                init_value=torch.randn,
+            ),
+            TensorSpec(
+                "wv",
+                [_ORIGINAL_KV_PROJ_HIDDEN, _ORIGINAL_KV_PROJ_OUT],
+                DataType.BF16,
+                init_value=torch.randn,
+            ),
+            TensorSpec(
+                "k_proj",
+                [_ORIGINAL_KV_PROJ_ROWS, _ORIGINAL_KV_PROJ_OUT],
+                DataType.FP32,
+                init_value=0.0,
+                is_output=True,
+            ),
+            TensorSpec(
+                "v_proj",
+                [_ORIGINAL_KV_PROJ_ROWS, _ORIGINAL_KV_PROJ_OUT],
+                DataType.FP32,
+                init_value=0.0,
+                is_output=True,
+            ),
+        ]
+
+    def get_program(self) -> Any:
+        return _build_original_kv_proj_outer_parallel_program()
+
+    def compute_expected(self, tensors, params=None):
+        normed = tensors["normed_tile"].to(torch.float32)
+        tensors["k_proj"][:] = torch.matmul(normed, tensors["wk"].to(torch.float32))
+        tensors["v_proj"][:] = torch.matmul(normed, tensors["wv"].to(torch.float32))
+
+
+@pytest.fixture(scope="session")
+def original_kv_proj_swimlane_file(test_runner) -> Path:
+    """Run the original kv_proj case with profiling and return the swimlane JSON."""
+    if not test_runner.config.runtime_profiling:
+        pytest.skip("pass --runtime-profiling to validate the original kv_proj swimlane")
+
+    before: set[Path] = set(_BUILD_OUTPUT_DIR.glob("*/swimlane_data/l2_perf_records.json"))
+    result = test_runner.run(_OriginalKVProjOuterParallelPTO())
+    assert result.passed, f"original kv_proj outer-parallel execution failed: {result.error}"
+    after: set[Path] = set(_BUILD_OUTPUT_DIR.glob("*/swimlane_data/l2_perf_records.json"))
+    new_files = after - before
+    assert new_files, "No l2_perf_records.json generated for the original kv_proj run"
+    return max(new_files, key=lambda p: p.stat().st_mtime)
+
+
+@pytest.fixture(scope="session")
+def original_kv_proj_swimlane_data(original_kv_proj_swimlane_file: Path) -> dict:
+    return json.loads(original_kv_proj_swimlane_file.read_text())
+
+
+class TestOriginalKVProjOuterParallelRuntime:
+    """Numerical + swimlane checks for the original kv_proj multi-output DSL."""
+
+    @pytest.mark.parametrize("platform", PLATFORMS)
+    def test_correctness(self, test_runner, platform):
+        result = test_runner.run(_OriginalKVProjOuterParallelPTO(platform=platform))
+        assert result.passed, f"original kv_proj outer-parallel execution failed: {result.error}"
+
+    @pytest.mark.parametrize("platform", PLATFORMS)
+    def test_saved_artifact_contains_original_kv_proj_orchestration(self, test_runner, test_config, platform):
+        if not test_config.save_kernels:
+            pytest.skip("pass --save-kernels to inspect the original kv_proj orchestration artifact")
+
+        tc = _OriginalKVProjOuterParallelPTO(platform=platform)
+        result = test_runner.run(tc)
+        assert result.passed, f"original kv_proj outer-parallel execution failed: {result.error}"
+
+        test_name = tc.get_name()
+        if test_config.save_kernels_dir:
+            work_dir = Path(test_config.save_kernels_dir) / test_name
+        else:
+            matches = sorted(_BUILD_OUTPUT_DIR.glob(f"{test_name}_*"), key=lambda p: p.stat().st_mtime)
+            assert matches, f"No saved artifact directory found for {test_name}"
+            work_dir = matches[-1]
+
+        orch_path = work_dir / "orchestration" / "main.cpp"
+        assert orch_path.exists(), f"Missing orchestration artifact: {orch_path}"
+        code = orch_path.read_text(encoding="utf-8")
+
+        assert "kv_proj" in code, code
+        assert "kv_proj__windowed" not in code, code
+        assert "kv_proj__iter_windowed" not in code, code
+        assert "Tensor ext_k_proj = from_tensor_arg(orch_args.tensor(3));" in code, code
+        assert "Tensor ext_v_proj = from_tensor_arg(orch_args.tensor(4));" in code, code
+
+
+class TestOriginalKVProjOuterParallelSwimlane:
+    """Validate that profiling emits a swimlane for the original kv_proj case."""
+
+    def test_file_generated(self, original_kv_proj_swimlane_file: Path):
+        assert original_kv_proj_swimlane_file.exists(), (
+            f"Swimlane file not found: {original_kv_proj_swimlane_file}"
+        )
+
+    def test_top_level_structure(self, original_kv_proj_swimlane_data: dict):
+        assert "version" in original_kv_proj_swimlane_data
+        assert "tasks" in original_kv_proj_swimlane_data
+        assert len(original_kv_proj_swimlane_data["tasks"]) > 0
 
 
 if __name__ == "__main__":

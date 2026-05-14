@@ -3353,6 +3353,180 @@ class TestManualScopeCodegen:
         assert re.search(r"params_t\d+\.add_(?:output|inout)\(\w*window\w*\);", code), code
         assert "q_proj_chunk_group__windowed" not in code, code
 
+    def test_original_q_proj_chunked_loop_optimizer_shape_codegen(self):
+        """The original q_proj-like DSL should expose the final output window."""
+        backend.reset_for_testing()
+        backend.set_backend_type(BackendType.Ascend910B)
+
+        @pl.program
+        class Prog:
+            @pl.function
+            def main(
+                self,
+                normed_tile: pl.Tensor[[16, 512], pl.BF16],
+                wq: pl.Tensor[[512, 256], pl.BF16],
+                q_proj: pl.Out[pl.Tensor[[16, 256], pl.FP32]],
+            ) -> pl.Tensor[[16, 256], pl.FP32]:
+                b0: pl.Scalar[pl.INDEX] = 0
+                layer_hidden_base: pl.Scalar[pl.INDEX] = 0
+                with pl.at(
+                    level=pl.Level.CORE_GROUP,
+                    optimization=pl.chunked_loop_optimizer,
+                    name_hint="q_proj",
+                ):
+                    for ob in pl.parallel(0, 4, 1, chunk=4, chunk_policy="leading_full"):
+                        q0: pl.Scalar[pl.INDEX] = ob * 64
+                        tile_a: pl.Tensor[[16, 128], pl.BF16] = pl.slice(normed_tile, [16, 128], [0, 0])
+                        tile_b: pl.Tensor[[128, 64], pl.BF16] = pl.slice(
+                            wq, [128, 64], [layer_hidden_base, q0]
+                        )
+                        q_acc: pl.Tensor[[16, 64], pl.FP32] = pl.matmul(tile_a, tile_b, out_dtype=pl.FP32)
+                        for kb in pl.range(1, 4):
+                            k0: pl.Scalar[pl.INDEX] = kb * 128
+                            tile_a_i: pl.Tensor[[16, 128], pl.BF16] = pl.slice(
+                                normed_tile, [16, 128], [0, k0]
+                            )
+                            tile_b_i: pl.Tensor[[128, 64], pl.BF16] = pl.slice(
+                                wq, [128, 64], [layer_hidden_base + k0, q0]
+                            )
+                            q_acc = pl.matmul_acc(q_acc, tile_a_i, tile_b_i)
+                        q_proj = pl.assemble(q_proj, q_acc, [b0, q0])
+                return q_proj
+
+        pm = PassManager.get_strategy(OptimizationStrategy.Default)
+        transformed = pm.run_passes(Prog)
+        code = _generate_orch_code(transformed)
+
+        assert "q_proj__windowed" in code, code
+        assert "{16, 256}" in code, code
+        assert re.search(r"Tensor\s+\w*window\w*\s*=\s*ext_q_proj\.view\(", code), code
+        assert re.search(r"params_t\d+\.add_(?:output|inout)\(\w*window\w*\);", code), code
+        assert re.search(r"params_t\d+\.add_(?:output|inout)\(ext_q_proj\);", code) is None, code
+
+    def test_original_q_proj_chunked_loop_optimizer_shape_task_split_codegen(self):
+        """Task split should hoist original q_proj-like ChunkInner iterations."""
+        backend.reset_for_testing()
+        backend.set_backend_type(BackendType.Ascend910B)
+
+        @pl.program
+        class Prog:
+            @pl.function
+            def main(
+                self,
+                normed_tile: pl.Tensor[[16, 512], pl.BF16],
+                wq: pl.Tensor[[512, 256], pl.BF16],
+                q_proj: pl.Out[pl.Tensor[[16, 256], pl.FP32]],
+            ) -> pl.Tensor[[16, 256], pl.FP32]:
+                b0: pl.Scalar[pl.INDEX] = 0
+                layer_hidden_base: pl.Scalar[pl.INDEX] = 0
+                with pl.at(
+                    level=pl.Level.CORE_GROUP,
+                    optimization=pl.chunked_loop_optimizer,
+                    name_hint="q_proj",
+                ):
+                    for ob in pl.parallel(0, 4, 1, chunk=4, chunk_policy="leading_full"):
+                        q0: pl.Scalar[pl.INDEX] = ob * 64
+                        tile_a: pl.Tensor[[16, 128], pl.BF16] = pl.slice(normed_tile, [16, 128], [0, 0])
+                        tile_b: pl.Tensor[[128, 64], pl.BF16] = pl.slice(
+                            wq, [128, 64], [layer_hidden_base, q0]
+                        )
+                        q_acc: pl.Tensor[[16, 64], pl.FP32] = pl.matmul(tile_a, tile_b, out_dtype=pl.FP32)
+                        for kb in pl.range(1, 4):
+                            k0: pl.Scalar[pl.INDEX] = kb * 128
+                            tile_a_i: pl.Tensor[[16, 128], pl.BF16] = pl.slice(
+                                normed_tile, [16, 128], [0, k0]
+                            )
+                            tile_b_i: pl.Tensor[[128, 64], pl.BF16] = pl.slice(
+                                wq, [128, 64], [layer_hidden_base + k0, q0]
+                            )
+                            q_acc = pl.matmul_acc(q_acc, tile_a_i, tile_b_i)
+                        q_proj = pl.assemble(q_proj, q_acc, [b0, q0])
+                return q_proj
+
+        pm = PassManager.get_strategy(OptimizationStrategy.Default)
+        with passes.PassContext([], enable_out_window_task_split=True):
+            transformed = pm.run_passes(Prog)
+        code = _generate_orch_code(transformed)
+
+        assert "q_proj__iter_windowed" in code, code
+        assert "q_proj__windowed" not in code, code
+        assert re.search(r"for \(int64_t ob_0_in = 0; ob_0_in < 4; ob_0_in \+= 1\)", code), code
+        assert "{16, 64}" in code, code
+        assert re.search(r"Tensor\s+\w*window\w*\s*=\s*ext_q_proj\.view\(", code), code
+        assert re.search(r"params_t\d+\.add_(?:output|inout)\(\w*window\w*\);", code), code
+
+    def test_original_kv_proj_outer_parallel_inner_at_multi_output_codegen(self):
+        """The original kv_proj DSL should codegen as a multi-output baseline task."""
+        backend.reset_for_testing()
+        backend.set_backend_type(BackendType.Ascend910B)
+
+        @pl.program
+        class Prog:
+            @pl.function
+            def main(
+                self,
+                normed_tile: pl.Tensor[[16, 512], pl.BF16],
+                wk: pl.Tensor[[512, 512], pl.BF16],
+                wv: pl.Tensor[[512, 512], pl.BF16],
+                k_proj: pl.Out[pl.Tensor[[16, 512], pl.FP32]],
+                v_proj: pl.Out[pl.Tensor[[16, 512], pl.FP32]],
+            ) -> tuple[pl.Tensor[[16, 512], pl.FP32], pl.Tensor[[16, 512], pl.FP32]]:
+                b0: pl.Scalar[pl.INDEX] = 0
+                layer_hidden_base: pl.Scalar[pl.INDEX] = 0
+                for ob_chunk in pl.parallel(0, 8, 4):
+                    with pl.at(level=pl.Level.CORE_GROUP, name_hint="kv_proj"):
+                        for ob in pl.range(ob_chunk, ob_chunk + 4):
+                            kv0: pl.Scalar[pl.INDEX] = ob * 64
+                            tile_a: pl.Tensor[[16, 128], pl.BF16] = pl.slice(
+                                normed_tile, [16, 128], [0, 0]
+                            )
+                            tile_wk: pl.Tensor[[128, 64], pl.BF16] = pl.slice(
+                                wk, [128, 64], [layer_hidden_base, kv0]
+                            )
+                            k_acc: pl.Tensor[[16, 64], pl.FP32] = pl.matmul(
+                                tile_a, tile_wk, out_dtype=pl.FP32
+                            )
+                            for kb in pl.range(1, 4):
+                                k0: pl.Scalar[pl.INDEX] = kb * 128
+                                tile_a_i: pl.Tensor[[16, 128], pl.BF16] = pl.slice(
+                                    normed_tile, [16, 128], [0, k0]
+                                )
+                                tile_wk_i: pl.Tensor[[128, 64], pl.BF16] = pl.slice(
+                                    wk, [128, 64], [layer_hidden_base + k0, kv0]
+                                )
+                                k_acc = pl.matmul_acc(k_acc, tile_a_i, tile_wk_i)
+                            k_proj = pl.assemble(k_proj, k_acc, [b0, kv0])
+
+                            tile_a = pl.slice(normed_tile, [16, 128], [0, 0])
+                            tile_wv: pl.Tensor[[128, 64], pl.BF16] = pl.slice(
+                                wv, [128, 64], [layer_hidden_base, kv0]
+                            )
+                            v_acc: pl.Tensor[[16, 64], pl.FP32] = pl.matmul(
+                                tile_a, tile_wv, out_dtype=pl.FP32
+                            )
+                            for kb in pl.range(1, 4):
+                                k0 = kb * 128
+                                tile_a_i = pl.slice(normed_tile, [16, 128], [0, k0])
+                                tile_wv_i: pl.Tensor[[128, 64], pl.BF16] = pl.slice(
+                                    wv, [128, 64], [layer_hidden_base + k0, kv0]
+                                )
+                                v_acc = pl.matmul_acc(v_acc, tile_a_i, tile_wv_i)
+                            v_proj = pl.assemble(v_proj, v_acc, [b0, kv0])
+                return k_proj, v_proj
+
+        pm = PassManager.get_strategy(OptimizationStrategy.Default)
+        transformed = pm.run_passes(Prog)
+        code = _generate_orch_code(transformed)
+
+        assert "kv_proj" in code, code
+        assert "kv_proj__windowed" not in code, code
+        assert "kv_proj__iter_windowed" not in code, code
+        assert "Tensor ext_k_proj = from_tensor_arg(orch_args.tensor(3));" in code, code
+        assert "Tensor ext_v_proj = from_tensor_arg(orch_args.tensor(4));" in code, code
+        assert re.search(r"for \(int64_t ob_chunk = 0; ob_chunk < 8; ob_chunk \+= 4\)", code), code
+        assert re.search(r"params_t\d+\.add_(?:output|inout)\(ext_k_proj\);", code), code
+        assert re.search(r"params_t\d+\.add_(?:output|inout)\(ext_v_proj\);", code), code
+
     def test_manual_scope_parallel_dynamic_trip_count_rejected(self):
         """``pl.parallel(<dynamic>)`` carrying a manual_scope dep must error.
 

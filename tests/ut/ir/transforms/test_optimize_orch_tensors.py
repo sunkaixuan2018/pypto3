@@ -16,6 +16,17 @@ and Expected (optimized) programs in @pl.program style.
 import pypto.language as pl
 import pytest
 from pypto import ir, passes
+from pypto.ir.pass_manager import OptimizationStrategy, PassManager
+
+
+def _run_original_q_proj_to_optimize_orch_tensors(program):
+    pm = PassManager.get_strategy(OptimizationStrategy.Default)
+    result = program
+    for pass_name, pass_obj in zip(pm.pass_names, pm.passes):
+        result = pass_obj(result)
+        if pass_name == "OptimizeOrchTensors":
+            return result
+    raise AssertionError("Default pipeline did not run OptimizeOrchTensors")
 
 
 class TestIterArgReuse:
@@ -1281,6 +1292,206 @@ class TestOutWindowExternalizer:
 
         printed_main = ir.python_print(After.get_function("main"))
         assert "q_proj_chunk_group__iter_windowed" not in printed_main
+
+    def test_original_q_proj_chunked_loop_optimizer_shape_rewrites_to_windowed_clone(self):
+        @pl.program
+        class Before:
+            @pl.function
+            def main(
+                self,
+                normed_tile: pl.Tensor[[16, 512], pl.BF16],
+                wq: pl.Tensor[[512, 256], pl.BF16],
+                q_proj: pl.Out[pl.Tensor[[16, 256], pl.FP32]],
+            ) -> pl.Tensor[[16, 256], pl.FP32]:
+                b0: pl.Scalar[pl.INDEX] = 0
+                layer_hidden_base: pl.Scalar[pl.INDEX] = 0
+                with pl.at(
+                    level=pl.Level.CORE_GROUP,
+                    optimization=pl.chunked_loop_optimizer,
+                    name_hint="q_proj",
+                ):
+                    for ob in pl.parallel(0, 4, 1, chunk=4, chunk_policy="leading_full"):
+                        q0: pl.Scalar[pl.INDEX] = ob * 64
+                        tile_a: pl.Tensor[[16, 128], pl.BF16] = pl.slice(normed_tile, [16, 128], [0, 0])
+                        tile_b: pl.Tensor[[128, 64], pl.BF16] = pl.slice(
+                            wq, [128, 64], [layer_hidden_base, q0]
+                        )
+                        q_acc: pl.Tensor[[16, 64], pl.FP32] = pl.matmul(tile_a, tile_b, out_dtype=pl.FP32)
+                        for kb in pl.range(1, 4):
+                            k0: pl.Scalar[pl.INDEX] = kb * 128
+                            tile_a_i: pl.Tensor[[16, 128], pl.BF16] = pl.slice(
+                                normed_tile, [16, 128], [0, k0]
+                            )
+                            tile_b_i: pl.Tensor[[128, 64], pl.BF16] = pl.slice(
+                                wq, [128, 64], [layer_hidden_base + k0, q0]
+                            )
+                            q_acc = pl.matmul_acc(q_acc, tile_a_i, tile_b_i)
+                        q_proj = pl.assemble(q_proj, q_acc, [b0, q0])
+                return q_proj
+
+        After = _run_original_q_proj_to_optimize_orch_tensors(Before)
+
+        funcs = {func.name for func in After.functions.values()}
+        assert "q_proj" in funcs
+        assert "q_proj__windowed" in funcs
+        assert "q_proj__iter_windowed" not in funcs
+
+        main = After.get_function("main")
+        q_proj = After.get_function("q_proj")
+        q_proj_windowed = After.get_function("q_proj__windowed")
+        assert main is not None
+        assert q_proj is not None
+        assert q_proj_windowed is not None
+
+        printed_main = ir.python_print(main)
+        assert "pl.tensor.slice(q_proj, [16, 256], [0, 0])" in printed_main
+        assert "q_proj__windowed(normed_tile, wq, q_proj__window)" in printed_main
+        assert "pl.tensor.assemble(q_proj, q_proj__windowed, [0, 0])" in printed_main
+
+        printed_windowed = ir.python_print(q_proj_windowed)
+        assert 'attrs={"loop_origin": pl.LoopOrigin.ChunkInner}' in printed_windowed
+        assert "pl.Tensor[[16, 256], pl.FP32" in printed_windowed
+        assert "matmul_acc" in printed_windowed
+        assert "pl.tile.store(q_acc" in printed_windowed
+        assert "[0, q0]" in printed_windowed
+
+    def test_original_q_proj_chunked_loop_optimizer_shape_task_split_is_opt_in(self):
+        @pl.program
+        class Before:
+            @pl.function
+            def main(
+                self,
+                normed_tile: pl.Tensor[[16, 512], pl.BF16],
+                wq: pl.Tensor[[512, 256], pl.BF16],
+                q_proj: pl.Out[pl.Tensor[[16, 256], pl.FP32]],
+            ) -> pl.Tensor[[16, 256], pl.FP32]:
+                b0: pl.Scalar[pl.INDEX] = 0
+                layer_hidden_base: pl.Scalar[pl.INDEX] = 0
+                with pl.at(
+                    level=pl.Level.CORE_GROUP,
+                    optimization=pl.chunked_loop_optimizer,
+                    name_hint="q_proj",
+                ):
+                    for ob in pl.parallel(0, 4, 1, chunk=4, chunk_policy="leading_full"):
+                        q0: pl.Scalar[pl.INDEX] = ob * 64
+                        tile_a: pl.Tensor[[16, 128], pl.BF16] = pl.slice(normed_tile, [16, 128], [0, 0])
+                        tile_b: pl.Tensor[[128, 64], pl.BF16] = pl.slice(
+                            wq, [128, 64], [layer_hidden_base, q0]
+                        )
+                        q_acc: pl.Tensor[[16, 64], pl.FP32] = pl.matmul(tile_a, tile_b, out_dtype=pl.FP32)
+                        for kb in pl.range(1, 4):
+                            k0: pl.Scalar[pl.INDEX] = kb * 128
+                            tile_a_i: pl.Tensor[[16, 128], pl.BF16] = pl.slice(
+                                normed_tile, [16, 128], [0, k0]
+                            )
+                            tile_b_i: pl.Tensor[[128, 64], pl.BF16] = pl.slice(
+                                wq, [128, 64], [layer_hidden_base + k0, q0]
+                            )
+                            q_acc = pl.matmul_acc(q_acc, tile_a_i, tile_b_i)
+                        q_proj = pl.assemble(q_proj, q_acc, [b0, q0])
+                return q_proj
+
+        with passes.PassContext([], enable_out_window_task_split=True):
+            After = _run_original_q_proj_to_optimize_orch_tensors(Before)
+
+        funcs = {func.name for func in After.functions.values()}
+        assert "q_proj__iter_windowed" in funcs
+        assert "q_proj__windowed" not in funcs
+
+        main = After.get_function("main")
+        q_proj_iter = After.get_function("q_proj__iter_windowed")
+        assert main is not None
+        assert q_proj_iter is not None
+
+        printed_main = ir.python_print(main)
+        assert "for ob_0_in" in printed_main
+        assert "in pl.parallel(" in printed_main
+        assert "pl.tensor.slice(" in printed_main
+        assert "[16, 64]" in printed_main
+        assert "q_proj__iter_windowed(" in printed_main
+        assert "pl.tensor.assemble(" in printed_main
+
+        printed_iter = ir.python_print(q_proj_iter)
+        assert "pl.parallel" not in printed_iter
+        assert "matmul_acc" in printed_iter
+        assert "pl.tile.store(q_acc" in printed_iter
+        assert "[0, 0]" in printed_iter
+
+    def test_original_kv_proj_outer_parallel_inner_at_multi_output_shape_stays_baseline(self):
+        @pl.program
+        class Before:
+            @pl.function
+            def main(
+                self,
+                normed_tile: pl.Tensor[[16, 512], pl.BF16],
+                wk: pl.Tensor[[512, 512], pl.BF16],
+                wv: pl.Tensor[[512, 512], pl.BF16],
+                k_proj: pl.Out[pl.Tensor[[16, 512], pl.FP32]],
+                v_proj: pl.Out[pl.Tensor[[16, 512], pl.FP32]],
+            ) -> tuple[pl.Tensor[[16, 512], pl.FP32], pl.Tensor[[16, 512], pl.FP32]]:
+                b0: pl.Scalar[pl.INDEX] = 0
+                layer_hidden_base: pl.Scalar[pl.INDEX] = 0
+                for ob_chunk in pl.parallel(0, 8, 4):
+                    with pl.at(level=pl.Level.CORE_GROUP, name_hint="kv_proj"):
+                        for ob in pl.range(ob_chunk, ob_chunk + 4):
+                            kv0: pl.Scalar[pl.INDEX] = ob * 64
+                            tile_a: pl.Tensor[[16, 128], pl.BF16] = pl.slice(
+                                normed_tile, [16, 128], [0, 0]
+                            )
+                            tile_wk: pl.Tensor[[128, 64], pl.BF16] = pl.slice(
+                                wk, [128, 64], [layer_hidden_base, kv0]
+                            )
+                            k_acc: pl.Tensor[[16, 64], pl.FP32] = pl.matmul(
+                                tile_a, tile_wk, out_dtype=pl.FP32
+                            )
+                            for kb in pl.range(1, 4):
+                                k0: pl.Scalar[pl.INDEX] = kb * 128
+                                tile_a_i: pl.Tensor[[16, 128], pl.BF16] = pl.slice(
+                                    normed_tile, [16, 128], [0, k0]
+                                )
+                                tile_wk_i: pl.Tensor[[128, 64], pl.BF16] = pl.slice(
+                                    wk, [128, 64], [layer_hidden_base + k0, kv0]
+                                )
+                                k_acc = pl.matmul_acc(k_acc, tile_a_i, tile_wk_i)
+                            k_proj = pl.assemble(k_proj, k_acc, [b0, kv0])
+
+                            tile_a = pl.slice(normed_tile, [16, 128], [0, 0])
+                            tile_wv: pl.Tensor[[128, 64], pl.BF16] = pl.slice(
+                                wv, [128, 64], [layer_hidden_base, kv0]
+                            )
+                            v_acc: pl.Tensor[[16, 64], pl.FP32] = pl.matmul(
+                                tile_a, tile_wv, out_dtype=pl.FP32
+                            )
+                            for kb in pl.range(1, 4):
+                                k0 = kb * 128
+                                tile_a_i = pl.slice(normed_tile, [16, 128], [0, k0])
+                                tile_wv_i: pl.Tensor[[128, 64], pl.BF16] = pl.slice(
+                                    wv, [128, 64], [layer_hidden_base + k0, kv0]
+                                )
+                                v_acc = pl.matmul_acc(v_acc, tile_a_i, tile_wv_i)
+                            v_proj = pl.assemble(v_proj, v_acc, [b0, kv0])
+                return k_proj, v_proj
+
+        After = _run_original_q_proj_to_optimize_orch_tensors(Before)
+
+        funcs = {func.name for func in After.functions.values()}
+        assert "kv_proj" in funcs
+        assert "kv_proj__windowed" not in funcs
+        assert "kv_proj__iter_windowed" not in funcs
+
+        main = After.get_function("main")
+        kv_proj = After.get_function("kv_proj")
+        assert main is not None
+        assert kv_proj is not None
+
+        printed_main = ir.python_print(main)
+        assert "for ob_chunk in pl.parallel(0, 8, 4)" in printed_main
+        assert "kv_proj(" in printed_main
+
+        printed_kernel = ir.python_print(kv_proj)
+        assert "pl.range(ob_chunk, ob_chunk + 4)" in printed_kernel
+        assert "pl.tile.store(k_acc" in printed_kernel
+        assert "pl.tile.store(v_acc" in printed_kernel
 
 
 if __name__ == "__main__":
