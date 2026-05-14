@@ -1494,7 +1494,9 @@ class TestOutWindowExternalizer:
         assert "kv_proj(" in printed_main
 
         printed_kernel = ir.python_print(kv_proj)
-        assert "pl.range(ob_chunk, ob_chunk + 4)" in printed_kernel
+        assert "in pl.range(" in printed_kernel
+        assert "ob_chunk__idx_v0 + 4" in printed_kernel
+        assert "init_values=(k_proj__iter_v1, v_proj__iter_v1)" in printed_kernel
         assert "pl.tile.store(k_acc" in printed_kernel
         assert "pl.tile.store(v_acc" in printed_kernel
 
