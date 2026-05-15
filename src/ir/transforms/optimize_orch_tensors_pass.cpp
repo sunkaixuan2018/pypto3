@@ -2564,7 +2564,8 @@ class OutWindowExternalizer {
   AnalysisMap Analyze(const ProgramPtr& program) {
     AnalysisMap analyses;
     for (const auto& [gvar, func] : program->functions_) {
-      if (!func || IsBuiltinOp(func->name_) || func->func_type_ == FunctionType::Orchestration ||
+      if (!func || pypto::codegen::IsBuiltinOp(func->name_) ||
+          func->func_type_ == FunctionType::Orchestration ||
           func->func_type_ == FunctionType::Inline) {
         continue;
       }
