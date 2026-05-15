@@ -1045,26 +1045,27 @@ class TestOutWindowExternalizer:
                             v_proj = pl.assemble(v_proj, v_acc, [b0, kv0])
                 return k_proj, v_proj
 
-        After = passes.optimize_orch_tensors()(Before)
+        After = _run_to_optimize_orch_tensors(Before)
         funcs = {func.name for func in After.functions.values()}
-        assert "kv_proj__windowed" in funcs
+        windowed_funcs = [name for name in funcs if "kv_proj" in name and "__windowed" in name]
+        assert windowed_funcs
 
         main = After.get_function("main")
-        kv_proj_windowed = After.get_function("kv_proj__windowed")
         assert main is not None
+        assert len(windowed_funcs) == 1
+        kv_proj_windowed = After.get_function(windowed_funcs[0])
         assert kv_proj_windowed is not None
 
         printed_main = ir.python_print(main)
         assert "pl.tensor.slice(k_proj" in printed_main
         assert "pl.tensor.slice(v_proj" in printed_main
-        assert "kv_proj__windowed(" in printed_main
+        assert f"{windowed_funcs[0]}(" in printed_main
         assert "pl.tensor.assemble(k_proj" in printed_main
         assert "pl.tensor.assemble(v_proj" in printed_main
 
         printed_windowed = ir.python_print(kv_proj_windowed)
         assert "pl.Tensor[[16, 256], pl.FP32" in printed_windowed
-        assert "pl.store(k_acc" in printed_windowed
-        assert "pl.store(v_acc" in printed_windowed
+        assert printed_windowed.count("pl.store(") >= 2
 
     def test_overlapping_sequential_windows_stay_baseline(self):
         @pl.program
