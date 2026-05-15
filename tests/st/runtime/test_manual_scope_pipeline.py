@@ -1082,6 +1082,21 @@ class _OriginalQProjChunkedLoopTaskSplitPTO(_OriginalQProjChunkedLoopPTO):
         return True
 
 
+class _OriginalQProjChunkedLoopNoOutWindowPTO(_OriginalQProjChunkedLoopPTO):
+    """Run the original q_proj DSL with both out-window rewrites disabled."""
+
+    __test__ = False
+
+    def get_name(self) -> str:
+        return f"original_q_proj_chunked_loop_no_out_window_{_ORIGINAL_Q_PROJ_ROWS}x{_ORIGINAL_Q_PROJ_OUT}"
+
+    def get_enable_out_window_rewrite(self) -> bool:
+        return False
+
+    def get_enable_out_window_task_split(self) -> bool:
+        return False
+
+
 class TestOriginalQProjChunkedLoopRuntime:
     """Numerical + artifact checks for the original q_proj-like Scenario B DSL."""
 
@@ -1150,6 +1165,41 @@ class TestOriginalQProjChunkedLoopRuntime:
         assert ".view(" in code, code
         assert "{16, 64}" in code, code
         assert re.search(r"for \(int64_t \w+ = 0; \w+ < 4; \w+ \+= 1\)", code), code
+
+
+class TestOriginalQProjChunkedLoopNoOutWindowRuntime:
+    """Original q_proj DSL with both out-window controls disabled."""
+
+    @pytest.mark.parametrize("platform", PLATFORMS)
+    def test_correctness(self, test_runner, platform):
+        result = test_runner.run(_OriginalQProjChunkedLoopNoOutWindowPTO(platform=platform))
+        assert result.passed, f"original q_proj no-out-window execution failed: {result.error}"
+
+    @pytest.mark.parametrize("platform", PLATFORMS)
+    def test_saved_artifact_stays_baseline(self, test_runner, test_config, platform):
+        if not test_config.save_kernels:
+            pytest.skip("pass --save-kernels to inspect the no-out-window orchestration artifact")
+
+        tc = _OriginalQProjChunkedLoopNoOutWindowPTO(platform=platform)
+        result = test_runner.run(tc)
+        assert result.passed, f"original q_proj no-out-window execution failed: {result.error}"
+
+        test_name = tc.get_name()
+        if test_config.save_kernels_dir:
+            work_dir = Path(test_config.save_kernels_dir) / test_name
+        else:
+            matches = sorted(_BUILD_OUTPUT_DIR.glob(f"{test_name}_*"), key=lambda p: p.stat().st_mtime)
+            assert matches, f"No saved artifact directory found for {test_name}"
+            work_dir = matches[-1]
+
+        orch_path = work_dir / "orchestration" / "main.cpp"
+        assert orch_path.exists(), f"Missing orchestration artifact: {orch_path}"
+        code = orch_path.read_text(encoding="utf-8")
+
+        assert "q_proj__windowed" not in code, code
+        assert "q_proj__iter_windowed" not in code, code
+        assert ".view(" not in code, code
+        assert "Task 0: q_proj" in code, code
 
 
 def _build_original_kv_proj_outer_parallel_program():
@@ -1278,6 +1328,23 @@ class _OriginalKVProjOuterParallelPTO(PTOTestCase):
         tensors["v_proj"][:] = torch.matmul(normed, tensors["wv"].to(torch.float32))
 
 
+class _OriginalKVProjOuterParallelNoOutWindowPTO(_OriginalKVProjOuterParallelPTO):
+    """Run the original kv_proj DSL with both out-window rewrites disabled."""
+
+    __test__ = False
+
+    def get_name(self) -> str:
+        return (
+            f"original_kv_proj_outer_parallel_no_out_window_{_ORIGINAL_KV_PROJ_ROWS}x{_ORIGINAL_KV_PROJ_OUT}"
+        )
+
+    def get_enable_out_window_rewrite(self) -> bool:
+        return False
+
+    def get_enable_out_window_task_split(self) -> bool:
+        return False
+
+
 @pytest.fixture(scope="session")
 def original_kv_proj_swimlane_file(test_runner) -> Path:
     """Run the original kv_proj case with profiling and return the swimlane JSON."""
@@ -1346,6 +1413,74 @@ class TestOriginalKVProjOuterParallelSwimlane:
         assert "version" in original_kv_proj_swimlane_data
         assert "tasks" in original_kv_proj_swimlane_data
         assert len(original_kv_proj_swimlane_data["tasks"]) > 0
+
+
+@pytest.fixture(scope="session")
+def original_kv_proj_no_out_window_swimlane_file(test_runner) -> Path:
+    """Run the original kv_proj case with both out-window controls disabled."""
+    if not test_runner.config.runtime_profiling:
+        pytest.skip("pass --runtime-profiling to validate the original kv_proj no-out-window swimlane")
+
+    before: set[Path] = set(_BUILD_OUTPUT_DIR.glob("*/swimlane_data/l2_perf_records.json"))
+    result = test_runner.run(_OriginalKVProjOuterParallelNoOutWindowPTO())
+    assert result.passed, f"original kv_proj no-out-window execution failed: {result.error}"
+    after: set[Path] = set(_BUILD_OUTPUT_DIR.glob("*/swimlane_data/l2_perf_records.json"))
+    new_files = after - before
+    assert new_files, "No l2_perf_records.json generated for the original kv_proj no-out-window run"
+    return max(new_files, key=lambda p: p.stat().st_mtime)
+
+
+@pytest.fixture(scope="session")
+def original_kv_proj_no_out_window_swimlane_data(original_kv_proj_no_out_window_swimlane_file: Path) -> dict:
+    return json.loads(original_kv_proj_no_out_window_swimlane_file.read_text())
+
+
+class TestOriginalKVProjOuterParallelNoOutWindowRuntime:
+    """Original kv_proj DSL with both out-window controls disabled."""
+
+    @pytest.mark.parametrize("platform", PLATFORMS)
+    def test_correctness(self, test_runner, platform):
+        result = test_runner.run(_OriginalKVProjOuterParallelNoOutWindowPTO(platform=platform))
+        assert result.passed, f"original kv_proj no-out-window execution failed: {result.error}"
+
+    @pytest.mark.parametrize("platform", PLATFORMS)
+    def test_saved_artifact_stays_baseline(self, test_runner, test_config, platform):
+        if not test_config.save_kernels:
+            pytest.skip("pass --save-kernels to inspect the no-out-window kv_proj orchestration artifact")
+
+        tc = _OriginalKVProjOuterParallelNoOutWindowPTO(platform=platform)
+        result = test_runner.run(tc)
+        assert result.passed, f"original kv_proj no-out-window execution failed: {result.error}"
+
+        test_name = tc.get_name()
+        if test_config.save_kernels_dir:
+            work_dir = Path(test_config.save_kernels_dir) / test_name
+        else:
+            matches = sorted(_BUILD_OUTPUT_DIR.glob(f"{test_name}_*"), key=lambda p: p.stat().st_mtime)
+            assert matches, f"No saved artifact directory found for {test_name}"
+            work_dir = matches[-1]
+
+        orch_path = work_dir / "orchestration" / "main.cpp"
+        assert orch_path.exists(), f"Missing orchestration artifact: {orch_path}"
+        code = orch_path.read_text(encoding="utf-8")
+
+        assert "kv_proj" in code, code
+        assert "kv_proj__windowed" not in code, code
+        assert "kv_proj__iter_windowed" not in code, code
+
+
+class TestOriginalKVProjOuterParallelNoOutWindowSwimlane:
+    """Validate profiling output for the no-out-window kv_proj variant."""
+
+    def test_file_generated(self, original_kv_proj_no_out_window_swimlane_file: Path):
+        assert original_kv_proj_no_out_window_swimlane_file.exists(), (
+            f"Swimlane file not found: {original_kv_proj_no_out_window_swimlane_file}"
+        )
+
+    def test_top_level_structure(self, original_kv_proj_no_out_window_swimlane_data: dict):
+        assert "version" in original_kv_proj_no_out_window_swimlane_data
+        assert "tasks" in original_kv_proj_no_out_window_swimlane_data
+        assert len(original_kv_proj_no_out_window_swimlane_data["tasks"]) > 0
 
 
 if __name__ == "__main__":
