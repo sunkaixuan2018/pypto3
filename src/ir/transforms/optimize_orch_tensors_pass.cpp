@@ -2422,17 +2422,21 @@ class OutWindowExternalizer {
       bool matches_all_outputs = true;
 
       for (const auto& out_param_index : out_indices) {
-        auto return_index = FindReturnIndexForOutParam(func, out_param_index);
-        if (!return_index.has_value() || *return_index >= ret_stmt->value_.size()) return std::nullopt;
-
-        auto returned = AsVarLike(ret_stmt->value_[*return_index]);
-        if (!returned) return std::nullopt;
-
         bool matched_output = false;
         for (size_t i = 0; i < candidate->iter_args_.size() && i < candidate->return_vars_.size(); ++i) {
           auto init_var = AsVarLike(candidate->iter_args_[i]->initValue_);
           if (!init_var || init_var.get() != func->params_[out_param_index].get()) continue;
-          if (returned.get() != candidate->return_vars_[i].get()) continue;
+
+          std::optional<size_t> return_index;
+          for (size_t ret_i = 0; ret_i < ret_stmt->value_.size(); ++ret_i) {
+            auto returned = AsVarLike(ret_stmt->value_[ret_i]);
+            if (returned && returned.get() == candidate->return_vars_[i].get()) {
+              return_index = ret_i;
+              break;
+            }
+          }
+          if (!return_index.has_value()) continue;
+
           if (!matched_iter_arg_indices.insert(i).second) return std::nullopt;
           candidate_matches.push_back(AggregateLoopOutputMatch{out_param_index, *return_index, i});
           matched_output = true;
