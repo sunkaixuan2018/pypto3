@@ -349,6 +349,51 @@ def _build_phase_fence_program():
     return PhaseFenceManualScope
 
 
+def _build_phase_fence_program_auto():
+    """4-phase x 4-branch outer-seq / inner-parallel auto-scope control program.
+
+    This keeps the same direct full-Out call shape as the manual_scope
+    PhaseFence case but removes both ``with pl.manual_scope():`` and
+    ``deps=[out]`` so the runtime falls back to ordinary auto dependency
+    tracking. It serves as a control case for the base Scenario A out-window
+    rewrite independent of TaskId / explicit-dep lowering.
+    """
+    N_PHASES = _PHASE_FENCE_N_PHASES
+    N_BRANCHES = _PHASE_FENCE_N_BRANCHES
+    TILE_M = _PHASE_FENCE_TILE_M
+    BIG_N = _PHASE_FENCE_BIG_N
+    BIG_M = _PHASE_FENCE_BIG_M
+
+    @pl.program
+    class PhaseFenceAuto:
+        @pl.function(type=pl.FunctionType.InCore)
+        def kernel_stripe(
+            self,
+            data: pl.Tensor[[BIG_M, BIG_N], pl.FP32],
+            row_offset: pl.Scalar[pl.INDEX],
+            bias: pl.Scalar[pl.FP32],
+            out: pl.Out[pl.Tensor[[BIG_M, BIG_N], pl.FP32]],
+        ) -> pl.Tensor[[BIG_M, BIG_N], pl.FP32]:
+            tile: pl.Tile[[TILE_M, BIG_N], pl.FP32] = pl.load(data, [row_offset, 0], [TILE_M, BIG_N])
+            result: pl.Tile[[TILE_M, BIG_N], pl.FP32] = pl.add(tile, bias)
+            ret: pl.Tensor[[BIG_M, BIG_N], pl.FP32] = pl.store(result, [row_offset, 0], out)
+            return ret
+
+        @pl.function(type=pl.FunctionType.Orchestration)
+        def main(
+            self,
+            data: pl.Tensor[[BIG_M, BIG_N], pl.FP32],
+            out: pl.Out[pl.Tensor[[BIG_M, BIG_N], pl.FP32]],
+        ) -> pl.Tensor[[BIG_M, BIG_N], pl.FP32]:
+            for phase in pl.range(N_PHASES):
+                for branch in pl.parallel(N_BRANCHES):
+                    row = (phase * N_BRANCHES + branch) * TILE_M
+                    out = self.kernel_stripe(data, row, 1.0, out)
+            return out
+
+    return PhaseFenceAuto
+
+
 class _PhaseFenceManualScopePTO(PTOTestCase):
     """Outer SEQ × inner PARALLEL under manual_scope (multi-deps phase fence)."""
 
@@ -387,6 +432,42 @@ class _PhaseFenceManualScopePTO(PTOTestCase):
             out[r0 : r0 + _PHASE_FENCE_TILE_M, :] = data[r0 : r0 + _PHASE_FENCE_TILE_M, :] + 1.0
 
 
+class _PhaseFenceAutoPTO(PTOTestCase):
+    """Outer SEQ x inner PARALLEL under auto dependency tracking."""
+
+    __test__ = False
+
+    def __init__(self, *, platform: str | None = None, config=None):
+        super().__init__(config, platform=platform)
+
+    def get_name(self) -> str:
+        return f"phase_fence_auto_{_PHASE_FENCE_N_PHASES}x{_PHASE_FENCE_N_BRANCHES}"
+
+    def get_strategy(self) -> OptimizationStrategy:
+        return OptimizationStrategy.Default
+
+    def define_tensors(self) -> list[TensorSpec]:
+        return [
+            TensorSpec(
+                "data", [_PHASE_FENCE_BIG_M, _PHASE_FENCE_BIG_N], DataType.FP32, init_value=torch.randn
+            ),
+            TensorSpec(
+                "out", [_PHASE_FENCE_BIG_M, _PHASE_FENCE_BIG_N], DataType.FP32, init_value=0.0, is_output=True
+            ),
+        ]
+
+    def get_program(self) -> Any:
+        return _build_phase_fence_program_auto()
+
+    def compute_expected(self, tensors, params=None):
+        data = tensors["data"]
+        out = tensors["out"]
+        out.zero_()
+        for i in range(_PHASE_FENCE_N_PHASES * _PHASE_FENCE_N_BRANCHES):
+            r0 = i * _PHASE_FENCE_TILE_M
+            out[r0 : r0 + _PHASE_FENCE_TILE_M, :] = data[r0 : r0 + _PHASE_FENCE_TILE_M, :] + 1.0
+
+
 class TestPhaseFenceManualScope:
     """Numerical correctness for the outer-seq × inner-parallel topology."""
 
@@ -394,6 +475,15 @@ class TestPhaseFenceManualScope:
     def test_correctness(self, test_runner, platform):
         result = test_runner.run(_PhaseFenceManualScopePTO(platform=platform))
         assert result.passed, f"phase-fence manual_scope execution failed: {result.error}"
+
+
+class TestPhaseFenceAuto:
+    """Numerical correctness for the auto-scope phase-fence control case."""
+
+    @pytest.mark.parametrize("platform", PLATFORMS)
+    def test_correctness(self, test_runner, platform):
+        result = test_runner.run(_PhaseFenceAutoPTO(platform=platform))
+        assert result.passed, f"phase-fence auto execution failed: {result.error}"
 
 
 @pytest.fixture(scope="module")
@@ -412,6 +502,24 @@ def phase_fence_swimlane_file(test_runner) -> Path:
 @pytest.fixture(scope="module")
 def phase_fence_swimlane_data(phase_fence_swimlane_file: Path) -> dict:
     return json.loads(phase_fence_swimlane_file.read_text())
+
+
+@pytest.fixture(scope="module")
+def phase_fence_auto_swimlane_file(test_runner) -> Path:
+    if not test_runner.config.enable_l2_swimlane:
+        pytest.skip("pass --enable-l2-swimlane to validate the auto phase-fence swimlane")
+    before: set[Path] = set(_BUILD_OUTPUT_DIR.glob("*/dfx_outputs/l2_perf_records.json"))
+    result = test_runner.run(_PhaseFenceAutoPTO())
+    assert result.passed, f"phase-fence auto failed: {result.error}"
+    after: set[Path] = set(_BUILD_OUTPUT_DIR.glob("*/dfx_outputs/l2_perf_records.json"))
+    new_files = after - before
+    assert new_files, "No l2_perf_records.json generated for the auto phase-fence run"
+    return max(new_files, key=lambda p: p.stat().st_mtime)
+
+
+@pytest.fixture(scope="module")
+def phase_fence_auto_swimlane_data(phase_fence_auto_swimlane_file: Path) -> dict:
+    return json.loads(phase_fence_auto_swimlane_file.read_text())
 
 
 class TestPhaseFenceSwimlane:
@@ -476,6 +584,16 @@ class TestPhaseFenceSwimlane:
             f"max fanout across all tasks = {max_fanout}, expected ≥ {_PHASE_FENCE_N_BRANCHES} "
             "(array-carry multi-deps means each phase-N task should fan out to all "
             f"{_PHASE_FENCE_N_BRANCHES} phase-N+1 tasks)"
+        )
+
+class TestPhaseFenceAutoSwimlane:
+    """Basic runtime validation for the auto-scope phase-fence control case."""
+
+    def test_total_task_count(self, phase_fence_auto_swimlane_data: dict):
+        tasks = phase_fence_auto_swimlane_data["tasks"]
+        assert len(tasks) >= _PHASE_FENCE_N_PHASES * _PHASE_FENCE_N_BRANCHES, (
+            f"expected at least {_PHASE_FENCE_N_PHASES * _PHASE_FENCE_N_BRANCHES} tasks "
+            f"({_PHASE_FENCE_N_PHASES} phases x {_PHASE_FENCE_N_BRANCHES} branches), got {len(tasks)}"
         )
 
 
