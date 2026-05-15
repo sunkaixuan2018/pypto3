@@ -69,19 +69,19 @@ Phase 1 对每个 `Function` body 运行三个子阶段。
 
 `CallDirectionMutator` 遍历每个非 builtin `Call`。对于 Group/Spmd 被调用方，通过 `ComputeGroupEffectiveDirections`（`orchestration_analysis.h`）恢复每位置的有效方向；其他被调用方使用其声明的 `param_directions_`。`sequential_depth_` 计数器在非 `Parallel` 的 `For` 和 `While` 上递增，用于驱动下面的 *R-seq* 提升。
 
-对于每个位置参数，mutator 按下表选择方向：
+对于每个位置参数，mutator 按下表选择方向。被调用方的 `Out` 依次尝试三条提升规则——R-seq → R-prior → R-enclosing；都不触发时保持 `OutputExisting`：
 
-| Callee `ParamDirection` | 实参来源 | `sequential_depth > 0`？ | 作用域内有先前写入者？ | Result |
-| ----------------------- | -------- | ------------------------ | ---------------------- | ------ |
-| any | 非 tensor | — | — | `Scalar` |
-| `In` | tensor | — | — | `Input` |
-| `InOut` | tensor | — | — | `InOut` |
-| `Out` | 根植于函数参数 | — | — | `OutputExisting` |
-| `Out` | 本地缓冲区 | 是 (R-seq) | — | `InOut` |
-| `Out` | 本地缓冲区 | 否 | 是 (R-prior) | `InOut` |
-| `Out` | 本地缓冲区 | 否 | 否 | `OutputExisting` |
+| Callee `ParamDirection` | 实参 | `sequential_depth > 0`？ | 作用域内有先前写入者？ | 所根植的外层参数为 `InOut`？ | Result |
+| ----------------------- | ---- | ------------------------ | ---------------------- | ---------------------------- | ------ |
+| any | 非 tensor | — | — | — | `Scalar` |
+| `In` | tensor | — | — | — | `Input` |
+| `InOut` | tensor | — | — | — | `InOut` |
+| `Out` | tensor | 是 (R-seq) | — | — | `InOut` |
+| `Out` | tensor | 否 | 是 (R-prior) | — | `InOut` |
+| `Out` | tensor | 否 | 否 | 是 (R-enclosing) | `InOut` |
+| `Out` | tensor | 否 | 否 | 否 | `OutputExisting` |
 
-**R-seq** 在顺序循环内保持跨迭代的 write-after-write 链：同一缓冲区槽每次迭代都会被写入一次，因此运行时必须在该槽上序列化迭代。**R-prior** 当同一作用域中较早的写入单元已经触及同一 root 时，保留跨兄弟的 WAW 依赖关系。
+**R-seq** 在顺序循环内保持跨迭代的 write-after-write 链：只要被调用方的 `Out` 处于任意顺序祖先之下，就**无条件**提升为 `InOut`。早期曾有一个"变 offset store 视为不相交"的例外——当被调用方的 `tile.store` offset 依赖某个参数时，把这类调用保留为 `OutputExisting`——该例外已被移除：要 sound 地证明跨迭代写入互不相交，需要一套真正的依赖分析（仿射 offset 抽取、步长与 tile extent 对比、offset 单射性、跨过程组合），而它当时用的廉价语法检查可能悄悄丢掉真实的 WAW 边。**R-prior** 当同一作用域中较早的写入单元已经触及同一 root 时，保留跨兄弟的 WAW 依赖关系。**R-enclosing** 当实参根植的外层函数参数被显式声明为 `pl.InOut` 时，遵从该声明。
 
 预先填充的 `Call.attrs["arg_directions"]` 被视为权威信息并保持不变（像 `NoDep` 这类方向也无法仅从结构上推导得出）。需要注意的是，`Call` 构造函数中的 `ValidateArgDirectionsAttr` 只会在向量非空时检查其长度是否与参数个数匹配；空向量仍可被构造，但随后不会通过 `CallDirectionsResolved` 的属性验证。
 
