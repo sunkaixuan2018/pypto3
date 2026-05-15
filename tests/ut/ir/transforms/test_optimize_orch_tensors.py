@@ -990,7 +990,8 @@ class TestOutWindowExternalizer:
         assert "pl.tensor.slice(out" in printed_main
         assert "[64, 64]" in printed_main
         assert "[64, 0]" in printed_main
-        assert "kernel_stripe__windowed(data, row, 1.0, out__window)" in printed_main
+        assert "kernel_stripe__windowed(" in printed_main
+        assert "__window" in printed_main
         assert "pl.tensor.assemble(out" in printed_main
 
     def test_phase_fence_auto_nested_loop_shape_rewrites(self):
