@@ -1000,7 +1000,7 @@ def _build_original_q_proj_chunked_loop_program():
                 optimization=pl.chunked_loop_optimizer,
                 name_hint="q_proj",
             ):
-                for ob in pl.parallel(0, Q_BLOCKS, 1, chunk=4, chunk_policy="leading_full"):
+                for ob in pl.parallel(0, Q_BLOCKS, 1, chunk=2, chunk_policy="leading_full"):
                     q0: pl.Scalar[pl.INDEX] = ob * Q_CHUNK
                     tile_a: pl.Tensor[[ROWS, K_CHUNK], pl.BF16] = pl.slice(
                         normed_tile, [ROWS, K_CHUNK], [0, 0]
