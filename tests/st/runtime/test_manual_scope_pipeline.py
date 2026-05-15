@@ -797,6 +797,174 @@ class TestBranchChainSwimlane:
                 f"branches should spread across cores; step-0 core_ids = {sorted(step0_cores)}"
             )
 
+_ORIGINAL_KV_PROJ_ROWS = 16
+_ORIGINAL_KV_PROJ_HIDDEN = 512
+_ORIGINAL_KV_PROJ_OUT = 512
+_ORIGINAL_KV_PROJ_K_CHUNK = 128
+_ORIGINAL_KV_PROJ_OUT_CHUNK = 64
+_ORIGINAL_KV_PROJ_K_BLOCKS = _ORIGINAL_KV_PROJ_HIDDEN // _ORIGINAL_KV_PROJ_K_CHUNK
+_ORIGINAL_KV_PROJ_OUT_BLOCKS = _ORIGINAL_KV_PROJ_OUT // _ORIGINAL_KV_PROJ_OUT_CHUNK
+
+
+def _build_original_kv_proj_outer_parallel_program():
+    """Original kv_proj outer-parallel / inner-at multi-output Scenario B shape."""
+    ROWS = _ORIGINAL_KV_PROJ_ROWS
+    HIDDEN = _ORIGINAL_KV_PROJ_HIDDEN
+    OUT = _ORIGINAL_KV_PROJ_OUT
+    K_CHUNK = _ORIGINAL_KV_PROJ_K_CHUNK
+    OUT_CHUNK = _ORIGINAL_KV_PROJ_OUT_CHUNK
+    K_BLOCKS = _ORIGINAL_KV_PROJ_K_BLOCKS
+    OUT_BLOCKS = _ORIGINAL_KV_PROJ_OUT_BLOCKS
+
+    @pl.program
+    class OriginalKVProjOuterParallelProgram:
+        @pl.function(type=pl.FunctionType.Orchestration)
+        def main(
+            self,
+            normed_tile: pl.Tensor[[ROWS, HIDDEN], pl.BF16],
+            wk: pl.Tensor[[HIDDEN, OUT], pl.BF16],
+            wv: pl.Tensor[[HIDDEN, OUT], pl.BF16],
+            k_proj: pl.Out[pl.Tensor[[ROWS, OUT], pl.FP32]],
+            v_proj: pl.Out[pl.Tensor[[ROWS, OUT], pl.FP32]],
+        ) -> tuple[pl.Tensor[[ROWS, OUT], pl.FP32], pl.Tensor[[ROWS, OUT], pl.FP32]]:
+            b0: pl.Scalar[pl.INDEX] = 0
+            layer_hidden_base: pl.Scalar[pl.INDEX] = 0
+            for ob_chunk in pl.parallel(0, OUT_BLOCKS, 4):
+                with pl.at(level=pl.Level.CORE_GROUP, name_hint="kv_proj"):
+                    for ob in pl.range(ob_chunk, ob_chunk + 4):
+                        kv0: pl.Scalar[pl.INDEX] = ob * OUT_CHUNK
+                        tile_a: pl.Tensor[[ROWS, K_CHUNK], pl.BF16] = pl.slice(
+                            normed_tile, [ROWS, K_CHUNK], [0, 0]
+                        )
+                        tile_wk: pl.Tensor[[K_CHUNK, OUT_CHUNK], pl.BF16] = pl.slice(
+                            wk, [K_CHUNK, OUT_CHUNK], [layer_hidden_base, kv0]
+                        )
+                        k_acc: pl.Tensor[[ROWS, OUT_CHUNK], pl.FP32] = pl.matmul(
+                            tile_a, tile_wk, out_dtype=pl.FP32
+                        )
+                        for kb in pl.range(1, K_BLOCKS):
+                            k0: pl.Scalar[pl.INDEX] = kb * K_CHUNK
+                            tile_a_i: pl.Tensor[[ROWS, K_CHUNK], pl.BF16] = pl.slice(
+                                normed_tile, [ROWS, K_CHUNK], [0, k0]
+                            )
+                            tile_wk_i: pl.Tensor[[K_CHUNK, OUT_CHUNK], pl.BF16] = pl.slice(
+                                wk, [K_CHUNK, OUT_CHUNK], [layer_hidden_base + k0, kv0]
+                            )
+                            k_acc = pl.matmul_acc(k_acc, tile_a_i, tile_wk_i)
+                        k_proj = pl.assemble(k_proj, k_acc, [b0, kv0])
+
+                        tile_a = pl.slice(normed_tile, [ROWS, K_CHUNK], [0, 0])
+                        tile_wv: pl.Tensor[[K_CHUNK, OUT_CHUNK], pl.BF16] = pl.slice(
+                            wv, [K_CHUNK, OUT_CHUNK], [layer_hidden_base, kv0]
+                        )
+                        v_acc: pl.Tensor[[ROWS, OUT_CHUNK], pl.FP32] = pl.matmul(
+                            tile_a, tile_wv, out_dtype=pl.FP32
+                        )
+                        for kb in pl.range(1, K_BLOCKS):
+                            k0 = kb * K_CHUNK
+                            tile_a_i = pl.slice(normed_tile, [ROWS, K_CHUNK], [0, k0])
+                            tile_wv_i: pl.Tensor[[K_CHUNK, OUT_CHUNK], pl.BF16] = pl.slice(
+                                wv, [K_CHUNK, OUT_CHUNK], [layer_hidden_base + k0, kv0]
+                            )
+                            v_acc = pl.matmul_acc(v_acc, tile_a_i, tile_wv_i)
+                        v_proj = pl.assemble(v_proj, v_acc, [b0, kv0])
+            return k_proj, v_proj
+
+    return OriginalKVProjOuterParallelProgram
+
+
+class _OriginalKVProjOuterParallelPTO(PTOTestCase):
+    """Minimal runtime vehicle for the original kv_proj multi-output DSL."""
+
+    __test__ = False
+
+    def __init__(self, *, platform: str | None = None, config=None):
+        super().__init__(config, platform=platform)
+
+    def get_name(self) -> str:
+        return f"original_kv_proj_outer_parallel_{_ORIGINAL_KV_PROJ_ROWS}x{_ORIGINAL_KV_PROJ_OUT}"
+
+    def get_strategy(self) -> OptimizationStrategy:
+        return OptimizationStrategy.Default
+
+    def define_tensors(self) -> list[TensorSpec]:
+        return [
+            TensorSpec(
+                "normed_tile",
+                [_ORIGINAL_KV_PROJ_ROWS, _ORIGINAL_KV_PROJ_HIDDEN],
+                DataType.BF16,
+                init_value=torch.randn,
+            ),
+            TensorSpec(
+                "wk",
+                [_ORIGINAL_KV_PROJ_HIDDEN, _ORIGINAL_KV_PROJ_OUT],
+                DataType.BF16,
+                init_value=torch.randn,
+            ),
+            TensorSpec(
+                "wv",
+                [_ORIGINAL_KV_PROJ_HIDDEN, _ORIGINAL_KV_PROJ_OUT],
+                DataType.BF16,
+                init_value=torch.randn,
+            ),
+            TensorSpec(
+                "k_proj",
+                [_ORIGINAL_KV_PROJ_ROWS, _ORIGINAL_KV_PROJ_OUT],
+                DataType.FP32,
+                init_value=0.0,
+                is_output=True,
+            ),
+            TensorSpec(
+                "v_proj",
+                [_ORIGINAL_KV_PROJ_ROWS, _ORIGINAL_KV_PROJ_OUT],
+                DataType.FP32,
+                init_value=0.0,
+                is_output=True,
+            ),
+        ]
+
+    def get_program(self) -> Any:
+        return _build_original_kv_proj_outer_parallel_program()
+
+    def compute_expected(self, tensors, params=None):
+        normed = tensors["normed_tile"].to(torch.float32)
+        tensors["k_proj"][:] = torch.matmul(normed, tensors["wk"].to(torch.float32))
+        tensors["v_proj"][:] = torch.matmul(normed, tensors["wv"].to(torch.float32))
+
+
+@pytest.fixture(scope="module")
+def original_kv_proj_swimlane_file(test_runner) -> Path:
+    """Run the original kv_proj case once and return the generated swimlane JSON."""
+    if not test_runner.config.enable_l2_swimlane:
+        pytest.skip("pass --enable-l2-swimlane to validate the original kv_proj swimlane")
+
+    before: set[Path] = set(_BUILD_OUTPUT_DIR.glob("*/dfx_outputs/l2_perf_records.json"))
+    result = test_runner.run(_OriginalKVProjOuterParallelPTO())
+    assert result.passed, f"original kv_proj outer-parallel execution failed: {result.error}"
+    after: set[Path] = set(_BUILD_OUTPUT_DIR.glob("*/dfx_outputs/l2_perf_records.json"))
+    new_files = after - before
+    assert new_files, "No l2_perf_records.json generated for the original kv_proj run"
+    return max(new_files, key=lambda p: p.stat().st_mtime)
+
+
+@pytest.fixture(scope="module")
+def original_kv_proj_swimlane_data(original_kv_proj_swimlane_file: Path) -> dict:
+    return json.loads(original_kv_proj_swimlane_file.read_text())
+
+
+class TestOriginalKVProjOuterParallelSwimlane:
+    """Validate that the original kv_proj case emits a basic swimlane artifact."""
+
+    def test_file_generated(self, original_kv_proj_swimlane_file: Path):
+        assert original_kv_proj_swimlane_file.exists(), (
+            f"Swimlane file not found: {original_kv_proj_swimlane_file}"
+        )
+
+    def test_top_level_structure(self, original_kv_proj_swimlane_data: dict):
+        assert "version" in original_kv_proj_swimlane_data
+        assert "tasks" in original_kv_proj_swimlane_data
+        assert len(original_kv_proj_swimlane_data["tasks"]) > 0
+
 
 if __name__ == "__main__":
     pytest.main([__file__, "-v"])
