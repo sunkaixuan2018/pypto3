@@ -2422,13 +2422,23 @@ class OutWindowExternalizer {
       bool matches_all_outputs = true;
 
       for (const auto& out_param_index : out_indices) {
+        std::optional<size_t> direct_return_index = FindReturnIndexForOutParam(func, out_param_index);
+        VarPtr direct_returned;
+        if (direct_return_index.has_value() && *direct_return_index < ret_stmt->value_.size()) {
+          direct_returned = AsVarLike(ret_stmt->value_[*direct_return_index]);
+        }
+
         bool matched_output = false;
         for (size_t i = 0; i < candidate->iter_args_.size() && i < candidate->return_vars_.size(); ++i) {
           auto init_var = AsVarLike(candidate->iter_args_[i]->initValue_);
           if (!init_var || init_var.get() != func->params_[out_param_index].get()) continue;
 
-          std::optional<size_t> return_index;
+          std::optional<size_t> return_index = direct_return_index;
+          if (direct_returned && direct_returned.get() != candidate->return_vars_[i].get()) {
+            return_index = std::nullopt;
+          }
           for (size_t ret_i = 0; ret_i < ret_stmt->value_.size(); ++ret_i) {
+            if (return_index.has_value()) break;
             auto returned = AsVarLike(ret_stmt->value_[ret_i]);
             if (returned && returned.get() == candidate->return_vars_[i].get()) {
               return_index = ret_i;
