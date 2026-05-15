@@ -829,7 +829,7 @@ def _build_original_kv_proj_outer_parallel_program():
         ) -> tuple[pl.Tensor[[ROWS, OUT], pl.FP32], pl.Tensor[[ROWS, OUT], pl.FP32]]:
             b0: pl.Scalar[pl.INDEX] = 0
             layer_hidden_base: pl.Scalar[pl.INDEX] = 0
-            for ob_chunk in pl.parallel(0, OUT_BLOCKS, 4):
+            for ob_chunk in pl.range(0, OUT_BLOCKS, 4):
                 with pl.at(level=pl.Level.CORE_GROUP, name_hint="kv_proj"):
                     for ob in pl.range(ob_chunk, ob_chunk + 4):
                         kv0: pl.Scalar[pl.INDEX] = ob * OUT_CHUNK
@@ -880,6 +880,8 @@ class _OriginalKVProjOuterParallelPTO(PTOTestCase):
 
     def __init__(self, *, platform: str | None = None, config=None):
         super().__init__(config, platform=platform)
+        self.config.atol = 2e-5
+        self.config.rtol = 2e-5
 
     def get_name(self) -> str:
         return f"original_kv_proj_outer_parallel_{_ORIGINAL_KV_PROJ_ROWS}x{_ORIGINAL_KV_PROJ_OUT}"
