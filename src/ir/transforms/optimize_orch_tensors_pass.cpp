@@ -2412,6 +2412,11 @@ class OutWindowExternalizer {
       size_t iter_arg_index;
     };
 
+    std::unordered_set<const Var*> out_params;
+    for (const auto& out_index : out_indices) {
+      out_params.insert(func->params_[out_index].get());
+    }
+
     ForStmtPtr loop;
     std::vector<AggregateLoopOutputMatch> loop_matches;
     for (const auto& stmt : body_stmts) {
@@ -2467,6 +2472,68 @@ class OutWindowExternalizer {
       if (loop) return std::nullopt;
       loop = candidate;
       loop_matches = std::move(candidate_matches);
+    }
+    if (!loop) {
+      class NestedLoopFinder : public IRVisitor {
+       public:
+        explicit NestedLoopFinder(const std::unordered_set<const Var*>& out_params) : out_params_(out_params) {}
+
+        ForStmtPtr loop() const { return loop_; }
+
+       protected:
+        void VisitStmt_(const ForStmtPtr& op) override {
+          if (!loop_ && !op->iter_args_.empty()) {
+            bool carries_out = true;
+            bool saw_out = false;
+            for (const auto& iter_arg : op->iter_args_) {
+              auto init_var = AsVarLike(iter_arg->initValue_);
+              if (!init_var || !out_params_.count(init_var.get())) {
+                carries_out = false;
+                break;
+              }
+              saw_out = true;
+            }
+            if (carries_out && saw_out) {
+              loop_ = op;
+              return;
+            }
+          }
+          IRVisitor::VisitStmt_(op);
+        }
+
+       private:
+        const std::unordered_set<const Var*>& out_params_;
+        ForStmtPtr loop_;
+      };
+
+      NestedLoopFinder finder(out_params);
+      finder.VisitStmt(func->body_);
+      auto nested = finder.loop();
+      if (nested) {
+        std::vector<AggregateLoopOutputMatch> nested_matches;
+        std::unordered_set<size_t> matched_iter_arg_indices;
+        bool matches_all_outputs = true;
+        for (size_t out_ordinal = 0; out_ordinal < out_indices.size(); ++out_ordinal) {
+          auto out_param_index = out_indices[out_ordinal];
+          bool matched_output = false;
+          for (size_t i = 0; i < nested->iter_args_.size() && i < nested->return_vars_.size(); ++i) {
+            auto init_var = AsVarLike(nested->iter_args_[i]->initValue_);
+            if (!init_var || init_var.get() != func->params_[out_param_index].get()) continue;
+            if (!matched_iter_arg_indices.insert(i).second) return std::nullopt;
+            nested_matches.push_back(AggregateLoopOutputMatch{out_param_index, out_ordinal, i});
+            matched_output = true;
+            break;
+          }
+          if (!matched_output) {
+            matches_all_outputs = false;
+            break;
+          }
+        }
+        if (matches_all_outputs) {
+          loop = nested;
+          loop_matches = std::move(nested_matches);
+        }
+      }
     }
     if (!loop) return std::nullopt;
     if (loop_matches.size() != out_indices.size()) return std::nullopt;
