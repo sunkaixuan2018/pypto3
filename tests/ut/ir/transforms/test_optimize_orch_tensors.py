@@ -1168,9 +1168,9 @@ class TestOutWindowExternalizer:
                 for ob_chunk, (k_proj_iter, v_proj_iter) in pl.range(
                     0, 8, 4, init_values=(k_proj, v_proj)
                 ):
-                    result: tuple[pl.Tensor[[16, 512], pl.FP32], pl.Tensor[[16, 512], pl.FP32]] = self.kv_proj(
-                        k_proj_iter, v_proj_iter, ob_chunk, normed_tile, wk, wv
-                    )
+                    result: tuple[
+                        pl.Tensor[[16, 512], pl.FP32], pl.Tensor[[16, 512], pl.FP32]
+                    ] = self.kv_proj(k_proj_iter, v_proj_iter, ob_chunk, normed_tile, wk, wv)
                     k_proj_next: pl.Tensor[[16, 512], pl.FP32] = result[0]
                     v_proj_next: pl.Tensor[[16, 512], pl.FP32] = result[1]
                     k_proj_rv, v_proj_rv = pl.yield_(k_proj_next, v_proj_next)
