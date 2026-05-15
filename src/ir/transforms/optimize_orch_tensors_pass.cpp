@@ -1934,6 +1934,7 @@ class OutWindowExternalizer {
       new_stmts.reserve(op->stmts_.size());
       bool changed = false;
       auto saved_scalar_defs = scalar_defs_;
+      auto saved_tuple_result_subst = tuple_result_subst_;
 
       for (const auto& stmt : op->stmts_) {
         auto call_assign = As<AssignStmt>(stmt);
@@ -1957,6 +1958,7 @@ class OutWindowExternalizer {
       }
 
       scalar_defs_ = std::move(saved_scalar_defs);
+      tuple_result_subst_ = std::move(saved_tuple_result_subst);
       if (!changed) return op;
       return SeqStmts::Flatten(std::move(new_stmts), op->span_);
     }
@@ -2097,8 +2099,7 @@ class OutWindowExternalizer {
         }
       }
 
-      auto final_tuple = std::make_shared<MakeTuple>(assembled_result_exprs, call_assign->span_);
-      tail_stmts.push_back(std::make_shared<AssignStmt>(call_assign->var_, final_tuple, call_assign->span_));
+      tuple_result_subst_[call_assign->var_.get()] = std::move(assembled_result_exprs);
       stmts.insert(stmts.end(), tail_stmts.begin(), tail_stmts.end());
 
       RewriteBundle bundle;
@@ -2245,11 +2246,24 @@ class OutWindowExternalizer {
       return std::nullopt;
     }
 
+    ExprPtr VisitExpr_(const TupleGetItemExprPtr& op) override {
+      auto tuple_var = AsVarLike(op->tuple_);
+      if (tuple_var) {
+        auto subst_it = tuple_result_subst_.find(tuple_var.get());
+        if (subst_it != tuple_result_subst_.end() && op->index_ >= 0 &&
+            static_cast<size_t>(op->index_) < subst_it->second.size()) {
+          return VisitExpr(subst_it->second[static_cast<size_t>(op->index_)]);
+        }
+      }
+      return IRMutator::VisitExpr_(op);
+    }
+
     ProgramPtr program_;
     const AnalysisMap& analyses_;
     const std::unordered_map<std::string, FunctionPtr>& cloned_funcs_;
     std::vector<ForStmtPtr> sequential_loops_;
     std::unordered_map<const Var*, ExprPtr> scalar_defs_;
+    std::unordered_map<const Var*, std::vector<ExprPtr>> tuple_result_subst_;
     int while_depth_ = 0;
   };
 
