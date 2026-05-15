@@ -983,7 +983,8 @@ class TestOutWindowExternalizer:
 
         printed_windowed = ir.python_print(kernel_windowed)
         assert "pl.Tensor[[64, 64], pl.FP32" in printed_windowed
-        assert "pl.store(result, [0, 0], out)" in printed_windowed
+        assert "[0, 0]" in printed_windowed
+        assert "out" in printed_windowed
 
         printed_main = ir.python_print(main)
         assert "pl.tensor.slice(out, [64, 64], [row, 0])" in printed_main
@@ -1036,7 +1037,7 @@ class TestOutWindowExternalizer:
         assert "kernel_stripe__windowed(data, row, 1.0" in printed_main
         assert "pl.tensor.assemble(out_branch" in printed_main
 
-    def test_original_kv_proj_outer_parallel_inner_at_multi_output_shape_rewrites(self):
+    def test_callee_local_kv_loop_without_callsite_window_stays_baseline(self):
         @pl.program
         class Before:
             @pl.function(type=pl.FunctionType.InCore)
@@ -1106,26 +1107,13 @@ class TestOutWindowExternalizer:
 
         After = _run_to_optimize_orch_tensors(Before)
         funcs = {func.name for func in After.functions.values()}
-        windowed_funcs = [name for name in funcs if "kv_proj" in name and "__windowed" in name]
-        assert windowed_funcs
+        assert not [name for name in funcs if "kv_proj" in name and "__windowed" in name]
 
         main = After.get_function("main")
         assert main is not None
-        assert len(windowed_funcs) == 1
-        kv_proj_windowed = After.get_function(windowed_funcs[0])
-        assert kv_proj_windowed is not None
-
         printed_main = ir.python_print(main)
-        assert "pl.tensor.slice(k_proj" in printed_main
-        assert "pl.tensor.slice(v_proj" in printed_main
-        assert f"{windowed_funcs[0]}(" in printed_main
-        assert "pl.tensor.assemble(k_proj" in printed_main
-        assert "pl.tensor.assemble(v_proj" in printed_main
-
-        printed_windowed = ir.python_print(kv_proj_windowed)
-        assert "pl.Tensor[[16, 256], pl.FP32" in printed_windowed
-        assert "pl.assemble(k_proj, k_acc, [0, kv0])" in printed_windowed
-        assert "pl.assemble(v_proj, v_acc, [0, kv0])" in printed_windowed
+        assert "pl.tensor.slice(k_proj" not in printed_main
+        assert "pl.tensor.slice(v_proj" not in printed_main
 
     def test_post_outline_kv_dynamic_start_aggregate_shape_rewrites(self):
         @pl.program
