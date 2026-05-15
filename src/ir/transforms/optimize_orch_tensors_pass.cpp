@@ -1884,7 +1884,7 @@ class OutWindowExternalizer {
 
       auto info_it = out_info_by_var_.find(target_var);
       if (info_it == out_info_by_var_.end()) return assign;
-      if (!offsets || !AreExprVectorsEqual(offsets->elements_, info_it->second.callsite_offsets)) return assign;
+      if (!offsets) return assign;
 
       auto new_offset_tuple = std::make_shared<MakeTuple>(info_it->second.local_store_offsets, offsets->span_);
       std::vector<ExprPtr> new_args = call->args_;
@@ -1933,6 +1933,7 @@ class OutWindowExternalizer {
       std::vector<StmtPtr> new_stmts;
       new_stmts.reserve(op->stmts_.size());
       bool changed = false;
+      auto saved_scalar_defs = scalar_defs_;
 
       for (const auto& stmt : op->stmts_) {
         auto call_assign = As<AssignStmt>(stmt);
@@ -1948,8 +1949,14 @@ class OutWindowExternalizer {
         auto visited = VisitStmt(stmt);
         changed = changed || visited.get() != stmt.get();
         new_stmts.push_back(visited);
+
+        auto visited_assign = As<AssignStmt>(visited);
+        if (visited_assign && As<ScalarType>(visited_assign->var_->GetType())) {
+          scalar_defs_[visited_assign->var_.get()] = visited_assign->value_;
+        }
       }
 
+      scalar_defs_ = std::move(saved_scalar_defs);
       if (!changed) return op;
       return SeqStmts::Flatten(std::move(new_stmts), op->span_);
     }
@@ -2173,6 +2180,7 @@ class OutWindowExternalizer {
         std::optional<size_t> varying_dim;
         for (size_t i = 0; i < output.callsite_offsets.size(); ++i) {
           auto rewritten = transform_utils::Substitute(output.callsite_offsets[i], callsite_subst);
+          rewritten = transform_utils::Substitute(rewritten, scalar_defs_);
           auto affine = ParseAffineInLoop(rewritten, loop->loop_var_.get());
           if (!affine.has_value()) return false;
           if (affine->coeff == 0) continue;
@@ -2241,6 +2249,7 @@ class OutWindowExternalizer {
     const AnalysisMap& analyses_;
     const std::unordered_map<std::string, FunctionPtr>& cloned_funcs_;
     std::vector<ForStmtPtr> sequential_loops_;
+    std::unordered_map<const Var*, ExprPtr> scalar_defs_;
     int while_depth_ = 0;
   };
 
@@ -2298,11 +2307,43 @@ class OutWindowExternalizer {
     return (distance_abs + step_abs - 1) / step_abs;
   }
 
+  static std::optional<int64_t> GetKnownPositiveTripCount(const ForStmtPtr& loop) {
+    auto static_trip_count = GetStaticTripCount(loop);
+    if (static_trip_count.has_value()) return static_trip_count;
+    if (!loop) return std::nullopt;
+    auto step = GetConstIntValue(loop->step_);
+    if (!step.has_value() || *step <= 0) return std::nullopt;
+
+    auto distance_expr = arith::Analyzer().Simplify(MakeSub(loop->stop_, loop->start_, loop->span_));
+    auto distance = As<ConstInt>(distance_expr);
+    if (!distance) return std::nullopt;
+    if (distance->value_ <= 0) return int64_t{0};
+    return (distance->value_ + *step - 1) / *step;
+  }
+
   static std::optional<ExprPtr> SimplifyWithLoopBound(const ExprPtr& expr, const VarPtr& loop_var, int64_t value) {
     if (!expr) return std::nullopt;
     arith::Analyzer analyzer;
     analyzer.Bind(loop_var, value, value + 1);
     return analyzer.Simplify(expr);
+  }
+
+  static std::optional<ExprPtr> SimplifyWithLoopValue(const ExprPtr& expr, const VarPtr& loop_var,
+                                                      const ExprPtr& value) {
+    if (!expr || !value) return std::nullopt;
+    arith::Analyzer analyzer;
+    analyzer.Bind(loop_var, value);
+    return analyzer.Simplify(expr);
+  }
+
+  static std::optional<ExprPtr> GetLoopValueAtTrip(const ForStmtPtr& loop, int64_t trip_index) {
+    if (!loop || trip_index < 0) return std::nullopt;
+    auto step = GetConstIntValue(loop->step_);
+    if (!step.has_value()) return std::nullopt;
+    int64_t delta = trip_index * *step;
+    if (delta == 0) return loop->start_;
+    auto delta_expr = std::make_shared<ConstInt>(delta, DataType::INDEX, loop->span_);
+    return arith::Analyzer().Simplify(MakeAdd(loop->start_, delta_expr, loop->span_));
   }
 
   static std::optional<ExprPtr> ExpandLoopLocalExpr(
@@ -2416,14 +2457,19 @@ class OutWindowExternalizer {
     if (!loop) return std::nullopt;
     if (loop_matches.size() != out_indices.size()) return std::nullopt;
 
-    auto start = GetConstIntValue(loop->start_);
     auto stop = GetConstIntValue(loop->stop_);
     auto step = GetConstIntValue(loop->step_);
     if (!stop.has_value() || !step.has_value()) {
+      auto known_trip_count = GetKnownPositiveTripCount(loop);
+      if (!known_trip_count.has_value() || *known_trip_count <= 0) return std::nullopt;
+    } else if (*step <= 0) {
       return std::nullopt;
     }
-    auto trip_count = GetStaticTripCount(loop);
+    auto trip_count = GetKnownPositiveTripCount(loop);
     if (!trip_count.has_value() || *trip_count <= 0) return std::nullopt;
+    auto first_loop_value = GetLoopValueAtTrip(loop, 0);
+    auto last_loop_value = GetLoopValueAtTrip(loop, *trip_count - 1);
+    if (!first_loop_value.has_value() || !last_loop_value.has_value()) return std::nullopt;
 
     auto loop_body_stmts = FlattenToStmts(loop->body_);
     YieldStmtPtr yield_stmt;
@@ -2529,10 +2575,8 @@ class OutWindowExternalizer {
         if (!expanded.has_value()) return std::nullopt;
         if (!ExprReferencesOnlyVarsIn(*expanded, allowed)) return std::nullopt;
 
-        auto min_bound = start.has_value() ? *start : 0;
-        auto max_bound = min_bound + (*trip_count - 1) * *step;
-        auto min_offset = SimplifyWithLoopBound(*expanded, loop->loop_var_, min_bound);
-        auto max_offset = SimplifyWithLoopBound(*expanded, loop->loop_var_, max_bound);
+        auto min_offset = SimplifyWithLoopValue(*expanded, loop->loop_var_, *first_loop_value);
+        auto max_offset = SimplifyWithLoopValue(*expanded, loop->loop_var_, *last_loop_value);
         if (!min_offset.has_value() || !max_offset.has_value()) return std::nullopt;
 
         auto span_expr = arith::Analyzer().Simplify(
