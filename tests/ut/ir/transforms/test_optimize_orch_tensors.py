@@ -993,8 +993,8 @@ class TestOutWindowExternalizer:
     def test_original_kv_proj_outer_parallel_inner_at_multi_output_shape_rewrites(self):
         @pl.program
         class Before:
-            @pl.function
-            def main(
+            @pl.function(type=pl.FunctionType.InCore)
+            def kv_proj(
                 self,
                 normed_tile: pl.Tensor[[16, 512], pl.BF16],
                 wk: pl.Tensor[[512, 512], pl.BF16],
@@ -1005,45 +1005,58 @@ class TestOutWindowExternalizer:
                 b0: pl.Scalar[pl.INDEX] = 0
                 layer_hidden_base: pl.Scalar[pl.INDEX] = 0
                 for ob_chunk in pl.range(0, 8, 4):
-                    with pl.at(level=pl.Level.CORE_GROUP, name_hint="kv_proj"):
-                        for ob in pl.range(ob_chunk, ob_chunk + 4):
-                            kv0: pl.Scalar[pl.INDEX] = ob * 64
-                            tile_a: pl.Tensor[[16, 128], pl.BF16] = pl.slice(
-                                normed_tile, [16, 128], [0, 0]
+                    for ob in pl.range(ob_chunk, ob_chunk + 4):
+                        kv0: pl.Scalar[pl.INDEX] = ob * 64
+                        tile_a: pl.Tensor[[16, 128], pl.BF16] = pl.slice(
+                            normed_tile, [16, 128], [0, 0]
+                        )
+                        tile_wk: pl.Tensor[[128, 64], pl.BF16] = pl.slice(
+                            wk, [128, 64], [layer_hidden_base, kv0]
+                        )
+                        k_acc: pl.Tensor[[16, 64], pl.FP32] = pl.matmul(
+                            tile_a, tile_wk, out_dtype=pl.FP32
+                        )
+                        for kb in pl.range(1, 4):
+                            k0: pl.Scalar[pl.INDEX] = kb * 128
+                            tile_a_i: pl.Tensor[[16, 128], pl.BF16] = pl.slice(
+                                normed_tile, [16, 128], [0, k0]
                             )
-                            tile_wk: pl.Tensor[[128, 64], pl.BF16] = pl.slice(
-                                wk, [128, 64], [layer_hidden_base, kv0]
+                            tile_wk_i: pl.Tensor[[128, 64], pl.BF16] = pl.slice(
+                                wk, [128, 64], [layer_hidden_base + k0, kv0]
                             )
-                            k_acc: pl.Tensor[[16, 64], pl.FP32] = pl.matmul(
-                                tile_a, tile_wk, out_dtype=pl.FP32
-                            )
-                            for kb in pl.range(1, 4):
-                                k0: pl.Scalar[pl.INDEX] = kb * 128
-                                tile_a_i: pl.Tensor[[16, 128], pl.BF16] = pl.slice(
-                                    normed_tile, [16, 128], [0, k0]
-                                )
-                                tile_wk_i: pl.Tensor[[128, 64], pl.BF16] = pl.slice(
-                                    wk, [128, 64], [layer_hidden_base + k0, kv0]
-                                )
-                                k_acc = pl.matmul_acc(k_acc, tile_a_i, tile_wk_i)
-                            k_proj = pl.assemble(k_proj, k_acc, [b0, kv0])
+                            k_acc = pl.matmul_acc(k_acc, tile_a_i, tile_wk_i)
+                        k_proj = pl.assemble(k_proj, k_acc, [b0, kv0])
 
-                            tile_a = pl.slice(normed_tile, [16, 128], [0, 0])
-                            tile_wv: pl.Tensor[[128, 64], pl.BF16] = pl.slice(
-                                wv, [128, 64], [layer_hidden_base, kv0]
+                        tile_a = pl.slice(normed_tile, [16, 128], [0, 0])
+                        tile_wv: pl.Tensor[[128, 64], pl.BF16] = pl.slice(
+                            wv, [128, 64], [layer_hidden_base, kv0]
+                        )
+                        v_acc: pl.Tensor[[16, 64], pl.FP32] = pl.matmul(
+                            tile_a, tile_wv, out_dtype=pl.FP32
+                        )
+                        for kb in pl.range(1, 4):
+                            k0 = kb * 128
+                            tile_a_i = pl.slice(normed_tile, [16, 128], [0, k0])
+                            tile_wv_i: pl.Tensor[[128, 64], pl.BF16] = pl.slice(
+                                wv, [128, 64], [layer_hidden_base + k0, kv0]
                             )
-                            v_acc: pl.Tensor[[16, 64], pl.FP32] = pl.matmul(
-                                tile_a, tile_wv, out_dtype=pl.FP32
-                            )
-                            for kb in pl.range(1, 4):
-                                k0 = kb * 128
-                                tile_a_i = pl.slice(normed_tile, [16, 128], [0, k0])
-                                tile_wv_i: pl.Tensor[[128, 64], pl.BF16] = pl.slice(
-                                    wv, [128, 64], [layer_hidden_base + k0, kv0]
-                                )
-                                v_acc = pl.matmul_acc(v_acc, tile_a_i, tile_wv_i)
-                            v_proj = pl.assemble(v_proj, v_acc, [b0, kv0])
+                            v_acc = pl.matmul_acc(v_acc, tile_a_i, tile_wv_i)
+                        v_proj = pl.assemble(v_proj, v_acc, [b0, kv0])
                 return k_proj, v_proj
+
+            @pl.function
+            def main(
+                self,
+                normed_tile: pl.Tensor[[16, 512], pl.BF16],
+                wk: pl.Tensor[[512, 512], pl.BF16],
+                wv: pl.Tensor[[512, 512], pl.BF16],
+                k_proj: pl.Out[pl.Tensor[[16, 512], pl.FP32]],
+                v_proj: pl.Out[pl.Tensor[[16, 512], pl.FP32]],
+            ) -> tuple[pl.Tensor[[16, 512], pl.FP32], pl.Tensor[[16, 512], pl.FP32]]:
+                result: tuple[pl.Tensor[[16, 512], pl.FP32], pl.Tensor[[16, 512], pl.FP32]] = self.kv_proj(
+                    normed_tile, wk, wv, k_proj, v_proj
+                )
+                return result
 
         After = _run_to_optimize_orch_tensors(Before)
         funcs = {func.name for func in After.functions.values()}
@@ -1065,7 +1078,8 @@ class TestOutWindowExternalizer:
 
         printed_windowed = ir.python_print(kv_proj_windowed)
         assert "pl.Tensor[[16, 256], pl.FP32" in printed_windowed
-        assert printed_windowed.count("pl.store(") >= 2
+        assert "pl.assemble(k_proj, k_acc, [0, kv0])" in printed_windowed
+        assert "pl.assemble(v_proj, v_acc, [0, kv0])" in printed_windowed
 
     def test_overlapping_sequential_windows_stay_baseline(self):
         @pl.program

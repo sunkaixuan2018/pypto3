@@ -1827,9 +1827,9 @@ class OutWindowExternalizer {
     ExprPtr base;
   };
 
-  class StoreOffsetLocalizer : public IRMutator {
+  class WindowWriteLocalizer : public IRMutator {
    public:
-    StoreOffsetLocalizer(const std::unordered_map<const Var*, OutputRewriteInfo>& out_info_by_var,
+    WindowWriteLocalizer(const std::unordered_map<const Var*, OutputRewriteInfo>& out_info_by_var,
                          const std::unordered_map<const Var*, ExprPtr>& new_out_vars,
                          const std::unordered_map<const Var*, TypePtr>& new_store_types)
         : out_info_by_var_(out_info_by_var), new_out_vars_(new_out_vars), new_store_types_(new_store_types) {}
@@ -1854,21 +1854,43 @@ class OutWindowExternalizer {
       auto assign = MutableCopy(op);
       assign->value_ = visited_value;
       auto call = As<Call>(assign->value_);
-      if (!call || call->op_->name_ != "tile.store" || call->args_.size() < 3) return assign;
+      if (!call) return assign;
 
-      auto out_var = AsVarLike(call->args_[2]);
-      if (!out_var) return assign;
-      auto info_it = out_info_by_var_.find(out_var.get());
+      ExprPtr rewritten_target_expr;
+      const Var* target_var = nullptr;
+      MakeTuplePtr offsets;
+      size_t offset_arg_index = SIZE_MAX;
+      size_t target_arg_index = SIZE_MAX;
+
+      if (call->op_->name_ == "tile.store" && call->args_.size() >= 3) {
+        rewritten_target_expr = call->args_[2];
+        auto out_var = AsVarLike(rewritten_target_expr);
+        if (!out_var) return assign;
+        target_var = out_var.get();
+        offsets = As<MakeTuple>(call->args_[1]);
+        offset_arg_index = 1;
+        target_arg_index = 2;
+      } else if (call->op_->name_ == "tensor.assemble" && call->args_.size() >= 3) {
+        rewritten_target_expr = call->args_[0];
+        auto parent_var = AsVarLike(rewritten_target_expr);
+        if (!parent_var) return assign;
+        target_var = parent_var.get();
+        offsets = As<MakeTuple>(call->args_[2]);
+        offset_arg_index = 2;
+        target_arg_index = 0;
+      } else {
+        return assign;
+      }
+
+      auto info_it = out_info_by_var_.find(target_var);
       if (info_it == out_info_by_var_.end()) return assign;
-
-      auto offsets = As<MakeTuple>(call->args_[1]);
       if (!offsets || !AreExprVectorsEqual(offsets->elements_, info_it->second.callsite_offsets)) return assign;
 
       auto new_offset_tuple = std::make_shared<MakeTuple>(info_it->second.local_store_offsets, offsets->span_);
       std::vector<ExprPtr> new_args = call->args_;
-      new_args[1] = new_offset_tuple;
-      new_args[2] = new_out_vars_.at(out_var.get());
-      auto new_type = new_store_types_.at(out_var.get());
+      new_args[offset_arg_index] = new_offset_tuple;
+      new_args[target_arg_index] = new_out_vars_.at(target_var);
+      auto new_type = new_store_types_.at(target_var);
       auto new_call = std::make_shared<Call>(call->op_, new_args, call->kwargs_, call->attrs_, new_type, call->span_);
 
       auto new_result_var = std::make_shared<Var>(assign->var_->name_hint_, new_type, assign->var_->span_);
@@ -2405,18 +2427,47 @@ class OutWindowExternalizer {
 
     auto loop_body_stmts = FlattenToStmts(loop->body_);
     YieldStmtPtr yield_stmt;
-    std::unordered_map<size_t, AssignStmtPtr> store_assigns_by_iter_arg_index;
+    struct AggregateUpdate {
+      AssignStmtPtr assign;
+      std::vector<ExprPtr> window_shape;
+      std::vector<ExprPtr> offsets;
+    };
+
+    std::unordered_map<size_t, AggregateUpdate> updates_by_iter_arg_index;
     std::unordered_map<const Var*, ExprPtr> scalar_defs;
     for (const auto& stmt : loop_body_stmts) {
       if (auto assign = As<AssignStmt>(stmt)) {
         auto call = As<Call>(assign->value_);
-        if (call && call->op_->name_ == "tile.store" && call->args_.size() >= 3) {
-          auto out_arg = AsVarLike(call->args_[2]);
-          if (out_arg) {
+        if (call) {
+          const Var* updated_iter_arg = nullptr;
+          std::vector<ExprPtr> window_shape;
+          std::vector<ExprPtr> offsets;
+          if (call->op_->name_ == "tile.store" && call->args_.size() >= 3) {
+            auto out_arg = AsVarLike(call->args_[2]);
+            auto offset_tuple = As<MakeTuple>(call->args_[1]);
+            auto tile_type = As<TileType>(call->args_[0]->GetType());
+            if (out_arg && offset_tuple && tile_type) {
+              updated_iter_arg = out_arg.get();
+              window_shape = tile_type->shape_;
+              offsets = offset_tuple->elements_;
+            }
+          } else if (call->op_->name_ == "tensor.assemble" && call->args_.size() >= 3) {
+            auto parent_arg = AsVarLike(call->args_[0]);
+            auto offset_tuple = As<MakeTuple>(call->args_[2]);
+            auto source_type = As<TensorType>(call->args_[1]->GetType());
+            if (parent_arg && offset_tuple && source_type) {
+              updated_iter_arg = parent_arg.get();
+              window_shape = source_type->shape_;
+              offsets = offset_tuple->elements_;
+            }
+          }
+
+          if (updated_iter_arg) {
             for (const auto& match : loop_matches) {
-              if (out_arg.get() != loop->iter_args_[match.iter_arg_index].get()) continue;
-              if (store_assigns_by_iter_arg_index.count(match.iter_arg_index)) return std::nullopt;
-              store_assigns_by_iter_arg_index.emplace(match.iter_arg_index, assign);
+              if (updated_iter_arg != loop->iter_args_[match.iter_arg_index].get()) continue;
+              if (updates_by_iter_arg_index.count(match.iter_arg_index)) return std::nullopt;
+              updates_by_iter_arg_index.emplace(
+                  match.iter_arg_index, AggregateUpdate{assign, std::move(window_shape), std::move(offsets)});
               goto next_stmt;
             }
           }
@@ -2433,7 +2484,7 @@ class OutWindowExternalizer {
     next_stmt:;
     }
 
-    if (!yield_stmt || store_assigns_by_iter_arg_index.size() != loop_matches.size()) return std::nullopt;
+    if (!yield_stmt || updates_by_iter_arg_index.size() != loop_matches.size()) return std::nullopt;
 
     std::unordered_set<const Var*> allowed;
     for (const auto& param : func->params_) allowed.insert(param.get());
@@ -2443,9 +2494,10 @@ class OutWindowExternalizer {
     analysis.kind = RewriteKind::AggregateWindowLoop;
 
     for (const auto& match : loop_matches) {
-      auto store_it = store_assigns_by_iter_arg_index.find(match.iter_arg_index);
-      if (store_it == store_assigns_by_iter_arg_index.end()) return std::nullopt;
-      auto store_assign = store_it->second;
+      auto update_it = updates_by_iter_arg_index.find(match.iter_arg_index);
+      if (update_it == updates_by_iter_arg_index.end()) return std::nullopt;
+      const auto& update = update_it->second;
+      auto store_assign = update.assign;
 
       auto yielded = AsVarLike(yield_stmt->value_[match.iter_arg_index]);
       if (!yielded || yielded.get() != store_assign->var_.get()) return std::nullopt;
@@ -2463,21 +2515,17 @@ class OutWindowExternalizer {
       size_t store_iter_refs = CountVarRefsInStmt(store_assign, loop->iter_args_[match.iter_arg_index].get());
       if (total_iter_refs != store_iter_refs) return std::nullopt;
 
-      auto store_call = As<Call>(store_assign->value_);
-      auto offsets = As<MakeTuple>(store_call->args_[1]);
-      auto tile_type = As<TileType>(store_call->args_[0]->GetType());
       auto out_tensor_type = As<TensorType>(func->params_[match.out_param_index]->GetType());
-      if (!offsets || !tile_type || !out_tensor_type) return std::nullopt;
-      if (offsets->elements_.size() != tile_type->shape_.size() ||
-          offsets->elements_.size() != out_tensor_type->shape_.size()) {
+      if (!out_tensor_type) return std::nullopt;
+      if (update.offsets.size() != update.window_shape.size() || update.offsets.size() != out_tensor_type->shape_.size()) {
         return std::nullopt;
       }
 
       std::vector<ExprPtr> base_offsets;
       std::vector<ExprPtr> local_offsets;
       std::vector<ExprPtr> window_shape;
-      for (size_t i = 0; i < offsets->elements_.size(); ++i) {
-        auto expanded = ExpandLoopLocalExpr(offsets->elements_[i], scalar_defs);
+      for (size_t i = 0; i < update.offsets.size(); ++i) {
+        auto expanded = ExpandLoopLocalExpr(update.offsets[i], scalar_defs);
         if (!expanded.has_value()) return std::nullopt;
         if (!ExprReferencesOnlyVarsIn(*expanded, allowed)) return std::nullopt;
 
@@ -2488,13 +2536,13 @@ class OutWindowExternalizer {
         if (!min_offset.has_value() || !max_offset.has_value()) return std::nullopt;
 
         auto span_expr = arith::Analyzer().Simplify(
-            MakeAdd(MakeSub(*max_offset, *min_offset, func->span_), tile_type->shape_[i], func->span_));
+            MakeAdd(MakeSub(*max_offset, *min_offset, func->span_), update.window_shape[i], func->span_));
         auto span_ci = As<ConstInt>(span_expr);
         if (!span_ci || span_ci->value_ <= 0) return std::nullopt;
 
         base_offsets.push_back(*min_offset);
         local_offsets.push_back(arith::Analyzer().Simplify(
-            MakeSub(offsets->elements_[i], *min_offset, offsets->elements_[i]->span_)));
+            MakeSub(update.offsets[i], *min_offset, update.offsets[i]->span_)));
         window_shape.push_back(std::make_shared<ConstInt>(span_ci->value_, DataType::INDEX, func->span_));
       }
 
@@ -2747,7 +2795,7 @@ class OutWindowExternalizer {
         new_store_types.emplace(iter_arg.get(), new_return_types[output.return_index]);
       }
 
-      StoreOffsetLocalizer localizer(out_info_by_var, new_out_vars, new_store_types);
+      WindowWriteLocalizer localizer(out_info_by_var, new_out_vars, new_store_types);
       new_body = localizer.VisitStmt(new_body);
     } else {
       std::unordered_map<const Var*, OutputRewriteInfo> out_info_by_var;
@@ -2759,7 +2807,7 @@ class OutWindowExternalizer {
         new_store_types.emplace(new_out.get(), new_out->GetType());
         new_out_vars.emplace(new_out.get(), new_out);
       }
-      StoreOffsetLocalizer localizer(out_info_by_var, new_out_vars, new_store_types);
+      WindowWriteLocalizer localizer(out_info_by_var, new_out_vars, new_store_types);
       new_body = localizer.VisitStmt(new_body);
     }
 
