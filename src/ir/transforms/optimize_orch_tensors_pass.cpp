@@ -11,8 +11,10 @@
 
 #include <cstddef>
 #include <cstdint>
+#include <algorithm>
+#include <any>
+#include <cstdlib>
 #include <memory>
-#include <numeric>
 #include <optional>
 #include <string>
 #include <unordered_map>
@@ -103,7 +105,7 @@ size_t CountVarRefsInStmt(const StmtPtr& stmt, const Var* target) {
    public:
     explicit Counter(const Var* target) : target_(target) {}
 
-    size_t count() const { return count_; }
+    [[nodiscard]] size_t count() const { return count_; }
 
    protected:
     void VisitExpr_(const VarPtr& op) override {
@@ -131,7 +133,7 @@ bool ExprReferencesOnlyVarsIn(const ExprPtr& expr, const std::unordered_set<cons
    public:
     explicit Checker(const std::unordered_set<const Var*>& allowed) : allowed_(allowed) {}
 
-    bool ok() const { return ok_; }
+    [[nodiscard]] bool ok() const { return ok_; }
 
    protected:
     void VisitExpr_(const VarPtr& op) override {
@@ -1809,6 +1811,7 @@ class OutWindowExternalizer {
   struct OutputRewriteInfo {
     size_t out_param_index;
     size_t return_index;
+    std::vector<ExprPtr> parent_shape;
     std::vector<ExprPtr> window_shape;
     std::vector<ExprPtr> callsite_offsets;
     std::vector<ExprPtr> local_store_offsets;
@@ -1909,9 +1912,9 @@ class OutWindowExternalizer {
 
   class OrchRewriter : public IRMutator {
    public:
-    OrchRewriter(const ProgramPtr& program, const AnalysisMap& analyses,
+    OrchRewriter(ProgramPtr program, const AnalysisMap& analyses,
                  const std::unordered_map<std::string, FunctionPtr>& cloned_funcs)
-        : program_(program), analyses_(analyses), cloned_funcs_(cloned_funcs) {}
+        : program_(std::move(program)), analyses_(analyses), cloned_funcs_(cloned_funcs) {}
 
    protected:
     StmtPtr VisitStmt_(const ForStmtPtr& op) override {
@@ -2624,6 +2627,7 @@ class OutWindowExternalizer {
 
       analysis.outputs.push_back(OutputRewriteInfo{match.out_param_index,
                                                    match.return_index,
+                                                   out_tensor_type->shape_,
                                                    std::move(window_shape),
                                                    std::move(base_offsets),
                                                    std::move(local_offsets),
@@ -2692,6 +2696,7 @@ class OutWindowExternalizer {
         analysis.outputs.push_back(
             OutputRewriteInfo{out_index,
                               info->return_index,
+                              out_tensor_type->shape_,
                               info->window_shape,
                               info->offsets,
                               local_zero_offsets,
@@ -2739,7 +2744,9 @@ class OutWindowExternalizer {
           }
           if (!new_view->valid_shape.empty()) new_view->valid_shape = rewrite_it->window_shape;
         } else {
-          new_view = tensor_view_semantics::CanonicalizeView(rewrite_it->window_shape, TensorLayout::ND);
+          auto parent_strides = ComputeRowMajorStrides(rewrite_it->parent_shape);
+          if (parent_strides.empty() || parent_strides.size() != rewrite_it->window_shape.size()) return nullptr;
+          new_view = TensorView(std::move(parent_strides), TensorLayout::ND);
         }
 
         param_type = std::make_shared<TensorType>(rewrite_it->window_shape, out_tensor_type->dtype_,

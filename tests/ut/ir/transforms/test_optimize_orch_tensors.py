@@ -1192,6 +1192,7 @@ class TestOutWindowExternalizer:
 
         printed_windowed = ir.python_print(kv_proj_windowed)
         assert "pl.Tensor[[16, 256], pl.FP32" in printed_windowed
+        assert "pl.TensorView(stride=[512, 1]" in printed_windowed
         assert "pl.tile.store(k_acc, [0, kv0 - ob_chunk * 64]" in printed_windowed
         assert "pl.tile.store(v_acc, [0, kv0 - ob_chunk * 64]" in printed_windowed
 
