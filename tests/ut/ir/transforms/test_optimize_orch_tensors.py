@@ -1100,7 +1100,7 @@ class TestOutWindowExternalizer:
                 tile: pl.Tile[[64, 64], pl.FP32] = pl.load(data, [row_offset, 0], [64, 64])
                 k_next: pl.Tensor[[256, 64], pl.FP32] = pl.store(tile, [row_offset, 0], k_out)
                 passthrough: pl.Tensor[[256, 64], pl.FP32] = v_out
-                v_next: pl.Tensor[[256, 64], pl.FP32] = pl.store(tile, [row_offset, 0], v_out)
+                pl.store(tile, [row_offset, 0], v_out)
                 return k_next, passthrough
 
             @pl.function(type=pl.FunctionType.Orchestration)
