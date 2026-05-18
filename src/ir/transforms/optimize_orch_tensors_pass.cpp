@@ -162,6 +162,35 @@ bool IsAllZeroOffsets(const std::vector<ExprPtr>& offsets) {
   return true;
 }
 
+bool IsTensorAllocationOp(const CallPtr& call) {
+  if (!call || std::dynamic_pointer_cast<const GlobalVar>(call->op_)) return false;
+  return call->op_->name_ == "tensor.create" || call->op_->name_ == "tensor.full";
+}
+
+std::unordered_set<const Var*> CollectLoopLocalTensorAllocs(const ForStmtPtr& loop) {
+  class Collector : public IRVisitor {
+   public:
+    [[nodiscard]] const std::unordered_set<const Var*>& result() const { return result_; }
+
+   protected:
+    void VisitStmt_(const AssignStmtPtr& op) override {
+      auto call = As<Call>(op->value_);
+      if (IsTensorAllocationOp(call) && As<TensorType>(op->var_->GetType())) {
+        result_.insert(op->var_.get());
+      }
+      IRVisitor::VisitStmt_(op);
+    }
+
+   private:
+    std::unordered_set<const Var*> result_;
+  };
+
+  if (!loop) return {};
+  Collector collector;
+  collector.VisitStmt(loop->body_);
+  return collector.result();
+}
+
 std::vector<size_t> CollectOutParamIndices(const FunctionPtr& func) {
   std::vector<size_t> result;
   if (!func) return result;
@@ -1971,10 +2000,22 @@ class OutWindowExternalizer {
 
    protected:
     StmtPtr VisitStmt_(const ForStmtPtr& op) override {
+      auto saved_loop_iter_init_subst = loop_iter_init_subst_;
+      for (const auto& iter_arg : op->iter_args_) {
+        if (iter_arg && iter_arg->initValue_) loop_iter_init_subst_[iter_arg.get()] = iter_arg->initValue_;
+      }
+
       bool is_sequential = op->kind_ != ForKind::Parallel;
-      if (is_sequential) sequential_loops_.push_back(op);
+      if (is_sequential) {
+        sequential_loops_.push_back(op);
+        loop_local_allocs_.emplace_back(CollectLoopLocalTensorAllocs(op));
+      }
       auto result = IRMutator::VisitStmt_(op);
-      if (is_sequential) sequential_loops_.pop_back();
+      if (is_sequential) {
+        loop_local_allocs_.pop_back();
+        sequential_loops_.pop_back();
+      }
+      loop_iter_init_subst_ = std::move(saved_loop_iter_init_subst);
       return result;
     }
 
@@ -2028,6 +2069,11 @@ class OutWindowExternalizer {
 
     struct RewriteBundle {
       std::vector<StmtPtr> stmts;
+    };
+
+    struct LoopDisjointnessCandidate {
+      ForStmtPtr loop;
+      const std::unordered_set<const Var*>* loop_local_allocs = nullptr;
     };
 
     std::optional<RewriteBundle> TryRewriteCall(const AssignStmtPtr& call_assign) {
@@ -2223,10 +2269,13 @@ class OutWindowExternalizer {
     bool ProveCallsiteDisjointness(const AssignStmtPtr& call_assign, const CallPtr& call,
                                    const CalleeRewriteAnalysis& analysis) const {
       if (while_depth_ > 0) return false;
-      std::vector<ForStmtPtr> candidate_loops;
+      std::vector<LoopDisjointnessCandidate> candidate_loops;
       candidate_loops.reserve(sequential_loops_.size());
-      for (const auto& loop : sequential_loops_) {
-        if (loop) candidate_loops.push_back(loop);
+      for (size_t i = 0; i < sequential_loops_.size(); ++i) {
+        const auto& loop = sequential_loops_[i];
+        if (!loop) continue;
+        const auto* local_allocs = i < loop_local_allocs_.size() ? &loop_local_allocs_[i] : nullptr;
+        candidate_loops.push_back(LoopDisjointnessCandidate{loop, local_allocs});
       }
       if (candidate_loops.empty()) return true;
 
@@ -2239,17 +2288,25 @@ class OutWindowExternalizer {
       }
 
       for (const auto& output : analysis.outputs) {
-        if (!ProveOutputDisjoint(candidate_loops, output, callsite_subst)) {
+        if (output.out_param_index >= original_func->params_.size()) return false;
+        if (!ProveOutputDisjoint(candidate_loops, output,
+                                 original_func->params_[output.out_param_index].get(), callsite_subst)) {
           return false;
         }
       }
       return true;
     }
 
-    bool ProveOutputDisjoint(const std::vector<ForStmtPtr>& loops, const OutputRewriteInfo& output,
+    bool ProveOutputDisjoint(const std::vector<LoopDisjointnessCandidate>& loops,
+                             const OutputRewriteInfo& output, const Var* output_param,
                              const std::unordered_map<const Var*, ExprPtr>& callsite_subst) const {
       std::unordered_set<size_t> varying_dims_used;
-      for (const auto& loop : loops) {
+      for (const auto& candidate : loops) {
+        auto loop = candidate.loop;
+        if (IsOutputParentLocalToLoop(output_param, callsite_subst, candidate.loop_local_allocs)) {
+          continue;
+        }
+
         auto trip_count = GetStaticTripCount(loop);
         if (!trip_count.has_value()) return false;
         if (*trip_count <= 1) continue;
@@ -2273,7 +2330,32 @@ class OutWindowExternalizer {
         if (!varying_dim.has_value()) return false;
         varying_dims_used.insert(*varying_dim);
       }
-      return !varying_dims_used.empty();
+      return true;
+    }
+
+    bool IsOutputParentLocalToLoop(const Var* output_param,
+                                   const std::unordered_map<const Var*, ExprPtr>& callsite_subst,
+                                   const std::unordered_set<const Var*>* loop_local_allocs) const {
+      if (!loop_local_allocs || loop_local_allocs->empty()) return false;
+
+      auto subst_it = callsite_subst.find(output_param);
+      if (subst_it == callsite_subst.end()) return false;
+
+      auto parent_expr = ResolveLoopInitExpr(subst_it->second);
+      auto parent_var = AsVarLike(parent_expr);
+      return parent_var && loop_local_allocs->count(parent_var.get());
+    }
+
+    ExprPtr ResolveLoopInitExpr(const ExprPtr& expr) const {
+      ExprPtr current = expr;
+      std::unordered_set<const Var*> seen;
+      while (auto var = AsVarLike(current)) {
+        if (!seen.insert(var.get()).second) break;
+        auto it = loop_iter_init_subst_.find(var.get());
+        if (it == loop_iter_init_subst_.end()) break;
+        current = it->second;
+      }
+      return current;
     }
 
     ExprPtr VisitExpr_(const TupleGetItemExprPtr& op) override {
@@ -2292,6 +2374,8 @@ class OutWindowExternalizer {
     const AnalysisMap& analyses_;
     const std::unordered_map<std::string, FunctionPtr>& cloned_funcs_;
     std::vector<ForStmtPtr> sequential_loops_;
+    std::vector<std::unordered_set<const Var*>> loop_local_allocs_;
+    std::unordered_map<const Var*, ExprPtr> loop_iter_init_subst_;
     std::unordered_map<const Var*, ExprPtr> scalar_defs_;
     std::unordered_map<const Var*, std::vector<ExprPtr>> tuple_result_subst_;
     int while_depth_ = 0;
@@ -2788,8 +2872,9 @@ class OutWindowExternalizer {
           if (!new_view->valid_shape.empty()) new_view->valid_shape = rewrite_it->window_shape;
         } else {
           auto parent_strides = ComputeRowMajorStrides(rewrite_it->parent_shape);
-          if (parent_strides.empty() || parent_strides.size() != rewrite_it->window_shape.size())
+          if (parent_strides.empty() || parent_strides.size() != rewrite_it->window_shape.size()) {
             return nullptr;
+          }
           new_view = TensorView(std::move(parent_strides), TensorLayout::ND);
         }
 
