@@ -968,6 +968,12 @@ class OrchestrationStmtCodegen : public CodegenBase {
       if (AsVarLike(assign->value_) && value_expr == var_name) {
         return;
       }
+      if (auto input_var = AsVarLike(assign->value_)) {
+        auto tid_it = manual_task_id_map_.find(input_var.get());
+        if (tid_it != manual_task_id_map_.end()) {
+          manual_task_id_map_[assign->var_.get()] = tid_it->second;
+        }
+      }
       code_ << Indent() << GetCppType(assign->var_->GetType()) << " " << var_name << " = " << value_expr
             << ";\n";
     }

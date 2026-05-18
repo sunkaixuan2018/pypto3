@@ -4,7 +4,7 @@ Optimizes tensor buffer usage across orchestration and InCore functions by elimi
 
 ## Overview
 
-After `ConvertTensorToTileOps`, orchestration functions allocate output tensors (`tensor.create`) at every InCore call site, even inside loops where the same buffer could be reused. This pass applies three optimization patterns to reduce allocations and improve buffer layout information.
+After `ConvertTensorToTileOps`, orchestration functions allocate output tensors (`tensor.create`) at every InCore call site, even inside loops where the same buffer could be reused. This pass applies five optimization patterns to reduce allocations, improve buffer layout information, and make statically provable local Out-window writes explicit.
 
 **Requirements**:
 
@@ -29,7 +29,7 @@ program_opt = opt_pass(program)
 
 ## Patterns
 
-The pass applies four patterns in sequence. Each pattern sees the results of the previous one.
+The pass applies five patterns in sequence. Each pattern sees the results of the previous one.
 
 ### Pattern 1: Iter-Arg Reuse (IterArgReuseOptimizer)
 
@@ -71,6 +71,30 @@ for i in pl.range(N, init_values=[init_buf]):
 **Problem**: An InCore function contains a `for` loop that accumulates results via `tile.assemble` into an iter-arg, then stores the final result. The `tile.assemble` creates intermediate tile copies each iteration.
 
 **Solution**: Rewrite the loop body to use `tile.store` directly (writing into the `Out` param), initializing the iter-arg from the `Out` param instead of a `tile.create`.
+
+### Pattern 5: Static Out-Window Externalization (OutWindowExternalizer)
+
+**Problem**: An outlined callee may write only a statically provable local window of a large `Out` tensor, but the call site still passes the whole tensor. Downstream dependence analysis then sees a whole-buffer writer and adds unnecessary serialization.
+
+**Solution**: Clone the callee to a `__windowed` variant with narrowed rewritten `Out` parameter types, narrowed rewritten return types, and localized internal `tile.store` offsets. Rewrite the orchestration call site to explicit `slice + __windowed call + assemble`:
+
+```python
+out_window = pl.tensor.slice(out, shape, offset)
+out_window_next = self.kernel__windowed(..., out_window)
+out = pl.tensor.assemble(out, out_window_next, offset)
+```
+
+Supported rewrite shapes:
+
+- `FinalStore`: the callee returns the result of a final `tile.store(...)` into one local window
+- `AggregateWindowLoop`: the callee carries one or more `Out` tensors through a loop and writes a statically provable aggregate window, such as the outlined `kv_proj` group shape
+
+Safety rules:
+
+- only statically provable affine offsets are accepted
+- multi-`Out` rewrite is all-or-nothing
+- sequential-loop siblings are rewritten only when every rewritten `Out` can be proven disjoint across sibling iterations
+- `DeriveCallDirections` keeps its existing sound sequential `Out -> InOut` rule; Pattern 5 only makes disjoint windows explicit before that pass runs
 
 ## Example (Pattern 1)
 
@@ -144,6 +168,7 @@ The `tensor.create` is eliminated; the iter-arg buffer is reused across iteratio
 | `AssembleParentStridesOptimizer` | Pattern 2 — attaches parent strides via TensorView |
 | `SliceInputStridesOptimizer` | Pattern 4 — attaches parent strides to In params via TensorView for slice patterns |
 | `AssembleLoopRewriter` | Pattern 3 — rewrites tile.assemble loops to tile.store loops |
+| `OutWindowExternalizer` | Pattern 5 — rewrites statically provable local Out-window writes to explicit `slice + call + assemble` |
 | `BuildOutParamReturnMappings` | Shared helper — maps Out params to return indices via tile.store |
 | `ComputeRowMajorStrides` | Shared helper — computes row-major strides from a shape |
 
@@ -151,6 +176,6 @@ The `tensor.create` is eliminated; the iter-arg buffer is reused across iteratio
 
 | Function type | Action |
 | ------------- | ------ |
-| InCore | Params/body rewritten (Patterns 1, 3, 4) |
-| Orchestration / Opaque | Call sites rewritten (Patterns 1, 2) |
+| InCore / outlined non-builtin callee | Params/body rewritten (Patterns 1, 3, 4, 5) |
+| Orchestration / Opaque | Call sites rewritten (Patterns 1, 2, 5) |
 | Group | Unchanged |
