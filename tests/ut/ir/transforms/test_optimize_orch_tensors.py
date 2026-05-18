@@ -1254,7 +1254,9 @@ class TestOutWindowExternalizer:
         After = _run_to_optimize_orch_tensors(Before)
 
         printed_main = ir.python_print(After.get_function("main"))
-        assert "result = (" in printed_main
+        assert "pl.Tuple[pl.Tensor[[16, 512], pl.FP32]" in printed_main
+        assert "__assembled_0" in printed_main
+        assert "__assembled_1" in printed_main
         assert "return result" in printed_main
 
     def test_post_outline_kv_descending_loop_aggregate_shape_rewrites(self):
