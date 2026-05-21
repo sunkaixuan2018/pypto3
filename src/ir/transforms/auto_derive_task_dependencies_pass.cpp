@@ -55,13 +55,17 @@ struct AccessRegion {
   std::vector<int64_t> shape;
 };
 
-struct StorageLocation {
+struct StorageAlternative {
   const Var* root = nullptr;
   AccessRegion region;
 };
 
+struct StorageLocation {
+  std::vector<StorageAlternative> alternatives;
+};
+
 struct StorageAccess {
-  StorageLocation location;
+  StorageAlternative location;
   AccessKind kind = AccessKind::Read;
   VarPtr task_id_var;
 };
@@ -71,6 +75,15 @@ bool IsTensorType(const TypePtr& type) { return As<TensorType>(type) != nullptr;
 AccessRegion UnknownRegion() { return AccessRegion{RegionKind::Unknown, {}, {}}; }
 
 AccessRegion FullRegion() { return AccessRegion{RegionKind::Full, {}, {}}; }
+
+StorageLocation UnknownLocation() { return StorageLocation{}; }
+
+StorageLocation SingleLocation(const Var* root, AccessRegion region) {
+  if (!root) return UnknownLocation();
+  return StorageLocation{{StorageAlternative{root, std::move(region)}}};
+}
+
+bool HasLocation(const StorageLocation& location) { return !location.alternatives.empty(); }
 
 std::optional<std::vector<int64_t>> ConstIntTupleValues(const ExprPtr& expr) {
   auto tuple = As<MakeTuple>(expr);
@@ -142,6 +155,52 @@ bool SameRegion(const AccessRegion& lhs, const AccessRegion& rhs) {
   return lhs.kind == rhs.kind && lhs.offsets == rhs.offsets && lhs.shape == rhs.shape;
 }
 
+void AppendAlternativeUnique(std::vector<StorageAlternative>* alternatives, StorageAlternative candidate) {
+  if (!alternatives || !candidate.root) return;
+  for (auto& existing : *alternatives) {
+    if (existing.root != candidate.root) continue;
+    if (!SameRegion(existing.region, candidate.region)) {
+      existing.region = UnknownRegion();
+    }
+    return;
+  }
+  alternatives->push_back(std::move(candidate));
+}
+
+StorageLocation MergeLocations(const StorageLocation& lhs, const StorageLocation& rhs) {
+  StorageLocation merged;
+  for (const auto& alternative : lhs.alternatives) {
+    AppendAlternativeUnique(&merged.alternatives, alternative);
+  }
+  for (const auto& alternative : rhs.alternatives) {
+    AppendAlternativeUnique(&merged.alternatives, alternative);
+  }
+  return merged;
+}
+
+StorageLocation UnknownRegionsFor(const StorageLocation& location) {
+  StorageLocation widened;
+  widened.alternatives.reserve(location.alternatives.size());
+  for (const auto& alternative : location.alternatives) {
+    if (alternative.root) {
+      widened.alternatives.push_back(StorageAlternative{alternative.root, UnknownRegion()});
+    }
+  }
+  return widened;
+}
+
+StorageLocation SliceLocation(const StorageLocation& parent, const ExprPtr& shape_expr,
+                              const ExprPtr& offset_expr) {
+  StorageLocation sliced;
+  sliced.alternatives.reserve(parent.alternatives.size());
+  for (const auto& alternative : parent.alternatives) {
+    AppendAlternativeUnique(
+        &sliced.alternatives,
+        StorageAlternative{alternative.root, SliceRegion(alternative.region, shape_expr, offset_expr)});
+  }
+  return sliced;
+}
+
 bool HasTaskIdTail(const CallPtr& call) {
   auto tuple_ty = As<TupleType>(call ? call->GetType() : TypePtr{});
   if (!tuple_ty || tuple_ty->types_.empty()) return false;
@@ -199,7 +258,7 @@ class StorageRootAnalysis : public IRVisitor {
   void Initialize(const std::vector<VarPtr>& params) {
     for (const auto& param : params) {
       if (param && IsTensorType(param->GetType())) {
-        RegisterVarLocation(param, StorageLocation{param.get(), FullRegion()});
+        RegisterVarLocation(param, SingleLocation(param.get(), FullRegion()));
       }
     }
   }
@@ -233,38 +292,61 @@ class StorageRootAnalysis : public IRVisitor {
       if (i >= then_yield->value_.size() || i >= else_yield->value_.size()) break;
       auto then_location = ResolveExpr(then_yield->value_[i]);
       auto else_location = ResolveExpr(else_yield->value_[i]);
-      if (!then_location.root || then_location.root != else_location.root) continue;
-      if (!SameRegion(then_location.region, else_location.region)) {
-        then_location.region = UnknownRegion();
+      auto merged = MergeLocations(then_location, else_location);
+      if (HasLocation(merged)) {
+        RegisterVarLocation(op->return_vars_[i], std::move(merged));
       }
-      RegisterVarLocation(op->return_vars_[i], std::move(then_location));
     }
   }
 
   void VisitStmt_(const ForStmtPtr& op) override {
+    std::vector<StorageLocation> init_locations;
+    init_locations.reserve(op->iter_args_.size());
     for (size_t i = 0; i < op->iter_args_.size(); ++i) {
       auto location = ResolveExpr(op->iter_args_[i]->initValue_);
-      if (!location.root) continue;
-      RegisterVarLocation(op->iter_args_[i], location);
-      if (i < op->return_vars_.size()) {
-        location.region = UnknownRegion();
-        RegisterVarLocation(op->return_vars_[i], std::move(location));
+      init_locations.push_back(location);
+      if (HasLocation(location)) {
+        RegisterVarLocation(op->iter_args_[i], std::move(location));
       }
     }
     IRVisitor::VisitStmt_(op);
+
+    auto yield = GetTrailingYield(op->body_);
+    for (size_t i = 0; i < op->iter_args_.size() && i < op->return_vars_.size(); ++i) {
+      auto location = init_locations[i];
+      if (yield && i < yield->value_.size()) {
+        location = MergeLocations(location, ResolveExpr(yield->value_[i]));
+      }
+      location = UnknownRegionsFor(location);
+      if (HasLocation(location)) {
+        RegisterVarLocation(op->return_vars_[i], std::move(location));
+      }
+    }
   }
 
   void VisitStmt_(const WhileStmtPtr& op) override {
+    std::vector<StorageLocation> init_locations;
+    init_locations.reserve(op->iter_args_.size());
     for (size_t i = 0; i < op->iter_args_.size(); ++i) {
       auto location = ResolveExpr(op->iter_args_[i]->initValue_);
-      if (!location.root) continue;
-      RegisterVarLocation(op->iter_args_[i], location);
-      if (i < op->return_vars_.size()) {
-        location.region = UnknownRegion();
-        RegisterVarLocation(op->return_vars_[i], std::move(location));
+      init_locations.push_back(location);
+      if (HasLocation(location)) {
+        RegisterVarLocation(op->iter_args_[i], std::move(location));
       }
     }
     IRVisitor::VisitStmt_(op);
+
+    auto yield = GetTrailingYield(op->body_);
+    for (size_t i = 0; i < op->iter_args_.size() && i < op->return_vars_.size(); ++i) {
+      auto location = init_locations[i];
+      if (yield && i < yield->value_.size()) {
+        location = MergeLocations(location, ResolveExpr(yield->value_[i]));
+      }
+      location = UnknownRegionsFor(location);
+      if (HasLocation(location)) {
+        RegisterVarLocation(op->return_vars_[i], std::move(location));
+      }
+    }
   }
 
   void VisitStmt_(const AssignStmtPtr& op) override {
@@ -284,20 +366,18 @@ class StorageRootAnalysis : public IRVisitor {
     if (auto call = As<Call>(op->value_)) {
       const std::string& op_name = call->op_->name_;
       if (op_name == "tensor.create") {
-        RegisterVarLocation(op->var_, StorageLocation{op->var_.get(), FullRegion()});
+        RegisterVarLocation(op->var_, SingleLocation(op->var_.get(), FullRegion()));
       } else if (op_name == "tensor.slice") {
         if (call->args_.size() >= 3) {
           auto parent = ResolveExpr(call->args_[0]);
-          if (parent.root) {
-            RegisterVarLocation(
-                op->var_,
-                StorageLocation{parent.root, SliceRegion(parent.region, call->args_[1], call->args_[2])});
+          if (HasLocation(parent)) {
+            RegisterVarLocation(op->var_, SliceLocation(parent, call->args_[1], call->args_[2]));
           }
         }
       } else if (op_name == "tensor.assemble") {
         if (!call->args_.empty()) {
           auto base = ResolveExpr(call->args_[0]);
-          if (base.root) {
+          if (HasLocation(base)) {
             RegisterVarLocation(op->var_, std::move(base));
           }
         }
@@ -305,7 +385,7 @@ class StorageRootAnalysis : public IRVisitor {
         auto out_locations = CollectCallOutputLocations(call);
         if (As<TupleType>(call->GetType())) {
           tuple_locations_[op->var_.get()] = std::move(out_locations);
-        } else if (!out_locations.empty() && out_locations[0].root) {
+        } else if (!out_locations.empty() && HasLocation(out_locations[0])) {
           RegisterVarLocation(op->var_, std::move(out_locations[0]));
         }
       }
@@ -313,13 +393,14 @@ class StorageRootAnalysis : public IRVisitor {
       if (auto tuple_var = AsVarLike(tuple_get->tuple_)) {
         auto it = tuple_locations_.find(tuple_var.get());
         if (it != tuple_locations_.end() && tuple_get->index_ >= 0 &&
-            tuple_get->index_ < static_cast<int>(it->second.size()) && it->second[tuple_get->index_].root) {
+            tuple_get->index_ < static_cast<int>(it->second.size()) &&
+            HasLocation(it->second[tuple_get->index_])) {
           RegisterVarLocation(op->var_, it->second[tuple_get->index_]);
         }
       }
     } else {
       auto location = ResolveExpr(op->value_);
-      if (location.root) {
+      if (HasLocation(location)) {
         RegisterVarLocation(op->var_, std::move(location));
       }
     }
@@ -342,10 +423,14 @@ class StorageRootAnalysis : public IRVisitor {
   }
 
   void RegisterVarLocation(const VarPtr& var, StorageLocation location) {
-    if (!var || !location.root) return;
+    if (!var || !HasLocation(location)) return;
     locations_[var.get()] = location;
     if (const auto memref = GetShapedMemRef(var->GetType())) {
-      root_memrefs_.try_emplace(location.root, memref);
+      for (const auto& alternative : location.alternatives) {
+        if (alternative.root) {
+          root_memrefs_.try_emplace(alternative.root, memref);
+        }
+      }
     }
   }
 
@@ -423,9 +508,22 @@ class AutoDepMutator : public IRMutator {
     }
 
     prior_stack_.emplace_back();
-    auto out = IRMutator::VisitStmt_(op);
+    fallback_stack_.push_back(false);
+    INTERNAL_CHECK_SPAN(op->body_, op->span_) << "RuntimeScopeStmt has null body";
+    auto new_body = VisitStmt(op->body_);
+    INTERNAL_CHECK_SPAN(new_body, op->span_) << "RuntimeScopeStmt body mutated to null";
+    const bool fallback = fallback_stack_.back();
+    fallback_stack_.pop_back();
     prior_stack_.pop_back();
-    return out;
+    if (fallback) {
+      return std::make_shared<const RuntimeScopeStmt>(false, op->name_hint_, op->body_, op->span_,
+                                                      op->leading_comments_, op->attrs_);
+    }
+    if (new_body.get() != op->body_.get()) {
+      return std::make_shared<const RuntimeScopeStmt>(op->manual_, op->name_hint_, std::move(new_body),
+                                                      op->span_, op->leading_comments_, op->attrs_);
+    }
+    return op;
   }
 
   ExprPtr VisitExpr_(const CallPtr& op) override {
@@ -445,10 +543,10 @@ class AutoDepMutator : public IRMutator {
         if (!storage_ || !storage_->MayAlias(access.location.root, prior.location.root)) continue;
         if (!RegionsMayOverlap(access.location.region, prior.location.region)) continue;
         if (!HasHazard(access.kind, prior.kind)) continue;
-        CHECK(prior.task_id_var)
-            << "manual_scope auto-deps requires a producer TaskId for a prior call that writes storage read "
-            << "or written by call '" << call->op_->name_
-            << "'. Use `out, tid = pl.submit(self.kernel, ...)` for the producer inside manual_scope.";
+        if (!prior.task_id_var) {
+          fallback_stack_.back() = true;
+          return call;
+        }
         if (ContainsVar(user_edges, prior.task_id_var)) continue;
         AppendUnique(&compiler_edges, prior.task_id_var);
       }
@@ -482,7 +580,7 @@ class AutoDepMutator : public IRMutator {
 
     for (size_t i = 0; i < dirs.size(); ++i) {
       auto location = storage_ ? storage_->ResolveExpr(call->args_[i]) : StorageLocation{};
-      if (!location.root) continue;
+      if (!HasLocation(location)) continue;
       std::optional<AccessKind> kind;
       switch (dirs[i]) {
         case ArgDirection::Input:
@@ -500,7 +598,9 @@ class AutoDepMutator : public IRMutator {
           break;
       }
       if (kind.has_value()) {
-        out.push_back(StorageAccess{std::move(location), *kind, nullptr});
+        for (const auto& alternative : location.alternatives) {
+          out.push_back(StorageAccess{alternative, *kind, nullptr});
+        }
       }
     }
     return out;
@@ -510,6 +610,7 @@ class AutoDepMutator : public IRMutator {
   const StorageRootAnalysis* storage_;
   const std::unordered_map<const Call*, VarPtr>* task_id_by_call_;
   std::vector<std::vector<StorageAccess>> prior_stack_;
+  std::vector<bool> fallback_stack_;
 };
 
 }  // namespace

@@ -52,6 +52,18 @@ def _compiler_edges(call: ir.Call) -> list[ir.Var]:
     return list(call.attrs.get("compiler_manual_dep_edges", []))
 
 
+def _runtime_scopes(program: ir.Program) -> list[ir.RuntimeScopeStmt]:
+    scopes: list[ir.RuntimeScopeStmt] = []
+
+    class Collector(ir.IRVisitor):
+        def visit_runtime_scope_stmt(self, op):
+            scopes.append(op)
+            super().visit_runtime_scope_stmt(op)
+
+    Collector().visit_program(program)
+    return scopes
+
+
 def _run_auto_deps(program: ir.Program) -> ir.Program:
     program = passes.derive_call_directions()(program)
     return passes.auto_derive_task_dependencies()(program)
@@ -292,6 +304,75 @@ class TestAutoDeriveTaskDependencies:
         assert len(edges) == 1
         assert edges[0].name_hint == "producer_tid"
 
+    def test_if_yield_different_roots_adds_edges_for_both_possible_producers(self):
+        @pl.program
+        class Prog:
+            @pl.function(type=pl.FunctionType.InCore)
+            def fill(
+                self,
+                out: pl.Out[pl.Tensor[[64], pl.FP32]],
+            ) -> pl.Tensor[[64], pl.FP32]:
+                return out
+
+            @pl.function(type=pl.FunctionType.InCore)
+            def consume(self, x: pl.Tensor[[64], pl.FP32]) -> pl.Tensor[[64], pl.FP32]:
+                return x
+
+            @pl.function(type=pl.FunctionType.Orchestration)
+            def main(
+                self,
+                left: pl.Tensor[[64], pl.FP32],
+                right: pl.Tensor[[64], pl.FP32],
+                cond: pl.Scalar[pl.BOOL],
+            ) -> pl.Tensor[[64], pl.FP32]:
+                with pl.manual_scope():
+                    produced_left, left_tid = pl.submit(self.fill, left)
+                    produced_right, right_tid = pl.submit(self.fill, right)
+                    if cond:
+                        selected = pl.yield_(produced_left)
+                    else:
+                        selected = pl.yield_(produced_right)
+                    out, _ = pl.submit(self.consume, selected)
+                return out
+
+        out = _run_auto_deps(Prog)
+        consume_call = _user_calls(out, "consume")[0]
+        edges = _compiler_edges(consume_call)
+        assert [edge.name_hint for edge in edges] == ["left_tid", "right_tid"]
+
+    def test_loop_yield_different_root_adds_edges_for_init_and_yield_roots(self):
+        @pl.program
+        class Prog:
+            @pl.function(type=pl.FunctionType.InCore)
+            def fill(
+                self,
+                out: pl.Out[pl.Tensor[[64], pl.FP32]],
+            ) -> pl.Tensor[[64], pl.FP32]:
+                return out
+
+            @pl.function(type=pl.FunctionType.InCore)
+            def consume(self, x: pl.Tensor[[64], pl.FP32]) -> pl.Tensor[[64], pl.FP32]:
+                return x
+
+            @pl.function(type=pl.FunctionType.Orchestration)
+            def main(
+                self,
+                left: pl.Tensor[[64], pl.FP32],
+                right: pl.Tensor[[64], pl.FP32],
+            ) -> pl.Tensor[[64], pl.FP32]:
+                with pl.manual_scope():
+                    produced_left, left_tid = pl.submit(self.fill, left)
+                    produced_right, right_tid = pl.submit(self.fill, right)
+                    for _i, (selected_iter,) in pl.range(0, 4, init_values=(produced_left,)):
+                        selected = pl.yield_(produced_right)
+                    out, _ = pl.submit(self.consume, selected)
+                return out
+
+        out = _run_auto_deps(Prog)
+        consume_call = _user_calls(out, "consume")[0]
+        edges = _compiler_edges(consume_call)
+        assert [edge.name_hint for edge in edges] == ["left_tid", "right_tid"]
+
     def test_memref_may_alias_adds_compiler_edge(self):
         @pl.program
         class Prog:
@@ -326,7 +407,7 @@ class TestAutoDeriveTaskDependencies:
         assert len(edges) == 1
         assert edges[0].name_hint == "producer_tid"
 
-    def test_prior_hazard_without_producer_task_id_reports_user_error(self):
+    def test_unencodable_manual_scope_hazard_falls_back_to_auto_scope(self):
         @pl.program
         class Prog:
             @pl.function(type=pl.FunctionType.InCore)
@@ -347,9 +428,12 @@ class TestAutoDeriveTaskDependencies:
                     out, _ = pl.submit(self.consume, produced)
                 return out
 
-        program = passes.derive_call_directions()(Prog)
-        with pytest.raises(ValueError, match="requires a producer TaskId"):
-            passes.auto_derive_task_dependencies()(program)
+        out = _run_auto_deps(Prog)
+        scopes = _runtime_scopes(out)
+        assert len(scopes) == 1
+        assert scopes[0].manual is False
+        consume_call = _user_calls(out, "consume")[0]
+        assert _compiler_edges(consume_call) == []
 
 
 if __name__ == "__main__":
