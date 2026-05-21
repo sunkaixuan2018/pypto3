@@ -925,8 +925,10 @@ class OrchestrationStmtCodegen : public CodegenBase {
         return {};
       };
       tensor_phi_init = find_in_scope_tensor_var(if_stmt->then_body_);
-      if (tensor_phi_init.empty() && if_stmt->else_body_.has_value()) {
-        tensor_phi_init = find_in_scope_tensor_var(*if_stmt->else_body_);
+      if (tensor_phi_init.empty()) {
+        if (StmtPtr else_body = if_stmt->else_body_.value_or(nullptr)) {
+          tensor_phi_init = find_in_scope_tensor_var(else_body);
+        }
       }
     }
 
@@ -1664,6 +1666,8 @@ class OrchestrationStmtCodegen : public CodegenBase {
 
   std::vector<std::string> ResolveAutoDepTaskIds(const CallPtr& call) const {
     std::vector<std::string> deps;
+    if (in_manual_scope_depth_ > 0) return deps;
+    if (HasManualDepEdges(call)) return deps;
     for (const auto& [k, v] : call->attrs_) {
       if (k != kAttrAutoDepProducerVars) continue;
       const auto* producers = std::any_cast<std::vector<VarPtr>>(&v);
@@ -1688,6 +1692,16 @@ class OrchestrationStmtCodegen : public CodegenBase {
       break;
     }
     return deps;
+  }
+
+  static bool HasManualDepEdges(const CallPtr& call) {
+    if (!call) return false;
+    for (const auto& [k, v] : call->attrs_) {
+      if (k != kAttrManualDepEdges) continue;
+      const auto* edges = std::any_cast<std::vector<VarPtr>>(&v);
+      return edges && !edges->empty();
+    }
+    return false;
   }
 
   void EmitAutoDeps(const CallPtr& call, const std::string& task_var) {

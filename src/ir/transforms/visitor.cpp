@@ -79,11 +79,16 @@ void IRVisitor::VisitExpr_(const CallPtr& op) {
     INTERNAL_CHECK_SPAN(op->args_[i], op->span_) << "Call has null argument at index " << i;
     VisitExpr(op->args_[i]);
   }
-  // Var-typed attr ``manual_dep_edges`` references Vars defined elsewhere
-  // in the IR. Treat them as real uses so analyses such as the unused-variable
-  // check don't flag a Var that is referenced only via ``deps=[tid]``.
+  // Var-typed attr ``manual_dep_edges`` references user-visible TaskId Vars
+  // defined elsewhere in the IR. Treat those as real uses so analyses such as
+  // the unused-variable check don't flag a Var referenced only via
+  // ``deps=[tid]``.
+  //
+  // Do not visit ``auto_dep_producer_vars`` here: it is compiler-internal
+  // codegen metadata that can intentionally reference a producer inside an
+  // earlier loop body from a later consumer. Codegen scans it explicitly.
   for (const auto& [k, v] : op->attrs_) {
-    if (k != kAttrManualDepEdges && k != kAttrAutoDepProducerVars) continue;
+    if (k != kAttrManualDepEdges) continue;
     const auto* edges = std::any_cast<std::vector<VarPtr>>(&v);
     if (!edges) continue;
     for (const auto& e : *edges) {
@@ -168,9 +173,9 @@ void IRVisitor::VisitStmt_(const IfStmtPtr& op) {
   VisitExpr(op->condition_);
   INTERNAL_CHECK_SPAN(op->then_body_, op->span_) << "IfStmt has null then_body";
   VisitStmt(op->then_body_);
-  if (op->else_body_.has_value()) {
-    INTERNAL_CHECK_SPAN(*op->else_body_, op->span_) << "IfStmt has null else_body";
-    VisitStmt(*op->else_body_);
+  StmtPtr else_body = op->else_body_.value_or(nullptr);
+  if (else_body) {
+    VisitStmt(else_body);
   }
   for (size_t i = 0; i < op->return_vars_.size(); ++i) {
     INTERNAL_CHECK_SPAN(op->return_vars_[i], op->span_) << "IfStmt has null return_vars at index " << i;
@@ -234,7 +239,7 @@ void IRVisitor::VisitStmt_(const WhileStmtPtr& op) {
 // ``task_id_var`` / ``arg_direction_overrides_vars`` attrs.
 void IRVisitor::VisitScopeAttrs(const ScopeStmtPtr& op) {
   for (const auto& [k, v] : op->attrs_) {
-    if (k == kAttrManualDepEdges || k == kAttrAutoDepProducerVars || k == kAttrArgDirOverrideVars) {
+    if (k == kAttrManualDepEdges || k == kAttrArgDirOverrideVars) {
       const auto* edges = std::any_cast<std::vector<VarPtr>>(&v);
       if (!edges) continue;
       for (const auto& e : *edges) {

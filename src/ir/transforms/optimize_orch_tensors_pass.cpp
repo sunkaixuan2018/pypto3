@@ -2054,6 +2054,14 @@ class OutWindowExternalizer {
       return result;
     }
 
+    StmtPtr VisitStmt_(const RuntimeScopeStmtPtr& op) override {
+      if (!op) return op;
+      if (op->manual_) ++manual_scope_depth_;
+      auto result = IRMutator::VisitStmt_(op);
+      if (op->manual_) --manual_scope_depth_;
+      return result;
+    }
+
     StmtPtr VisitStmt_(const SeqStmtsPtr& op) override {
       std::vector<StmtPtr> new_stmts;
       new_stmts.reserve(op->stmts_.size());
@@ -2238,8 +2246,8 @@ class OutWindowExternalizer {
         AddLoopReturnRoots(while_stmt);
       } else if (auto if_stmt = As<IfStmt>(stmt)) {
         PrecomputeFullBufferRoots(if_stmt->then_body_);
-        if (if_stmt->else_body_.has_value()) {
-          PrecomputeFullBufferRoots(if_stmt->else_body_.value());
+        if (StmtPtr else_body = if_stmt->else_body_.value_or(nullptr)) {
+          PrecomputeFullBufferRoots(else_body);
         }
       } else if (auto scope = As<ScopeStmt>(stmt)) {
         PrecomputeFullBufferRoots(scope->body_);
@@ -2345,8 +2353,8 @@ class OutWindowExternalizer {
         AddFullRootReadsFromStmt(while_stmt->body_, reads);
       } else if (auto if_stmt = As<IfStmt>(stmt)) {
         AddFullRootReadsFromStmt(if_stmt->then_body_, reads);
-        if (if_stmt->else_body_.has_value()) {
-          AddFullRootReadsFromStmt(if_stmt->else_body_.value(), reads);
+        if (StmtPtr else_body = if_stmt->else_body_.value_or(nullptr)) {
+          AddFullRootReadsFromStmt(else_body, reads);
         }
       } else if (auto scope = As<ScopeStmt>(stmt)) {
         AddFullRootReadsFromStmt(scope->body_, reads);
@@ -2356,6 +2364,8 @@ class OutWindowExternalizer {
     std::vector<VarPtr> CollectAutoDepProducers(const CallPtr& call) const {
       std::vector<VarPtr> result;
       if (!call || !program_ || codegen::IsBuiltinOp(call->op_->name_)) return result;
+      if (manual_scope_depth_ > 0) return result;
+      if (HasManualDepEdges(call)) return result;
 
       std::vector<bool> reads(call->args_.size(), false);
       auto arg_dirs = call->GetArgDirections();
@@ -2387,12 +2397,31 @@ class OutWindowExternalizer {
       return result;
     }
 
+    static bool HasManualDepEdges(const CallPtr& call) {
+      if (!call) return false;
+      for (const auto& [k, v] : call->attrs_) {
+        if (k != kAttrManualDepEdges) continue;
+        const auto* edges = std::any_cast<std::vector<VarPtr>>(&v);
+        return edges && !edges->empty();
+      }
+      return false;
+    }
+
     StmtPtr AttachAutoDepProducers(const AssignStmtPtr& assign) const {
       auto call = As<Call>(assign->value_);
       auto producers = CollectAutoDepProducers(call);
       if (producers.empty()) return assign;
 
-      auto attrs = call->attrs_;
+      auto attrs = AddAutoDepProducersToAttrs(call->attrs_, producers);
+      auto new_call =
+          std::make_shared<Call>(call->op_, call->args_, call->kwargs_, attrs, call->GetType(), call->span_);
+      auto new_assign = MutableCopy(assign);
+      new_assign->value_ = new_call;
+      return new_assign;
+    }
+
+    static std::vector<std::pair<std::string, std::any>> AddAutoDepProducersToAttrs(
+        std::vector<std::pair<std::string, std::any>> attrs, const std::vector<VarPtr>& producers) {
       std::vector<VarPtr> merged;
       for (auto& [k, v] : attrs) {
         if (k != kAttrAutoDepProducerVars) continue;
@@ -2410,12 +2439,7 @@ class OutWindowExternalizer {
           merged.push_back(producer);
         }
       }
-      attrs = WithAutoDepProducerVarsAttr(std::move(attrs), std::move(merged));
-      auto new_call =
-          std::make_shared<Call>(call->op_, call->args_, call->kwargs_, attrs, call->GetType(), call->span_);
-      auto new_assign = MutableCopy(assign);
-      new_assign->value_ = new_call;
-      return new_assign;
+      return WithAutoDepProducerVarsAttr(std::move(attrs), std::move(merged));
     }
 
     void RegisterWindowedProducer(const VarPtr& producer_var, const CallPtr& call,
@@ -2512,6 +2536,10 @@ class OutWindowExternalizer {
           result_types.size() == 1 ? result_types[0] : std::make_shared<TupleType>(result_types);
 
       auto new_attrs = RewriteCallAttrs(call, analysis, slices_by_out_index);
+      auto auto_dep_producers = CollectAutoDepProducers(call);
+      if (!auto_dep_producers.empty()) {
+        new_attrs = AddAutoDepProducersToAttrs(std::move(new_attrs), auto_dep_producers);
+      }
       auto new_call = std::make_shared<Call>(cloned_gvar, new_args, call->kwargs_, new_attrs, new_return_type,
                                              call->span_);
       auto tmp_result_var = std::make_shared<Var>(call_assign->var_->name_hint_ + "__windowed",
@@ -2740,6 +2768,7 @@ class OutWindowExternalizer {
     std::unordered_map<const Var*, std::vector<VarPtr>> windowed_producers_by_root_;
     RootSet enclosing_later_full_parent_reads_;
     int while_depth_ = 0;
+    int manual_scope_depth_ = 0;
   };
 
   struct FinalStoreInfo {

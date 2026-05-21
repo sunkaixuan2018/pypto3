@@ -2240,19 +2240,25 @@ class TestTensorReadWriteOffsetCodegen:
                     probe_rv = pl.yield_(probe_next)
                 return probe_rv
 
-        transformed = PassManager.get_strategy(OptimizationStrategy.Default).run_passes(
-            WindowedWriteFullParentReadProgram
-        )
-        code = _generate_orch_code(transformed)
+        from pypto.pypto_core import passes as _core_passes  # noqa: PLC0415
+
+        instruments: list[_core_passes.PassInstrument] = [
+            _core_passes.VerificationInstrument(_core_passes.VerificationMode.BEFORE_AND_AFTER)
+        ]
+        with _core_passes.PassContext(instruments):
+            transformed = PassManager.get_strategy(OptimizationStrategy.Default).run_passes(
+                WindowedWriteFullParentReadProgram
+            )
+            code = _generate_orch_code(transformed)
 
         assert "produce__windowed" in code, code
-        assert re.search(r"params_t0\.add_output\(score_flat__iter_v\d+__window\);", code), code
+        assert "params_t0.add_inout(score_iter);" in code, code
         assert "params_t1.add_input(score_flat)" in code, code
         assert "TaskOutputTensors task_0_outs = rt_submit_aiv_task(0, params_t0);" in code, code
-        dep_array_match = re.search(r"PTO2TaskId\s+(\w+)\[256\];", code)
+        dep_array_match = re.search(r"PTO2TaskId\s+(score_next__auto_deps)\[256\];", code)
         assert dep_array_match, code
         dep_array = dep_array_match.group(1)
-        assert re.search(rf"{dep_array}\[[^\]]+\]\s*=\s*task_0_outs\.task_id\(\);", code), code
+        assert re.search(rf"{dep_array}\[\(\(c0 - 0\) / 8\)\]\s*=\s*task_0_outs\.task_id\(\);", code), code
         assert "PTO2TaskId params_t1_deps[256];" in code, code
         assert re.search(rf"params_t1_deps\[params_t1_deps_count\+\+\]\s*=\s*{dep_array}\[", code), code
         assert "params_t1.set_dependencies(params_t1_deps, params_t1_deps_count);" in code, code
