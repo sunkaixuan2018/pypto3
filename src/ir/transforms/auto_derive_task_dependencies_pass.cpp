@@ -11,6 +11,8 @@
 
 #include <any>
 #include <cstddef>
+#include <cstdint>
+#include <limits>
 #include <memory>
 #include <optional>
 #include <string>
@@ -45,13 +47,100 @@ using ::pypto::codegen::IsBuiltinOp;
 
 enum class AccessKind { Read, Write, ReadWrite };
 
-struct StorageAccess {
+enum class RegionKind { Unknown, Full, Box };
+
+struct AccessRegion {
+  RegionKind kind = RegionKind::Unknown;
+  std::vector<int64_t> offsets;
+  std::vector<int64_t> shape;
+};
+
+struct StorageLocation {
   const Var* root = nullptr;
+  AccessRegion region;
+};
+
+struct StorageAccess {
+  StorageLocation location;
   AccessKind kind = AccessKind::Read;
   VarPtr task_id_var;
 };
 
 bool IsTensorType(const TypePtr& type) { return As<TensorType>(type) != nullptr; }
+
+AccessRegion UnknownRegion() { return AccessRegion{RegionKind::Unknown, {}, {}}; }
+
+AccessRegion FullRegion() { return AccessRegion{RegionKind::Full, {}, {}}; }
+
+std::optional<std::vector<int64_t>> ConstIntTupleValues(const ExprPtr& expr) {
+  auto tuple = As<MakeTuple>(expr);
+  if (!tuple) return std::nullopt;
+
+  std::vector<int64_t> values;
+  values.reserve(tuple->elements_.size());
+  for (const auto& element : tuple->elements_) {
+    auto value = As<ConstInt>(element);
+    if (!value) return std::nullopt;
+    values.push_back(value->value_);
+  }
+  return values;
+}
+
+std::optional<int64_t> AddInt64(int64_t lhs, int64_t rhs) {
+  if ((rhs > 0 && lhs > std::numeric_limits<int64_t>::max() - rhs) ||
+      (rhs < 0 && lhs < std::numeric_limits<int64_t>::min() - rhs)) {
+    return std::nullopt;
+  }
+  return lhs + rhs;
+}
+
+AccessRegion SliceRegion(const AccessRegion& parent, const ExprPtr& shape_expr, const ExprPtr& offset_expr) {
+  auto shape = ConstIntTupleValues(shape_expr);
+  auto offsets = ConstIntTupleValues(offset_expr);
+  if (!shape.has_value() || !offsets.has_value() || shape->size() != offsets->size()) {
+    return UnknownRegion();
+  }
+
+  if (parent.kind == RegionKind::Unknown) {
+    return UnknownRegion();
+  }
+
+  std::vector<int64_t> absolute_offsets;
+  absolute_offsets.reserve(offsets->size());
+  if (parent.kind == RegionKind::Full) {
+    absolute_offsets = *offsets;
+  } else {
+    if (parent.offsets.size() != offsets->size()) return UnknownRegion();
+    for (size_t i = 0; i < offsets->size(); ++i) {
+      auto absolute = AddInt64(parent.offsets[i], (*offsets)[i]);
+      if (!absolute.has_value()) return UnknownRegion();
+      absolute_offsets.push_back(*absolute);
+    }
+  }
+
+  return AccessRegion{RegionKind::Box, std::move(absolute_offsets), std::move(*shape)};
+}
+
+bool RegionsMayOverlap(const AccessRegion& lhs, const AccessRegion& rhs) {
+  if (lhs.kind == RegionKind::Unknown || rhs.kind == RegionKind::Unknown) return true;
+  if (lhs.kind == RegionKind::Full || rhs.kind == RegionKind::Full) return true;
+  if (lhs.offsets.size() != rhs.offsets.size() || lhs.shape.size() != rhs.shape.size() ||
+      lhs.offsets.size() != lhs.shape.size()) {
+    return true;
+  }
+
+  for (size_t i = 0; i < lhs.offsets.size(); ++i) {
+    auto lhs_end = AddInt64(lhs.offsets[i], lhs.shape[i]);
+    auto rhs_end = AddInt64(rhs.offsets[i], rhs.shape[i]);
+    if (!lhs_end.has_value() || !rhs_end.has_value()) return true;
+    if (*lhs_end <= rhs.offsets[i] || *rhs_end <= lhs.offsets[i]) return false;
+  }
+  return true;
+}
+
+bool SameRegion(const AccessRegion& lhs, const AccessRegion& rhs) {
+  return lhs.kind == rhs.kind && lhs.offsets == rhs.offsets && lhs.shape == rhs.shape;
+}
 
 bool HasTaskIdTail(const CallPtr& call) {
   auto tuple_ty = As<TupleType>(call ? call->GetType() : TypePtr{});
@@ -110,16 +199,16 @@ class StorageRootAnalysis : public IRVisitor {
   void Initialize(const std::vector<VarPtr>& params) {
     for (const auto& param : params) {
       if (param && IsTensorType(param->GetType())) {
-        RegisterVarRoot(param, param.get());
+        RegisterVarLocation(param, StorageLocation{param.get(), FullRegion()});
       }
     }
   }
 
-  const Var* ResolveExpr(const ExprPtr& expr) const {
+  StorageLocation ResolveExpr(const ExprPtr& expr) const {
     auto var = AsVarLike(expr);
-    if (!var) return nullptr;
-    auto it = roots_.find(var.get());
-    return it != roots_.end() ? it->second : nullptr;
+    if (!var) return {};
+    auto it = locations_.find(var.get());
+    return it != locations_.end() ? it->second : StorageLocation{};
   }
 
   bool MayAlias(const Var* lhs, const Var* rhs) const {
@@ -142,20 +231,24 @@ class StorageRootAnalysis : public IRVisitor {
 
     for (size_t i = 0; i < op->return_vars_.size(); ++i) {
       if (i >= then_yield->value_.size() || i >= else_yield->value_.size()) break;
-      const Var* then_root = ResolveExpr(then_yield->value_[i]);
-      const Var* else_root = ResolveExpr(else_yield->value_[i]);
-      if (!then_root || then_root != else_root) continue;
-      RegisterVarRoot(op->return_vars_[i], then_root);
+      auto then_location = ResolveExpr(then_yield->value_[i]);
+      auto else_location = ResolveExpr(else_yield->value_[i]);
+      if (!then_location.root || then_location.root != else_location.root) continue;
+      if (!SameRegion(then_location.region, else_location.region)) {
+        then_location.region = UnknownRegion();
+      }
+      RegisterVarLocation(op->return_vars_[i], std::move(then_location));
     }
   }
 
   void VisitStmt_(const ForStmtPtr& op) override {
     for (size_t i = 0; i < op->iter_args_.size(); ++i) {
-      const Var* root = ResolveExpr(op->iter_args_[i]->initValue_);
-      if (!root) continue;
-      RegisterVarRoot(op->iter_args_[i], root);
+      auto location = ResolveExpr(op->iter_args_[i]->initValue_);
+      if (!location.root) continue;
+      RegisterVarLocation(op->iter_args_[i], location);
       if (i < op->return_vars_.size()) {
-        RegisterVarRoot(op->return_vars_[i], root);
+        location.region = UnknownRegion();
+        RegisterVarLocation(op->return_vars_[i], std::move(location));
       }
     }
     IRVisitor::VisitStmt_(op);
@@ -163,11 +256,12 @@ class StorageRootAnalysis : public IRVisitor {
 
   void VisitStmt_(const WhileStmtPtr& op) override {
     for (size_t i = 0; i < op->iter_args_.size(); ++i) {
-      const Var* root = ResolveExpr(op->iter_args_[i]->initValue_);
-      if (!root) continue;
-      RegisterVarRoot(op->iter_args_[i], root);
+      auto location = ResolveExpr(op->iter_args_[i]->initValue_);
+      if (!location.root) continue;
+      RegisterVarLocation(op->iter_args_[i], location);
       if (i < op->return_vars_.size()) {
-        RegisterVarRoot(op->return_vars_[i], root);
+        location.region = UnknownRegion();
+        RegisterVarLocation(op->return_vars_[i], std::move(location));
       }
     }
     IRVisitor::VisitStmt_(op);
@@ -176,7 +270,7 @@ class StorageRootAnalysis : public IRVisitor {
   void VisitStmt_(const AssignStmtPtr& op) override {
     if (auto call = As<Call>(op->value_)) {
       if (As<TupleType>(call->GetType()) && !IsBuiltinOp(call->op_->name_)) {
-        tuple_roots_[op->var_.get()] = CollectCallOutputRoots(call);
+        tuple_locations_[op->var_.get()] = CollectCallOutputLocations(call);
         IRVisitor::VisitStmt_(op);
         return;
       }
@@ -190,37 +284,44 @@ class StorageRootAnalysis : public IRVisitor {
     if (auto call = As<Call>(op->value_)) {
       const std::string& op_name = call->op_->name_;
       if (op_name == "tensor.create") {
-        RegisterVarRoot(op->var_, op->var_.get());
+        RegisterVarLocation(op->var_, StorageLocation{op->var_.get(), FullRegion()});
       } else if (op_name == "tensor.slice") {
-        if (!call->args_.empty()) {
-          if (const Var* root = ResolveExpr(call->args_[0])) {
-            RegisterVarRoot(op->var_, root);
+        if (call->args_.size() >= 3) {
+          auto parent = ResolveExpr(call->args_[0]);
+          if (parent.root) {
+            RegisterVarLocation(
+                op->var_,
+                StorageLocation{parent.root, SliceRegion(parent.region, call->args_[1], call->args_[2])});
           }
         }
       } else if (op_name == "tensor.assemble") {
         if (!call->args_.empty()) {
-          if (const Var* root = ResolveExpr(call->args_[0])) {
-            RegisterVarRoot(op->var_, root);
+          auto base = ResolveExpr(call->args_[0]);
+          if (base.root) {
+            RegisterVarLocation(op->var_, std::move(base));
           }
         }
       } else if (!IsBuiltinOp(op_name)) {
-        auto out_roots = CollectCallOutputRoots(call);
+        auto out_locations = CollectCallOutputLocations(call);
         if (As<TupleType>(call->GetType())) {
-          tuple_roots_[op->var_.get()] = std::move(out_roots);
-        } else if (!out_roots.empty() && out_roots[0]) {
-          RegisterVarRoot(op->var_, out_roots[0]);
+          tuple_locations_[op->var_.get()] = std::move(out_locations);
+        } else if (!out_locations.empty() && out_locations[0].root) {
+          RegisterVarLocation(op->var_, std::move(out_locations[0]));
         }
       }
     } else if (auto tuple_get = As<TupleGetItemExpr>(op->value_)) {
       if (auto tuple_var = AsVarLike(tuple_get->tuple_)) {
-        auto it = tuple_roots_.find(tuple_var.get());
-        if (it != tuple_roots_.end() && tuple_get->index_ >= 0 &&
-            tuple_get->index_ < static_cast<int>(it->second.size()) && it->second[tuple_get->index_]) {
-          RegisterVarRoot(op->var_, it->second[tuple_get->index_]);
+        auto it = tuple_locations_.find(tuple_var.get());
+        if (it != tuple_locations_.end() && tuple_get->index_ >= 0 &&
+            tuple_get->index_ < static_cast<int>(it->second.size()) && it->second[tuple_get->index_].root) {
+          RegisterVarLocation(op->var_, it->second[tuple_get->index_]);
         }
       }
-    } else if (const Var* root = ResolveExpr(op->value_)) {
-      RegisterVarRoot(op->var_, root);
+    } else {
+      auto location = ResolveExpr(op->value_);
+      if (location.root) {
+        RegisterVarLocation(op->var_, std::move(location));
+      }
     }
 
     IRVisitor::VisitStmt_(op);
@@ -240,30 +341,30 @@ class StorageRootAnalysis : public IRVisitor {
     return shaped->memref_.value();
   }
 
-  void RegisterVarRoot(const VarPtr& var, const Var* root) {
-    if (!var || !root) return;
-    roots_[var.get()] = root;
+  void RegisterVarLocation(const VarPtr& var, StorageLocation location) {
+    if (!var || !location.root) return;
+    locations_[var.get()] = location;
     if (const auto memref = GetShapedMemRef(var->GetType())) {
-      root_memrefs_.try_emplace(root, memref);
+      root_memrefs_.try_emplace(location.root, memref);
     }
   }
 
-  std::vector<const Var*> CollectCallOutputRoots(const CallPtr& call) const {
+  std::vector<StorageLocation> CollectCallOutputLocations(const CallPtr& call) const {
     auto callee = program_ ? program_->GetFunction(call->op_->name_) : nullptr;
     if (!callee) return {};
     auto dirs = ResolveCalleeDirections(program_, call, callee);
-    std::vector<const Var*> roots;
+    std::vector<StorageLocation> locations;
     for (size_t i = 0; i < dirs.size() && i < call->args_.size(); ++i) {
       if (dirs[i] != ParamDirection::Out && dirs[i] != ParamDirection::InOut) continue;
-      roots.push_back(ResolveExpr(call->args_[i]));
+      locations.push_back(ResolveExpr(call->args_[i]));
     }
-    return roots;
+    return locations;
   }
 
   ProgramPtr program_;
-  std::unordered_map<const Var*, const Var*> roots_;
+  std::unordered_map<const Var*, StorageLocation> locations_;
   std::unordered_map<const Var*, MemRefPtr> root_memrefs_;
-  std::unordered_map<const Var*, std::vector<const Var*>> tuple_roots_;
+  std::unordered_map<const Var*, std::vector<StorageLocation>> tuple_locations_;
 };
 
 class SubmitTaskIdCollector : public IRVisitor {
@@ -341,7 +442,8 @@ class AutoDepMutator : public IRMutator {
     auto user_edges = GetDepAttr(call, kAttrManualDepEdges);
     for (const auto& access : accesses) {
       for (const auto& prior : prior_stack_.back()) {
-        if (access.root == nullptr || !storage_ || !storage_->MayAlias(access.root, prior.root)) continue;
+        if (!storage_ || !storage_->MayAlias(access.location.root, prior.location.root)) continue;
+        if (!RegionsMayOverlap(access.location.region, prior.location.region)) continue;
         if (!HasHazard(access.kind, prior.kind)) continue;
         CHECK(prior.task_id_var)
             << "manual_scope auto-deps requires a producer TaskId for a prior call that writes storage read "
@@ -379,8 +481,8 @@ class AutoDepMutator : public IRMutator {
     if (dirs.size() != call->args_.size()) return out;
 
     for (size_t i = 0; i < dirs.size(); ++i) {
-      const Var* root = storage_ ? storage_->ResolveExpr(call->args_[i]) : nullptr;
-      if (!root) continue;
+      auto location = storage_ ? storage_->ResolveExpr(call->args_[i]) : StorageLocation{};
+      if (!location.root) continue;
       std::optional<AccessKind> kind;
       switch (dirs[i]) {
         case ArgDirection::Input:
@@ -398,7 +500,7 @@ class AutoDepMutator : public IRMutator {
           break;
       }
       if (kind.has_value()) {
-        out.push_back(StorageAccess{root, *kind, nullptr});
+        out.push_back(StorageAccess{std::move(location), *kind, nullptr});
       }
     }
     return out;

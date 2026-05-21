@@ -26,22 +26,27 @@ OverlapMap behaviour unchanged.
 
 For each function body:
 
-1. Build a conservative storage-root map for tensor Vars. Direct aliases,
-   loop carries, tuple elements, `tensor.slice`, `tensor.assemble`, and
-   cross-function outputs inherit the same root when the root can be traced.
+1. Build a conservative storage-location map for tensor Vars. Direct aliases,
+   loop carries, tuple elements, `tensor.assemble`, and cross-function outputs
+   inherit the same storage root and region when the root can be traced.
 2. Preserve storage lineage through `IfStmt.return_vars` when both branches
-   yield the same traced storage root.
-3. Treat MemRef-backed shaped values as aliases when `MemRef::MayAlias` reports
+   yield the same traced storage root. Matching regions are preserved; differing
+   regions widen to unknown.
+3. Track constant rectangular `tensor.slice` windows as regions relative to the
+   storage root. Slices with symbolic shape or offset fall back to an unknown
+   region and overlap conservatively.
+4. Treat MemRef-backed shaped values as aliases when `MemRef::MayAlias` reports
    the same base allocation with overlapping or symbolic byte ranges.
-4. Collect statically bound producer TaskIds from `pl.submit` tuple tails.
-5. Walk each `RuntimeScopeStmt(manual=true)` in source order, maintaining prior
+5. Collect statically bound producer TaskIds from `pl.submit` tuple tails.
+6. Walk each `RuntimeScopeStmt(manual=true)` in source order, maintaining prior
    accesses for that manual scope only.
-6. For every non-builtin call with resolved `arg_directions`, classify tensor
+7. For every non-builtin call with resolved `arg_directions`, classify tensor
    arguments as read, write, or read-write. Accesses to the same storage root,
-   or to MemRef roots that may alias, are treated as may-overlap.
-7. Add a compiler edge from any prior producer TaskId when RAW, WAR, or WAW
-   hazards exist. Read-read pairs do not produce edges. User-written edges are
-   respected and not duplicated.
+   or to MemRef roots that may alias, are considered for region overlap.
+8. Skip dependency edges for statically proven disjoint regions. Otherwise, add
+   a compiler edge from any prior producer TaskId when RAW, WAR, or WAW hazards
+   exist. Read-read pairs do not produce edges. User-written edges are respected
+   and not duplicated.
 
 If a hazard depends on a prior producer whose TaskId was not statically bound,
 the pass raises a targeted `ValueError` asking the user to submit the producer

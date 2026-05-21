@@ -168,7 +168,7 @@ class TestAutoDeriveTaskDependencies:
         assert [edge.name_hint for edge in user_edges] == ["user_tid"]
         assert [edge.name_hint for edge in compiler_edges] == ["producer_tid"]
 
-    def test_disjoint_slices_are_conservatively_treated_as_overlap(self):
+    def test_static_disjoint_slices_do_not_add_compiler_edge(self):
         @pl.program
         class Prog:
             @pl.function(type=pl.FunctionType.InCore)
@@ -189,6 +189,66 @@ class TestAutoDeriveTaskDependencies:
                     right = scratch[32:64]
                     _produced, producer_tid = pl.submit(self.fill, left)
                     out, _ = pl.submit(self.consume, right)
+                return out
+
+        out = _run_auto_deps(Prog)
+        consume_call = _user_calls(out, "consume")[0]
+        assert _compiler_edges(consume_call) == []
+
+    def test_static_overlapping_slices_add_compiler_edge(self):
+        @pl.program
+        class Prog:
+            @pl.function(type=pl.FunctionType.InCore)
+            def fill(
+                self,
+                out: pl.Out[pl.Tensor[[32], pl.FP32]],
+            ) -> pl.Tensor[[32], pl.FP32]:
+                return out
+
+            @pl.function(type=pl.FunctionType.InCore)
+            def consume(self, x: pl.Tensor[[32], pl.FP32]) -> pl.Tensor[[32], pl.FP32]:
+                return x
+
+            @pl.function(type=pl.FunctionType.Orchestration)
+            def main(self, scratch: pl.Tensor[[64], pl.FP32]) -> pl.Tensor[[32], pl.FP32]:
+                with pl.manual_scope():
+                    left = scratch[0:32]
+                    mid = scratch[16:48]
+                    _produced, producer_tid = pl.submit(self.fill, left)
+                    out, _ = pl.submit(self.consume, mid)
+                return out
+
+        out = _run_auto_deps(Prog)
+        consume_call = _user_calls(out, "consume")[0]
+        edges = _compiler_edges(consume_call)
+        assert len(edges) == 1
+        assert edges[0].name_hint == "producer_tid"
+
+    def test_symbolic_slice_offset_stays_conservative(self):
+        @pl.program
+        class Prog:
+            @pl.function(type=pl.FunctionType.InCore)
+            def fill(
+                self,
+                out: pl.Out[pl.Tensor[[32], pl.FP32]],
+            ) -> pl.Tensor[[32], pl.FP32]:
+                return out
+
+            @pl.function(type=pl.FunctionType.InCore)
+            def consume(self, x: pl.Tensor[[32], pl.FP32]) -> pl.Tensor[[32], pl.FP32]:
+                return x
+
+            @pl.function(type=pl.FunctionType.Orchestration)
+            def main(
+                self,
+                scratch: pl.Tensor[[64], pl.FP32],
+                offset: pl.Scalar[pl.INDEX],
+            ) -> pl.Tensor[[32], pl.FP32]:
+                with pl.manual_scope():
+                    left = scratch[0:32]
+                    dynamic = pl.slice(scratch, [32], [offset])
+                    _produced, producer_tid = pl.submit(self.fill, left)
+                    out, _ = pl.submit(self.consume, dynamic)
                 return out
 
         out = _run_auto_deps(Prog)
