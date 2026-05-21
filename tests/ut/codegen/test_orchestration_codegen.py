@@ -2263,6 +2263,85 @@ class TestTensorReadWriteOffsetCodegen:
         assert re.search(rf"params_t1_deps\[params_t1_deps_count\+\+\]\s*=\s*{dep_array}\[", code), code
         assert "params_t1.set_dependencies(params_t1_deps, params_t1_deps_count);" in code, code
 
+    def test_inner_parallel_windowed_writer_outer_reader_dep_array_is_in_scope(self):
+        """Issue #1444: inner-loop auto-dep arrays must outlive the inner scope."""
+
+        backend.reset_for_testing()
+        backend.set_backend_type(BackendType.Ascend910B)
+
+        ROWS, COLS = 16, 64
+        OUTER, INNER, TILE_C = 2, 4, 16
+
+        @pl.program
+        class NestedWindowedWriteFullParentReadProgram:
+            @pl.function(type=pl.FunctionType.InCore)
+            def produce(
+                self,
+                x: pl.Tensor[[ROWS, COLS], pl.FP32],
+                score: pl.Out[pl.Tensor[[ROWS, COLS], pl.FP32]],
+                row: pl.Scalar[pl.INDEX],
+                col: pl.Scalar[pl.INDEX],
+            ) -> pl.Tensor[[ROWS, COLS], pl.FP32]:
+                tile: pl.Tile[[1, TILE_C], pl.FP32] = pl.tile.load(x, [row, col], [1, TILE_C], [1, TILE_C])
+                ret: pl.Tensor[[ROWS, COLS], pl.FP32] = pl.tile.store(tile, [row, col], score)
+                return ret
+
+            @pl.function(type=pl.FunctionType.InCore)
+            def consume(
+                self,
+                score: pl.Tensor[[ROWS, COLS], pl.FP32],
+                out: pl.Out[pl.Tensor[[ROWS, COLS], pl.FP32]],
+                row: pl.Scalar[pl.INDEX],
+            ) -> pl.Tensor[[ROWS, COLS], pl.FP32]:
+                tile: pl.Tile[[1, COLS], pl.FP32] = pl.tile.load(score, [row, 0], [1, COLS], [1, COLS])
+                ret: pl.Tensor[[ROWS, COLS], pl.FP32] = pl.tile.store(tile, [row, 0], out)
+                return ret
+
+            @pl.function(type=pl.FunctionType.Orchestration)
+            def main(
+                self,
+                x: pl.Tensor[[ROWS, COLS], pl.FP32],
+                score: pl.Out[pl.Tensor[[ROWS, COLS], pl.FP32]],
+                out: pl.Out[pl.Tensor[[ROWS, COLS], pl.FP32]],
+            ) -> pl.Tensor[[ROWS, COLS], pl.FP32]:
+                score_flat: pl.Tensor[[ROWS, COLS], pl.FP32] = pl.reshape(score, [ROWS, COLS])
+                for outer, (score_outer,) in pl.range(OUTER, init_values=(score_flat,)):
+                    row: pl.Scalar[pl.INDEX] = outer
+                    for inner, (score_inner,) in pl.parallel(INNER, init_values=(score_outer,)):
+                        col: pl.Scalar[pl.INDEX] = inner * TILE_C
+                        score_next: pl.Tensor[[ROWS, COLS], pl.FP32] = self.produce(x, score_inner, row, col)
+                        score_inner_rv = pl.yield_(score_next)
+                    score_outer_rv = pl.yield_(score_inner_rv)
+                for row, (out_iter,) in pl.range(OUTER, init_values=(out,)):
+                    out_next: pl.Tensor[[ROWS, COLS], pl.FP32] = self.consume(score_outer_rv, out_iter, row)
+                    out_rv = pl.yield_(out_next)
+                return out_rv
+
+        from pypto.pypto_core import passes as _core_passes  # noqa: PLC0415
+
+        instruments: list[_core_passes.PassInstrument] = [
+            _core_passes.VerificationInstrument(_core_passes.VerificationMode.BEFORE_AND_AFTER)
+        ]
+        with _core_passes.PassContext(instruments):
+            transformed = PassManager.get_strategy(OptimizationStrategy.Default).run_passes(
+                NestedWindowedWriteFullParentReadProgram
+            )
+            code = _generate_orch_code(transformed)
+
+        dep_array_match = re.search(r"PTO2TaskId\s+(score_next__auto_deps\w*)\[8\];", code)
+        assert dep_array_match, code
+        dep_array = dep_array_match.group(1)
+        consumer_deps_pos = code.index("params_t1_deps[params_t1_deps_count++]")
+        dep_decl_pos = code.index(f"PTO2TaskId {dep_array}[8];")
+        inner_scope_pos = code.index("PTO2_SCOPE() {", dep_decl_pos)
+        assert dep_decl_pos < inner_scope_pos < consumer_deps_pos, code
+        assert re.search(rf"{dep_array}\[\(outer \* 4\) \+ inner\]\s*=\s*task_0_outs\.task_id\(\);", code), (
+            code
+        )
+        assert f"params_t1_deps[params_t1_deps_count++] = {dep_array}[0];" in code, code
+        assert f"params_t1_deps[params_t1_deps_count++] = {dep_array}[7];" in code, code
+        assert "params_t1.set_dependencies(params_t1_deps, params_t1_deps_count);" in code, code
+
     def test_group_submit_uses_both_aiv_slots_for_split_vector_kernel(self):
         """Cross-core split inferred from pipe ops should reuse one AIV kernel across both slots."""
         backend.reset_for_testing()

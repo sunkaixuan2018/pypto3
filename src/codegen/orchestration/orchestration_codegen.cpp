@@ -751,43 +751,95 @@ class OrchestrationStmtCodegen : public CodegenBase {
       }
     }
 
-    std::vector<const Var*> auto_dep_capture_in_loop;
+    std::vector<std::pair<const Var*, std::vector<int64_t>>> auto_dep_capture_in_loop;
     if (!auto_dep_capture_vars_.empty()) {
       class CaptureCollector : public IRVisitor {
        public:
-        explicit CaptureCollector(const std::unordered_set<const Var*>& capture_vars)
-            : capture_vars_(capture_vars) {}
+        CaptureCollector(const std::unordered_set<const Var*>& capture_vars, int64_t root_trip_count)
+            : capture_vars_(capture_vars), loop_extents_{root_trip_count} {}
 
-        std::vector<const Var*> vars;
+        std::vector<std::pair<const Var*, std::vector<int64_t>>> vars;
 
        protected:
         void VisitStmt_(const AssignStmtPtr& op) override {
-          if (capture_vars_.count(op->var_.get()) &&
-              std::find(vars.begin(), vars.end(), op->var_.get()) == vars.end()) {
-            vars.push_back(op->var_.get());
+          if (capture_vars_.count(op->var_.get())) {
+            auto existing = std::find_if(vars.begin(), vars.end(),
+                                         [&](const auto& entry) { return entry.first == op->var_.get(); });
+            if (existing == vars.end()) {
+              vars.emplace_back(op->var_.get(), loop_extents_);
+            } else {
+              INTERNAL_CHECK(existing->second == loop_extents_)
+                  << "Internal error: auto dependency producer is assigned under inconsistent loop nests";
+            }
           }
           IRVisitor::VisitStmt_(op);
         }
 
+        void VisitStmt_(const ForStmtPtr& op) override {
+          if (!ContainsCapture(op->body_)) return;
+          auto trip_count = EvalConstTripCount(op);
+          INTERNAL_CHECK_SPAN(trip_count > 0, op->span_)
+              << "Internal error: auto dependency capture across nested loops requires statically-known "
+                 "trip counts";
+          loop_extents_.push_back(trip_count);
+          IRVisitor::VisitStmt_(op);
+          loop_extents_.pop_back();
+        }
+
        private:
+        [[nodiscard]] bool ContainsCapture(const StmtPtr& stmt) const {
+          class Finder : public IRVisitor {
+           public:
+            explicit Finder(const std::unordered_set<const Var*>& capture_vars)
+                : capture_vars_(capture_vars) {}
+
+            bool found = false;
+
+           protected:
+            void VisitStmt_(const AssignStmtPtr& op) override {
+              if (found) return;
+              if (capture_vars_.count(op->var_.get())) {
+                found = true;
+                return;
+              }
+              IRVisitor::VisitStmt_(op);
+            }
+
+           private:
+            const std::unordered_set<const Var*>& capture_vars_;
+          };
+
+          Finder finder(capture_vars_);
+          finder.VisitStmt(stmt);
+          return finder.found;
+        }
+
         const std::unordered_set<const Var*>& capture_vars_;
+        std::vector<int64_t> loop_extents_;
       };
 
-      CaptureCollector collector(auto_dep_capture_vars_);
+      auto trip_count = EvalConstTripCount(for_stmt);
+      INTERNAL_CHECK_SPAN(trip_count > 0, for_stmt->span_)
+          << "Internal error: auto dependency capture across a loop requires a statically-known trip count";
+      CaptureCollector collector(auto_dep_capture_vars_, trip_count);
       collector.VisitStmt(for_stmt->body_);
       auto_dep_capture_in_loop = std::move(collector.vars);
     }
 
     std::vector<std::pair<const Var*, std::string>> auto_dep_arrays_this_loop;
-    if (!auto_dep_capture_in_loop.empty()) {
-      auto trip_count = EvalConstTripCount(for_stmt);
-      INTERNAL_CHECK_SPAN(trip_count > 0, for_stmt->span_)
-          << "Internal error: auto dependency capture across a loop requires a statically-known trip count";
-      for (const Var* var : auto_dep_capture_in_loop) {
+    for (const auto& [var, loop_extents] : auto_dep_capture_in_loop) {
+      if (array_carry_vars_.count(var) > 0) continue;
+      int64_t slot_count = 1;
+      for (int64_t extent : loop_extents) {
+        INTERNAL_CHECK_SPAN(extent > 0, for_stmt->span_)
+            << "Internal error: auto dependency loop extent must be positive";
+        slot_count *= extent;
+      }
+      {
         std::string array_name =
             ReserveSyntheticEmitName(std::string(GetSSABaseName(var->name_hint_)) + "__auto_deps");
-        code_ << Indent() << "PTO2TaskId " << array_name << "[" << trip_count << "];\n";
-        RegisterArrayCarry(var, array_name, trip_count);
+        code_ << Indent() << "PTO2TaskId " << array_name << "[" << slot_count << "];\n";
+        RegisterArrayCarry(var, array_name, slot_count, current_loop_slot_exprs_.size(), loop_extents);
         auto map_it = manual_task_id_map_.find(var);
         INTERNAL_CHECK_SPAN(map_it != manual_task_id_map_.end(), for_stmt->span_)
             << "Internal error: failed to register auto dependency array for loop producer";
@@ -1036,8 +1088,9 @@ class OrchestrationStmtCodegen : public CodegenBase {
           if (array_it != array_carry_vars_.end()) {
             INTERNAL_CHECK_SPAN(!current_loop_slot_exprs_.empty(), assign->span_)
                 << "Internal error: auto dependency array capture requires an enclosing loop slot";
-            code_ << Indent() << array_it->second.array_name << "[" << current_loop_slot_exprs_.back()
-                  << "] = " << task_id_expr << ";\n";
+            code_ << Indent() << array_it->second.array_name << "["
+                  << RenderArrayCarrySlotExpr(array_it->second, assign->span_) << "] = " << task_id_expr
+                  << ";\n";
           } else {
             auto_dep_task_id_exprs_[assign->var_.get()] = task_id_expr;
           }
@@ -2423,17 +2476,50 @@ class OrchestrationStmtCodegen : public CodegenBase {
     return auto_name::ReserveUniqueName(base_name, declared_var_names_);
   }
 
+  /// Records the C++ array allocation backing a TaskId carry that holds an
+  /// array of task ids (not a scalar). Used by ``YieldStmt`` to decide how
+  /// to write into the carry:
+  ///   * Parallel ForStmt rv: yield writes one slot ``arr[<loop_var>] = value``
+  ///   * Sequential ForStmt rv whose body yields an array: yield copies
+  ///     slot-by-slot from the inner array
+  /// The key is either a ``ForStmt`` iter_arg (when used as a deps source) or
+  /// a ``ForStmt`` return_var (when used as a yield target). For each key the
+  /// recorded ``array_name`` is the C++ identifier of the underlying
+  /// ``PTO2TaskId[N]`` array and ``size`` is the slot count ``N``.
+  struct ArrayCarryEntry {
+    std::string array_name;
+    int64_t size;
+    size_t slot_base_depth = 0;
+    std::vector<int64_t> loop_extents;
+  };
+
   /// Register ``var`` as backed by ``array_name[size]``; also populates the
   /// ``manual_task_id_map_`` with the per-slot expressions so EmitManualDeps
   /// emits one ``add_dep`` per slot when this Var appears as a deps source.
-  void RegisterArrayCarry(const Var* var, const std::string& array_name, int64_t size) {
-    array_carry_vars_[var] = ArrayCarryEntry{array_name, size};
+  void RegisterArrayCarry(const Var* var, const std::string& array_name, int64_t size,
+                          size_t slot_base_depth = 0, std::vector<int64_t> loop_extents = {}) {
+    array_carry_vars_[var] = ArrayCarryEntry{array_name, size, slot_base_depth, std::move(loop_extents)};
     std::vector<std::string> slot_names;
     slot_names.reserve(static_cast<size_t>(size));
     for (int64_t i = 0; i < size; ++i) {
       slot_names.push_back(array_name + "[" + std::to_string(i) + "]");
     }
     manual_task_id_map_[var] = std::move(slot_names);
+  }
+
+  std::string RenderArrayCarrySlotExpr(const ArrayCarryEntry& entry, const Span& span) const {
+    if (entry.loop_extents.empty()) {
+      return current_loop_slot_exprs_.back();
+    }
+    INTERNAL_CHECK_SPAN(current_loop_slot_exprs_.size() >= entry.slot_base_depth + entry.loop_extents.size(),
+                        span)
+        << "Internal error: auto dependency array capture is missing an enclosing loop slot";
+    std::string expr = current_loop_slot_exprs_[entry.slot_base_depth];
+    for (size_t i = 1; i < entry.loop_extents.size(); ++i) {
+      expr = "(" + expr + " * " + std::to_string(entry.loop_extents[i]) + ") + " +
+             current_loop_slot_exprs_[entry.slot_base_depth + i];
+    }
+    return expr;
   }
 
   /// Constant-evaluate ``expr`` if it is a ConstInt; returns ``nullopt``
@@ -2549,20 +2635,6 @@ class OrchestrationStmtCodegen : public CodegenBase {
   /// Cleared on entry to each manual scope.
   std::unordered_map<const Var*, std::variant<int, std::string, std::vector<std::string>>>
       manual_task_id_map_;
-  /// Records the C++ array allocation backing a TaskId carry that holds an
-  /// array of task ids (not a scalar). Used by ``YieldStmt`` to decide how
-  /// to write into the carry:
-  ///   * Parallel ForStmt rv: yield writes one slot ``arr[<loop_var>] = value``
-  ///   * Sequential ForStmt rv whose body yields an array: yield copies
-  ///     slot-by-slot from the inner array
-  /// The key is either a ``ForStmt`` iter_arg (when used as a deps source) or
-  /// a ``ForStmt`` return_var (when used as a yield target). For each key the
-  /// recorded ``array_name`` is the C++ identifier of the underlying
-  /// ``PTO2TaskId[N]`` array and ``size`` is the slot count ``N``.
-  struct ArrayCarryEntry {
-    std::string array_name;
-    int64_t size;
-  };
   std::unordered_map<const Var*, ArrayCarryEntry> array_carry_vars_;
   std::unordered_set<const Var*> auto_dep_capture_vars_;
   std::unordered_map<const Var*, std::variant<std::string, std::vector<std::string>>> auto_dep_task_id_exprs_;
