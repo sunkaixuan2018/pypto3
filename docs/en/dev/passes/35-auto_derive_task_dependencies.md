@@ -16,7 +16,10 @@ them immediately before emitting `Arg::set_dependencies(...)`.
 ## Position in the pipeline
 
 ```text
-... -> DeriveCallDirections -> AutoDeriveTaskDependencies -> CollectCommGroups -> Simplify (final)
+... -> DeriveCallDirections
+    -> AutoDeriveTaskDependencies
+    -> CollectCommGroups
+    -> Simplify (final)
 ```
 
 The pass only changes manual runtime scopes. Auto scopes keep the runtime
@@ -52,8 +55,19 @@ For each function body:
    exist. Read-read pairs do not produce edges. User-written edges are respected
    and not duplicated.
 
-If a hazard depends on a prior producer whose TaskId was not statically bound,
-the pass rewrites the whole enclosing `RuntimeScopeStmt` to `manual=false`.
+If dependency-relevant tensor access cannot be represented as bounded static
+roots plus fixed TaskId deps, the pass rewrites the whole enclosing
+`RuntimeScopeStmt` to `manual=false`. Implemented fallback triggers include:
+
+- a required hazard whose prior producer TaskId was not statically bound;
+- a prior producer inside a loop, where one scalar TaskId would not represent
+  the runtime fan-in across all iterations;
+- dynamic gather/scatter-like tensor values whose accessed region depends on
+  runtime indices;
+- root-set lineage that exceeds the pass cap for static alternatives;
+- tensor arguments with read/write directions whose storage location cannot be
+  resolved by the current lineage analysis.
+
 This returns the entire region to runtime OverlapMap/TensorMap tracking instead
 of mixing partial compiler deps with runtime state at manual-scope boundaries.
 
@@ -68,12 +82,15 @@ not call arguments or `arg_directions`.
 
 ## API
 
-| C++ | Python | Level |
-| --- | ------ | ----- |
-| `pass::AutoDeriveTaskDependencies()` | `passes.auto_derive_task_dependencies()` | Program-level |
+- C++: `pass::AutoDeriveTaskDependencies()`
+- Python: `passes.auto_derive_task_dependencies()`
+- Level: program-level
 
 ## References
 
-- Source: [src/ir/transforms/auto_derive_task_dependencies_pass.cpp](../../../../src/ir/transforms/auto_derive_task_dependencies_pass.cpp)
+- Source: [pass source][pass-source]
 - Proposal: [Automatic Task Dependency Derivation](../proposals/auto_task_dependencies.md)
-- Lowering: [Orchestration Code Generation](../codegen/01-orchestration_codegen.md#manual-scope-and-taskid-lowering)
+- Lowering: [Orchestration Code Generation][orchestration-lowering]
+
+[pass-source]: ../../../../src/ir/transforms/auto_derive_task_dependencies_pass.cpp
+[orchestration-lowering]: ../codegen/01-orchestration_codegen.md#manual-scope-and-taskid-lowering

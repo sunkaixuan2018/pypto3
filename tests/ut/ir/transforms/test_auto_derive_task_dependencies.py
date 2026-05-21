@@ -435,6 +435,113 @@ class TestAutoDeriveTaskDependencies:
         consume_call = _user_calls(out, "consume")[0]
         assert _compiler_edges(consume_call) == []
 
+    def test_dynamic_gather_result_falls_back_to_auto_scope(self):
+        @pl.program
+        class Prog:
+            @pl.function(type=pl.FunctionType.InCore)
+            def consume(self, x: pl.Tensor[[4, 8], pl.FP32]) -> pl.Tensor[[4, 8], pl.FP32]:
+                return x
+
+            @pl.function(type=pl.FunctionType.Orchestration)
+            def main(
+                self,
+                src: pl.Tensor[[4, 16], pl.FP32],
+                index: pl.Tensor[[4, 8], pl.INT32],
+            ) -> pl.Tensor[[4, 8], pl.FP32]:
+                with pl.manual_scope():
+                    gathered = pl.tensor.gather(src, -1, index)
+                    out, _ = pl.submit(self.consume, gathered)
+                return out
+
+        out = _run_auto_deps(Prog)
+        scopes = _runtime_scopes(out)
+        assert len(scopes) == 1
+        assert scopes[0].manual is False
+
+    def test_loop_dynamic_fan_in_producer_falls_back_to_auto_scope(self):
+        @pl.program
+        class Prog:
+            @pl.function(type=pl.FunctionType.InCore)
+            def fill(
+                self,
+                out: pl.Out[pl.Tensor[[64], pl.FP32]],
+            ) -> pl.Tensor[[64], pl.FP32]:
+                return out
+
+            @pl.function(type=pl.FunctionType.InCore)
+            def consume(self, x: pl.Tensor[[64], pl.FP32]) -> pl.Tensor[[64], pl.FP32]:
+                return x
+
+            @pl.function(type=pl.FunctionType.Orchestration)
+            def main(self, scratch: pl.Tensor[[64], pl.FP32]) -> pl.Tensor[[64], pl.FP32]:
+                with pl.manual_scope():
+                    for _i in pl.range(0, 4):
+                        _produced, _producer_tid = pl.submit(self.fill, scratch)
+                    out, _ = pl.submit(self.consume, scratch)
+                return out
+
+        out = _run_auto_deps(Prog)
+        scopes = _runtime_scopes(out)
+        assert len(scopes) == 1
+        assert scopes[0].manual is False
+
+    def test_large_control_flow_root_set_falls_back_to_auto_scope(self):
+        @pl.program
+        class Prog:
+            @pl.function(type=pl.FunctionType.InCore)
+            def fill(
+                self,
+                out: pl.Out[pl.Tensor[[64], pl.FP32]],
+            ) -> pl.Tensor[[64], pl.FP32]:
+                return out
+
+            @pl.function(type=pl.FunctionType.InCore)
+            def consume(self, x: pl.Tensor[[64], pl.FP32]) -> pl.Tensor[[64], pl.FP32]:
+                return x
+
+            @pl.function(type=pl.FunctionType.Orchestration)
+            def main(
+                self,
+                t0: pl.Tensor[[64], pl.FP32],
+                t1: pl.Tensor[[64], pl.FP32],
+                t2: pl.Tensor[[64], pl.FP32],
+                t3: pl.Tensor[[64], pl.FP32],
+                t4: pl.Tensor[[64], pl.FP32],
+                c0: pl.Scalar[pl.BOOL],
+                c1: pl.Scalar[pl.BOOL],
+                c2: pl.Scalar[pl.BOOL],
+                c3: pl.Scalar[pl.BOOL],
+            ) -> pl.Tensor[[64], pl.FP32]:
+                with pl.manual_scope():
+                    p0, _tid0 = pl.submit(self.fill, t0)
+                    p1, _tid1 = pl.submit(self.fill, t1)
+                    p2, _tid2 = pl.submit(self.fill, t2)
+                    p3, _tid3 = pl.submit(self.fill, t3)
+                    p4, _tid4 = pl.submit(self.fill, t4)
+                    if c0:
+                        selected_a = pl.yield_(p0)
+                    else:
+                        selected_a = pl.yield_(p1)
+                    if c1:
+                        selected_b = pl.yield_(p2)
+                    else:
+                        selected_b = pl.yield_(p3)
+                    if c2:
+                        selected_c = pl.yield_(selected_a)
+                    else:
+                        selected_c = pl.yield_(selected_b)
+                    if c3:
+                        selected = pl.yield_(selected_c)
+                    else:
+                        selected = pl.yield_(p4)
+                    out, _ = pl.submit(self.consume, selected)
+                return out
+
+        out = _run_auto_deps(Prog)
+        scopes = _runtime_scopes(out)
+        assert len(scopes) == 1
+        assert scopes[0].manual is False
+
 
 if __name__ == "__main__":
     pytest.main([__file__, "-v"])

@@ -49,6 +49,8 @@ enum class AccessKind { Read, Write, ReadWrite };
 
 enum class RegionKind { Unknown, Full, Box };
 
+constexpr size_t kMaxStaticRootAlternatives = 4;
+
 struct AccessRegion {
   RegionKind kind = RegionKind::Unknown;
   std::vector<int64_t> offsets;
@@ -64,10 +66,18 @@ struct StorageLocation {
   std::vector<StorageAlternative> alternatives;
 };
 
+enum class LocationStatus { Unknown, Known, Unsupported };
+
+struct ResolvedLocation {
+  LocationStatus status = LocationStatus::Unknown;
+  StorageLocation location;
+};
+
 struct StorageAccess {
   StorageAlternative location;
   AccessKind kind = AccessKind::Read;
   VarPtr task_id_var;
+  bool dynamic_producer = false;
 };
 
 bool IsTensorType(const TypePtr& type) { return As<TensorType>(type) != nullptr; }
@@ -84,6 +94,13 @@ StorageLocation SingleLocation(const Var* root, AccessRegion region) {
 }
 
 bool HasLocation(const StorageLocation& location) { return !location.alternatives.empty(); }
+
+bool IsDynamicAccessOp(const std::string& op_name) {
+  return op_name == "tensor.gather" || op_name == "tensor.gather_mask" ||
+         op_name == "tensor.gather_compare" || op_name == "tensor.scatter_update" ||
+         op_name == "tile.gather" || op_name == "tile.gather_mask" || op_name == "tile.gather_compare" ||
+         op_name == "tile.scatter_update" || op_name == "tile.mscatter";
+}
 
 std::optional<std::vector<int64_t>> ConstIntTupleValues(const ExprPtr& expr) {
   auto tuple = As<MakeTuple>(expr);
@@ -178,6 +195,10 @@ StorageLocation MergeLocations(const StorageLocation& lhs, const StorageLocation
   return merged;
 }
 
+bool ExceedsRootAlternativeLimit(const StorageLocation& location) {
+  return location.alternatives.size() > kMaxStaticRootAlternatives;
+}
+
 StorageLocation UnknownRegionsFor(const StorageLocation& location) {
   StorageLocation widened;
   widened.alternatives.reserve(location.alternatives.size());
@@ -270,6 +291,20 @@ class StorageRootAnalysis : public IRVisitor {
     return it != locations_.end() ? it->second : StorageLocation{};
   }
 
+  ResolvedLocation ResolveExprStatus(const ExprPtr& expr) const {
+    auto var = AsVarLike(expr);
+    if (!var) return ResolvedLocation{LocationStatus::Unknown, {}};
+    if (unsupported_locations_.count(var.get()) != 0) {
+      return ResolvedLocation{LocationStatus::Unsupported, {}};
+    }
+    auto location = ResolveExpr(expr);
+    if (!HasLocation(location)) return ResolvedLocation{LocationStatus::Unknown, {}};
+    if (ExceedsRootAlternativeLimit(location)) {
+      return ResolvedLocation{LocationStatus::Unsupported, std::move(location)};
+    }
+    return ResolvedLocation{LocationStatus::Known, std::move(location)};
+  }
+
   bool MayAlias(const Var* lhs, const Var* rhs) const {
     if (!lhs || !rhs) return false;
     if (lhs == rhs) return true;
@@ -293,7 +328,9 @@ class StorageRootAnalysis : public IRVisitor {
       auto then_location = ResolveExpr(then_yield->value_[i]);
       auto else_location = ResolveExpr(else_yield->value_[i]);
       auto merged = MergeLocations(then_location, else_location);
-      if (HasLocation(merged)) {
+      if (ExceedsRootAlternativeLimit(merged)) {
+        RegisterUnsupportedLocation(op->return_vars_[i]);
+      } else if (HasLocation(merged)) {
         RegisterVarLocation(op->return_vars_[i], std::move(merged));
       }
     }
@@ -318,7 +355,9 @@ class StorageRootAnalysis : public IRVisitor {
         location = MergeLocations(location, ResolveExpr(yield->value_[i]));
       }
       location = UnknownRegionsFor(location);
-      if (HasLocation(location)) {
+      if (ExceedsRootAlternativeLimit(location)) {
+        RegisterUnsupportedLocation(op->return_vars_[i]);
+      } else if (HasLocation(location)) {
         RegisterVarLocation(op->return_vars_[i], std::move(location));
       }
     }
@@ -343,7 +382,9 @@ class StorageRootAnalysis : public IRVisitor {
         location = MergeLocations(location, ResolveExpr(yield->value_[i]));
       }
       location = UnknownRegionsFor(location);
-      if (HasLocation(location)) {
+      if (ExceedsRootAlternativeLimit(location)) {
+        RegisterUnsupportedLocation(op->return_vars_[i]);
+      } else if (HasLocation(location)) {
         RegisterVarLocation(op->return_vars_[i], std::move(location));
       }
     }
@@ -381,6 +422,8 @@ class StorageRootAnalysis : public IRVisitor {
             RegisterVarLocation(op->var_, std::move(base));
           }
         }
+      } else if (IsDynamicAccessOp(op_name)) {
+        RegisterUnsupportedLocation(op->var_);
       } else if (!IsBuiltinOp(op_name)) {
         auto out_locations = CollectCallOutputLocations(call);
         if (As<TupleType>(call->GetType())) {
@@ -424,6 +467,11 @@ class StorageRootAnalysis : public IRVisitor {
 
   void RegisterVarLocation(const VarPtr& var, StorageLocation location) {
     if (!var || !HasLocation(location)) return;
+    if (ExceedsRootAlternativeLimit(location)) {
+      RegisterUnsupportedLocation(var);
+      return;
+    }
+    unsupported_locations_.erase(var.get());
     locations_[var.get()] = location;
     if (const auto memref = GetShapedMemRef(var->GetType())) {
       for (const auto& alternative : location.alternatives) {
@@ -432,6 +480,12 @@ class StorageRootAnalysis : public IRVisitor {
         }
       }
     }
+  }
+
+  void RegisterUnsupportedLocation(const VarPtr& var) {
+    if (!var) return;
+    locations_.erase(var.get());
+    unsupported_locations_.insert(var.get());
   }
 
   std::vector<StorageLocation> CollectCallOutputLocations(const CallPtr& call) const {
@@ -450,6 +504,7 @@ class StorageRootAnalysis : public IRVisitor {
   std::unordered_map<const Var*, StorageLocation> locations_;
   std::unordered_map<const Var*, MemRefPtr> root_memrefs_;
   std::unordered_map<const Var*, std::vector<StorageLocation>> tuple_locations_;
+  std::unordered_set<const Var*> unsupported_locations_;
 };
 
 class SubmitTaskIdCollector : public IRVisitor {
@@ -502,6 +557,22 @@ class AutoDepMutator : public IRMutator {
       : program_(std::move(program)), storage_(storage), task_id_by_call_(task_id_by_call) {}
 
  protected:
+  StmtPtr VisitStmt_(const ForStmtPtr& op) override {
+    if (prior_stack_.empty()) return IRMutator::VisitStmt_(op);
+    ++loop_depth_;
+    auto result = IRMutator::VisitStmt_(op);
+    --loop_depth_;
+    return result;
+  }
+
+  StmtPtr VisitStmt_(const WhileStmtPtr& op) override {
+    if (prior_stack_.empty()) return IRMutator::VisitStmt_(op);
+    ++loop_depth_;
+    auto result = IRMutator::VisitStmt_(op);
+    --loop_depth_;
+    return result;
+  }
+
   StmtPtr VisitStmt_(const RuntimeScopeStmtPtr& op) override {
     if (!op->manual_) {
       return IRMutator::VisitStmt_(op);
@@ -533,7 +604,12 @@ class AutoDepMutator : public IRMutator {
     if (IsBuiltinOp(call->op_->name_)) return call;
 
     VarPtr task_id = LookupTaskId(op.get());
-    auto accesses = SummarizeAccesses(call);
+    bool needs_fallback = false;
+    auto accesses = SummarizeAccesses(call, &needs_fallback);
+    if (needs_fallback) {
+      fallback_stack_.back() = true;
+      return call;
+    }
     if (accesses.empty()) return call;
 
     std::vector<VarPtr> compiler_edges;
@@ -543,7 +619,7 @@ class AutoDepMutator : public IRMutator {
         if (!storage_ || !storage_->MayAlias(access.location.root, prior.location.root)) continue;
         if (!RegionsMayOverlap(access.location.region, prior.location.region)) continue;
         if (!HasHazard(access.kind, prior.kind)) continue;
-        if (!prior.task_id_var) {
+        if (prior.dynamic_producer || !prior.task_id_var) {
           fallback_stack_.back() = true;
           return call;
         }
@@ -554,6 +630,7 @@ class AutoDepMutator : public IRMutator {
 
     for (auto& access : accesses) {
       access.task_id_var = task_id;
+      access.dynamic_producer = loop_depth_ > 0;
       prior_stack_.back().push_back(std::move(access));
     }
 
@@ -573,14 +650,12 @@ class AutoDepMutator : public IRMutator {
     return it != task_id_by_call_->end() ? it->second : nullptr;
   }
 
-  std::vector<StorageAccess> SummarizeAccesses(const CallPtr& call) const {
+  std::vector<StorageAccess> SummarizeAccesses(const CallPtr& call, bool* needs_fallback) const {
     std::vector<StorageAccess> out;
     auto dirs = call->GetArgDirections();
     if (dirs.size() != call->args_.size()) return out;
 
     for (size_t i = 0; i < dirs.size(); ++i) {
-      auto location = storage_ ? storage_->ResolveExpr(call->args_[i]) : StorageLocation{};
-      if (!HasLocation(location)) continue;
       std::optional<AccessKind> kind;
       switch (dirs[i]) {
         case ArgDirection::Input:
@@ -598,7 +673,12 @@ class AutoDepMutator : public IRMutator {
           break;
       }
       if (kind.has_value()) {
-        for (const auto& alternative : location.alternatives) {
+        auto resolved = storage_ ? storage_->ResolveExprStatus(call->args_[i]) : ResolvedLocation{};
+        if (resolved.status != LocationStatus::Known) {
+          if (needs_fallback) *needs_fallback = true;
+          return {};
+        }
+        for (const auto& alternative : resolved.location.alternatives) {
           out.push_back(StorageAccess{alternative, *kind, nullptr});
         }
       }
@@ -611,6 +691,7 @@ class AutoDepMutator : public IRMutator {
   const std::unordered_map<const Call*, VarPtr>* task_id_by_call_;
   std::vector<std::vector<StorageAccess>> prior_stack_;
   std::vector<bool> fallback_stack_;
+  size_t loop_depth_ = 0;
 };
 
 }  // namespace
