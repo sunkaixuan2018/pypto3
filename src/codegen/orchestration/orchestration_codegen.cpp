@@ -273,6 +273,31 @@ class OrchestrationStmtCodegen : public CodegenBase {
 
   void SetEffectiveUses(std::unordered_set<const Var*> uses) { effective_uses_ = std::move(uses); }
 
+  void AnalyzeAutoDepProducers(const StmtPtr& body) {
+    auto_dep_capture_vars_.clear();
+    class Collector : public IRVisitor {
+     public:
+      std::unordered_set<const Var*> result;
+
+     protected:
+      void VisitExpr_(const CallPtr& op) override {
+        for (const auto& [k, v] : op->attrs_) {
+          if (k != kAttrAutoDepProducerVars) continue;
+          const auto* vars = std::any_cast<std::vector<VarPtr>>(&v);
+          if (!vars) continue;
+          for (const auto& var : *vars) {
+            if (var) result.insert(var.get());
+          }
+        }
+        IRVisitor::VisitExpr_(op);
+      }
+    };
+
+    Collector collector;
+    collector.VisitStmt(body);
+    auto_dep_capture_vars_ = std::move(collector.result);
+  }
+
   std::string GetGeneratedCode() const { return code_.str(); }
   // --- CodegenBase pure virtual implementations ---
   [[nodiscard]] std::string GetCurrentResultTarget() const override { return current_result_var_; }
@@ -726,6 +751,54 @@ class OrchestrationStmtCodegen : public CodegenBase {
       }
     }
 
+    std::vector<const Var*> auto_dep_capture_in_loop;
+    if (!auto_dep_capture_vars_.empty()) {
+      class CaptureCollector : public IRVisitor {
+       public:
+        explicit CaptureCollector(const std::unordered_set<const Var*>& capture_vars)
+            : capture_vars_(capture_vars) {}
+
+        std::vector<const Var*> vars;
+
+       protected:
+        void VisitStmt_(const AssignStmtPtr& op) override {
+          if (capture_vars_.count(op->var_.get()) &&
+              std::find(vars.begin(), vars.end(), op->var_.get()) == vars.end()) {
+            vars.push_back(op->var_.get());
+          }
+          IRVisitor::VisitStmt_(op);
+        }
+
+       private:
+        const std::unordered_set<const Var*>& capture_vars_;
+      };
+
+      CaptureCollector collector(auto_dep_capture_vars_);
+      collector.VisitStmt(for_stmt->body_);
+      auto_dep_capture_in_loop = std::move(collector.vars);
+    }
+
+    std::vector<std::pair<const Var*, std::string>> auto_dep_arrays_this_loop;
+    if (!auto_dep_capture_in_loop.empty()) {
+      auto trip_count = EvalConstTripCount(for_stmt);
+      INTERNAL_CHECK_SPAN(trip_count > 0, for_stmt->span_)
+          << "Internal error: auto dependency capture across a loop requires a statically-known trip count";
+      for (const Var* var : auto_dep_capture_in_loop) {
+        std::string array_name =
+            ReserveSyntheticEmitName(std::string(GetSSABaseName(var->name_hint_)) + "__auto_deps");
+        code_ << Indent() << "PTO2TaskId " << array_name << "[" << trip_count << "];\n";
+        RegisterArrayCarry(var, array_name, trip_count);
+        auto map_it = manual_task_id_map_.find(var);
+        INTERNAL_CHECK_SPAN(map_it != manual_task_id_map_.end(), for_stmt->span_)
+            << "Internal error: failed to register auto dependency array for loop producer";
+        auto* names = std::get_if<std::vector<std::string>>(&map_it->second);
+        INTERNAL_CHECK_SPAN(names != nullptr, for_stmt->span_)
+            << "Internal error: auto dependency loop producer must resolve to an array of TaskIds";
+        auto_dep_task_id_exprs_[var] = *names;
+        auto_dep_arrays_this_loop.emplace_back(var, array_name);
+      }
+    }
+
     code_ << Indent() << "for (int64_t " << loop_var << " = " << start_expr << "; " << loop_var << " < "
           << stop_expr << "; " << loop_var << " += " << step_expr << ") {\n";
     indent_ += 4;
@@ -768,6 +841,9 @@ class OrchestrationStmtCodegen : public CodegenBase {
     current_loop_slot_exprs_.push_back(slot_expr);
     VisitStmt(for_stmt->body_);
     current_loop_slot_exprs_.pop_back();
+    for (const auto& [var, array_name] : auto_dep_arrays_this_loop) {
+      array_carry_vars_.erase(var);
+    }
     current_return_vars_ = saved;
 
     if (emit_implicit_scope) {
@@ -949,7 +1025,21 @@ class OrchestrationStmtCodegen : public CodegenBase {
           result_key = var_name;
         }
         int task_idx_before = task_counter_;
-        GenerateFunctionCallCode(call, result_key);
+        const bool capture_auto_dep = auto_dep_capture_vars_.count(assign->var_.get()) > 0;
+        GenerateFunctionCallCode(call, result_key, capture_auto_dep);
+
+        if (capture_auto_dep) {
+          const std::string task_id_expr = "task_" + std::to_string(task_idx_before) + "_outs.task_id()";
+          auto array_it = array_carry_vars_.find(assign->var_.get());
+          if (array_it != array_carry_vars_.end()) {
+            INTERNAL_CHECK_SPAN(!current_loop_slot_exprs_.empty(), assign->span_)
+                << "Internal error: auto dependency array capture requires an enclosing loop slot";
+            code_ << Indent() << array_it->second.array_name << "[" << current_loop_slot_exprs_.back()
+                  << "] = " << task_id_expr << ";\n";
+          } else {
+            auto_dep_task_id_exprs_[assign->var_.get()] = task_id_expr;
+          }
+        }
 
         if (in_manual_scope_depth_ > 0 && task_counter_ > task_idx_before) {
           // Bind the LHS Var to the just-emitted ``task_<n>`` so a downstream
@@ -1104,7 +1194,7 @@ class OrchestrationStmtCodegen : public CodegenBase {
       if (IsTensorOp(op_name) || IsArrayOp(op_name)) {
         GenerateTensorOpCode(call, "", nullptr);
       } else if (!IsBuiltinOp(op_name)) {
-        GenerateFunctionCallCode(call, "");
+        GenerateFunctionCallCode(call, "", false);
       } else {
         INTERNAL_CHECK_SPAN(false, eval->span_)
             << "Misplaced builtin op '" << op_name
@@ -1572,6 +1662,48 @@ class OrchestrationStmtCodegen : public CodegenBase {
     }
   }
 
+  std::vector<std::string> ResolveAutoDepTaskIds(const CallPtr& call) const {
+    std::vector<std::string> deps;
+    for (const auto& [k, v] : call->attrs_) {
+      if (k != kAttrAutoDepProducerVars) continue;
+      const auto* producers = std::any_cast<std::vector<VarPtr>>(&v);
+      INTERNAL_CHECK_SPAN(producers != nullptr, call->span_)
+          << "Internal error: " << kAttrAutoDepProducerVars << " attr must hold std::vector<VarPtr>";
+      std::unordered_set<std::string> seen;
+      for (const auto& producer : *producers) {
+        if (!producer) continue;
+        auto it = auto_dep_task_id_exprs_.find(producer.get());
+        INTERNAL_CHECK_SPAN(it != auto_dep_task_id_exprs_.end(), call->span_)
+            << "Internal error: auto dependency producer '" << producer->name_hint_
+            << "' has no captured task id";
+        if (auto* scalar = std::get_if<std::string>(&it->second)) {
+          if (seen.insert(*scalar).second) deps.push_back(*scalar);
+        } else {
+          const auto& names = std::get<std::vector<std::string>>(it->second);
+          for (const auto& name : names) {
+            if (seen.insert(name).second) deps.push_back(name);
+          }
+        }
+      }
+      break;
+    }
+    return deps;
+  }
+
+  void EmitAutoDeps(const CallPtr& call, const std::string& task_var) {
+    auto deps = ResolveAutoDepTaskIds(call);
+    if (deps.empty()) return;
+    const std::string deps_arr = task_var + "_deps";
+    const std::string deps_cnt = task_var + "_deps_count";
+    code_ << Indent() << "PTO2TaskId " << deps_arr << "[" << deps.size() << "];\n";
+    code_ << Indent() << "uint32_t " << deps_cnt << " = 0;\n";
+    for (const auto& dep : deps) {
+      code_ << Indent() << "if (" << dep << ".is_valid()) " << deps_arr << "[" << deps_cnt << "++] = " << dep
+            << ";\n";
+    }
+    code_ << Indent() << task_var << ".set_dependencies(" << deps_arr << ", " << deps_cnt << ");\n";
+  }
+
   static constexpr size_t kMaxAllocTensorsArgs = 16;
 
   static bool IsInjectedGMPipeCreateVar(const VarPtr& var) {
@@ -1771,7 +1903,8 @@ class OrchestrationStmtCodegen : public CodegenBase {
     }
   }
 
-  void GenerateFunctionCallCode(const CallPtr& call, const std::string& result_var) {
+  void GenerateFunctionCallCode(const CallPtr& call, const std::string& result_var,
+                                bool capture_auto_dep = false) {
     const std::string& callee_name = call->op_->name_;
 
     FunctionPtr callee_func = program_->GetFunction(callee_name);
@@ -1810,10 +1943,11 @@ class OrchestrationStmtCodegen : public CodegenBase {
     // pointers block) and named ``ext_<outer-arg-name>_ctx``.
     EmitDistTensorCtxScalars(call, callee_func, ind, task_var);
     EmitManualDeps(call, task_var);
+    EmitAutoDeps(call, task_var);
 
     std::string submit_expr =
         CoreTypeToSubmitPrefix(core_type) + std::to_string(func_id) + ", " + task_var + ")";
-    EmitTaskSubmitAndBind(submit_expr, IsSubmitCall(call));
+    EmitTaskSubmitAndBind(submit_expr, IsSubmitCall(call) || capture_auto_dep);
   }
 
   void GenerateSpmdCallCode(const CallPtr& call, const FunctionPtr& spmd_func) {
@@ -2416,6 +2550,8 @@ class OrchestrationStmtCodegen : public CodegenBase {
     int64_t size;
   };
   std::unordered_map<const Var*, ArrayCarryEntry> array_carry_vars_;
+  std::unordered_set<const Var*> auto_dep_capture_vars_;
+  std::unordered_map<const Var*, std::variant<std::string, std::vector<std::string>>> auto_dep_task_id_exprs_;
   /// Names of mutable Tensor values declared in each generated C++ block.
   /// Tuple-output alias emission must avoid redeclaring names already declared
   /// in the same block, but must not treat outer-block declarations as aliases:
@@ -2514,6 +2650,7 @@ OrchestrationResult GenerateOrchestration(const ir::ProgramPtr& program, const i
   stmt_codegen.SetCallToTupleKey(info_collector.call_to_tuple_key);
   stmt_codegen.SetTupleVarToKey(info_collector.tuple_var_to_key);
   stmt_codegen.SetEffectiveUses(std::move(use_collector.var_uses));
+  stmt_codegen.AnalyzeAutoDepProducers(func->body_);
   stmt_codegen.SetInitialIndent(8);
   stmt_codegen.VisitStmt(func->body_);
 

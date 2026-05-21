@@ -83,7 +83,7 @@ void IRVisitor::VisitExpr_(const CallPtr& op) {
   // in the IR. Treat them as real uses so analyses such as the unused-variable
   // check don't flag a Var that is referenced only via ``deps=[tid]``.
   for (const auto& [k, v] : op->attrs_) {
-    if (k != kAttrManualDepEdges) continue;
+    if (k != kAttrManualDepEdges && k != kAttrAutoDepProducerVars) continue;
     const auto* edges = std::any_cast<std::vector<VarPtr>>(&v);
     if (!edges) continue;
     for (const auto& e : *edges) {
@@ -234,7 +234,7 @@ void IRVisitor::VisitStmt_(const WhileStmtPtr& op) {
 // ``task_id_var`` / ``arg_direction_overrides_vars`` attrs.
 void IRVisitor::VisitScopeAttrs(const ScopeStmtPtr& op) {
   for (const auto& [k, v] : op->attrs_) {
-    if (k == kAttrManualDepEdges || k == kAttrArgDirOverrideVars) {
+    if (k == kAttrManualDepEdges || k == kAttrAutoDepProducerVars || k == kAttrArgDirOverrideVars) {
       const auto* edges = std::any_cast<std::vector<VarPtr>>(&v);
       if (!edges) continue;
       for (const auto& e : *edges) {

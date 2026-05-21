@@ -693,9 +693,22 @@ inline std::vector<std::pair<std::string, std::any>> WithArgDirectionOverridesAt
 inline constexpr const char* kAttrManualDepEdges = "manual_dep_edges";
 
 /**
- * @brief Reserved attr key for the producer-TaskId Var captured by a
- * ``with pl.at(...) as tid:`` block.
+ * @brief Compiler-internal explicit producer edges for auto-generated deps
  *
+ * Value type:
+ * ``std::vector<VarPtr>`` where each Var is the LHS of a prior
+ * kernel Call. Unlike ``manual_dep_edges``,
+ * these entries are not user-visible
+ * TaskId Vars; orchestration codegen captures the referenced producer
+ * task id
+ * directly and emits ``Arg::set_dependencies`` for the consumer Call.
+ */
+inline constexpr const char* kAttrAutoDepProducerVars = "auto_dep_producer_vars";
+
+/**
+ * @brief Reserved attr key for the producer-TaskId Var captured by a
+ * ``with pl.at(...) as tid:``
+ * block.
  * Set by the parser as a key on the enclosing ``ScopeStmt``'s ``attrs_``
  * (``InCoreScopeStmt`` / ``AutoInCoreScopeStmt`` / ``HierarchyScopeStmt``).
  * Value type: ``VarPtr`` — a fresh ``Scalar[TASK_ID]`` Var allocated in the
@@ -751,6 +764,18 @@ inline std::vector<std::pair<std::string, std::any>> WithManualDepEdgesAttr(
     }
   }
   attrs.emplace_back(kAttrManualDepEdges, std::move(vars));
+  return attrs;
+}
+
+inline std::vector<std::pair<std::string, std::any>> WithAutoDepProducerVarsAttr(
+    std::vector<std::pair<std::string, std::any>> attrs, std::vector<VarPtr> vars) {
+  for (auto& [k, v] : attrs) {
+    if (k == kAttrAutoDepProducerVars) {
+      v = std::move(vars);
+      return attrs;
+    }
+  }
+  attrs.emplace_back(kAttrAutoDepProducerVars, std::move(vars));
   return attrs;
 }
 

@@ -2093,7 +2093,8 @@ class OutWindowExternalizer {
           continue;
         }
 
-        auto visited = VisitStmt(stmt);
+        auto stmt_to_visit = call_assign ? AttachAutoDepProducers(call_assign) : stmt;
+        auto visited = VisitStmt(stmt_to_visit);
         changed = changed || visited.get() != stmt.get();
         new_stmts.push_back(visited);
 
@@ -2352,16 +2353,83 @@ class OutWindowExternalizer {
       }
     }
 
-    bool HasLaterFullParentReadOfRewrittenOutput(const CallPtr& call,
-                                                 const CalleeRewriteAnalysis& analysis) const {
-      for (const auto& output : analysis.outputs) {
-        if (output.out_param_index >= call->args_.size()) return true;
-        const Var* root = ResolveBufferRoot(call->args_[output.out_param_index]);
-        if (root && enclosing_later_full_parent_reads_.count(root) > 0) {
-          return true;
+    std::vector<VarPtr> CollectAutoDepProducers(const CallPtr& call) const {
+      std::vector<VarPtr> result;
+      if (!call || !program_ || codegen::IsBuiltinOp(call->op_->name_)) return result;
+
+      std::vector<bool> reads(call->args_.size(), false);
+      auto arg_dirs = call->GetArgDirections();
+      if (arg_dirs.size() == call->args_.size()) {
+        for (size_t i = 0; i < arg_dirs.size(); ++i) {
+          reads[i] = arg_dirs[i] == ArgDirection::Input || arg_dirs[i] == ArgDirection::InOut;
+        }
+      } else {
+        auto callee = program_->GetFunction(call->op_->name_);
+        if (!callee) return result;
+        for (size_t i = 0; i < callee->param_directions_.size() && i < call->args_.size(); ++i) {
+          reads[i] = IsReadDirection(callee->param_directions_[i]);
         }
       }
-      return false;
+
+      std::unordered_set<const Var*> seen;
+      for (size_t i = 0; i < call->args_.size(); ++i) {
+        if (!reads[i]) continue;
+        const Var* root = ResolveBufferRoot(call->args_[i]);
+        if (!root) continue;
+        auto producer_it = windowed_producers_by_root_.find(root);
+        if (producer_it == windowed_producers_by_root_.end()) continue;
+        for (const auto& producer : producer_it->second) {
+          if (producer && seen.insert(producer.get()).second) {
+            result.push_back(producer);
+          }
+        }
+      }
+      return result;
+    }
+
+    StmtPtr AttachAutoDepProducers(const AssignStmtPtr& assign) const {
+      auto call = As<Call>(assign->value_);
+      auto producers = CollectAutoDepProducers(call);
+      if (producers.empty()) return assign;
+
+      auto attrs = call->attrs_;
+      std::vector<VarPtr> merged;
+      for (auto& [k, v] : attrs) {
+        if (k != kAttrAutoDepProducerVars) continue;
+        if (auto* existing = std::any_cast<std::vector<VarPtr>>(&v)) {
+          merged = *existing;
+        }
+        break;
+      }
+      std::unordered_set<const Var*> seen;
+      for (const auto& dep : merged) {
+        if (dep) seen.insert(dep.get());
+      }
+      for (const auto& producer : producers) {
+        if (producer && seen.insert(producer.get()).second) {
+          merged.push_back(producer);
+        }
+      }
+      attrs = WithAutoDepProducerVarsAttr(std::move(attrs), std::move(merged));
+      auto new_call =
+          std::make_shared<Call>(call->op_, call->args_, call->kwargs_, attrs, call->GetType(), call->span_);
+      auto new_assign = MutableCopy(assign);
+      new_assign->value_ = new_call;
+      return new_assign;
+    }
+
+    void RegisterWindowedProducer(const VarPtr& producer_var, const CallPtr& call,
+                                  const CalleeRewriteAnalysis& analysis) {
+      if (!producer_var) return;
+      for (const auto& output : analysis.outputs) {
+        if (output.out_param_index >= call->args_.size()) continue;
+        const Var* root = ResolveBufferRoot(call->args_[output.out_param_index]);
+        if (!root) continue;
+        auto& producers = windowed_producers_by_root_[root];
+        if (std::find(producers.begin(), producers.end(), producer_var) == producers.end()) {
+          producers.push_back(producer_var);
+        }
+      }
     }
 
     std::optional<RewriteBundle> TryRewriteCall(const AssignStmtPtr& call_assign) {
@@ -2381,7 +2449,6 @@ class OutWindowExternalizer {
 
       if (analysis.outputs.empty()) return std::nullopt;
       if (!ProveCallsiteDisjointness(call_assign, call, analysis)) return std::nullopt;
-      if (HasLaterFullParentReadOfRewrittenOutput(call, analysis)) return std::nullopt;
 
       std::unordered_map<const Var*, ExprPtr> callsite_subst;
       for (size_t i = 0; i < original_func->params_.size() && i < call->args_.size(); ++i) {
@@ -2450,6 +2517,7 @@ class OutWindowExternalizer {
       auto tmp_result_var = std::make_shared<Var>(call_assign->var_->name_hint_ + "__windowed",
                                                   new_return_type, call_assign->var_->span_);
       stmts.push_back(std::make_shared<AssignStmt>(tmp_result_var, new_call, call_assign->span_));
+      RegisterWindowedProducer(tmp_result_var, call, analysis);
 
       if (!is_submit_call && analysis.outputs.size() == 1 && result_types.size() == 1) {
         const auto& output = analysis.outputs[0];
@@ -2669,6 +2737,7 @@ class OutWindowExternalizer {
     std::unordered_map<const Var*, const Var*> full_buffer_roots_;
     std::unordered_map<const Var*, std::vector<const Var*>> tuple_output_roots_;
     std::unordered_map<const Var*, std::vector<ExprPtr>> tuple_result_subst_;
+    std::unordered_map<const Var*, std::vector<VarPtr>> windowed_producers_by_root_;
     RootSet enclosing_later_full_parent_reads_;
     int while_depth_ = 0;
   };
