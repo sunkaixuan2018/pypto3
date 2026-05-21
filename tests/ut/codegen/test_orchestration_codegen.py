@@ -2186,6 +2186,74 @@ class TestTensorReadWriteOffsetCodegen:
             for name in rv_carry_names
         ), code
 
+    def test_windowed_writer_before_full_parent_reader_stays_unwindowed(self):
+        """Issue #1444: window writes followed by full-parent reads must not be externalized.
+
+        The unsafe codegen shape is:
+            producer writes score_flat.view(...) with add_output/add_inout
+            later consumer reads score_flat with add_input
+            no explicit set_dependencies edge bridges view -> parent
+
+        Until runtime/codegen has a generic root-aware dependency bridge,
+        OutWindowExternalizer must keep this producer unwindowed so auto deps
+        operate on the same parent Tensor object.
+        """
+
+        backend.reset_for_testing()
+        backend.set_backend_type(BackendType.Ascend910B)
+
+        N, M, W = 64, 2048, 8
+
+        @pl.program
+        class WindowedWriteFullParentReadProgram:
+            @pl.function(type=pl.FunctionType.InCore)
+            def produce(
+                self,
+                x: pl.Tensor[[N, M], pl.FP32],
+                score: pl.Out[pl.Tensor[[N, M], pl.FP32]],
+                col: pl.Scalar[pl.INDEX],
+            ) -> pl.Tensor[[N, M], pl.FP32]:
+                tile: pl.Tile[[N, W], pl.FP32] = pl.tile.load(x, [0, col], [N, W], [N, W])
+                ret: pl.Tensor[[N, M], pl.FP32] = pl.tile.store(tile, [0, col], score)
+                return ret
+
+            @pl.function(type=pl.FunctionType.InCore)
+            def consume(
+                self,
+                score: pl.Tensor[[N, M], pl.FP32],
+                probe: pl.Out[pl.Tensor[[N, M], pl.FP32]],
+                row: pl.Scalar[pl.INDEX],
+            ) -> pl.Tensor[[N, M], pl.FP32]:
+                tile: pl.Tile[[1, M], pl.FP32] = pl.tile.load(score, [row, 0], [1, M], [1, M])
+                ret: pl.Tensor[[N, M], pl.FP32] = pl.tile.store(tile, [row, 0], probe)
+                return ret
+
+            @pl.function(type=pl.FunctionType.Orchestration)
+            def main(
+                self,
+                x: pl.Tensor[[N, M], pl.FP32],
+                score: pl.Out[pl.Tensor[[N, M], pl.FP32]],
+                probe: pl.Out[pl.Tensor[[N, M], pl.FP32]],
+            ) -> pl.Tensor[[N, M], pl.FP32]:
+                score_flat: pl.Tensor[[N, M], pl.FP32] = pl.reshape(score, [N, M])
+                for c0, (score_iter,) in pl.range(0, M, W, init_values=(score_flat,)):
+                    score_next: pl.Tensor[[N, M], pl.FP32] = self.produce(x, score_iter, c0)
+                    score_rv = pl.yield_(score_next)
+                for r, (probe_iter,) in pl.range(N, init_values=(probe,)):
+                    probe_next: pl.Tensor[[N, M], pl.FP32] = self.consume(score_rv, probe_iter, r)
+                    probe_rv = pl.yield_(probe_next)
+                return probe_rv
+
+        transformed = PassManager.get_strategy(OptimizationStrategy.Default).run_passes(
+            WindowedWriteFullParentReadProgram
+        )
+        code = _generate_orch_code(transformed)
+
+        assert "produce__windowed" not in code, code
+        assert "params_t0.add_inout(score_flat)" in code, code
+        assert "params_t1.add_input(score_flat)" in code, code
+        assert "score_flat.view(" not in code, code
+
     def test_group_submit_uses_both_aiv_slots_for_split_vector_kernel(self):
         """Cross-core split inferred from pipe ops should reuse one AIV kernel across both slots."""
         backend.reset_for_testing()

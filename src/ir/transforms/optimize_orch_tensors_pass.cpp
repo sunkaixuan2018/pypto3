@@ -1818,7 +1818,7 @@ class OutWindowExternalizer {
     bool changed = false;
     for (auto& func : new_functions) {
       if (!func || func->func_type_ != FunctionType::Orchestration) continue;
-      OrchRewriter rewriter(program, analyses, cloned_funcs);
+      OrchRewriter rewriter(program, analyses, cloned_funcs, func);
       auto new_body = rewriter.VisitStmt(func->body_);
       if (new_body.get() == func->body_.get()) continue;
       changed = true;
@@ -1994,15 +1994,32 @@ class OutWindowExternalizer {
 
   class OrchRewriter : public IRMutator {
    public:
+    using RootSet = std::unordered_set<const Var*>;
+
     OrchRewriter(ProgramPtr program, const AnalysisMap& analyses,
-                 const std::unordered_map<std::string, FunctionPtr>& cloned_funcs)
-        : program_(std::move(program)), analyses_(analyses), cloned_funcs_(cloned_funcs) {}
+                 const std::unordered_map<std::string, FunctionPtr>& cloned_funcs,
+                 const FunctionPtr& current_func)
+        : program_(std::move(program)), analyses_(analyses), cloned_funcs_(cloned_funcs) {
+      if (current_func) {
+        for (const auto& param : current_func->params_) {
+          if (param && AsTensorTypeLike(param->GetType())) {
+            full_buffer_roots_[param.get()] = param.get();
+          }
+        }
+        PrecomputeFullBufferRoots(current_func->body_);
+      }
+    }
 
    protected:
     StmtPtr VisitStmt_(const ForStmtPtr& op) override {
       auto saved_loop_iter_init_subst = loop_iter_init_subst_;
       for (const auto& iter_arg : op->iter_args_) {
         if (iter_arg && iter_arg->initValue_) loop_iter_init_subst_[iter_arg.get()] = iter_arg->initValue_;
+        if (iter_arg && iter_arg->initValue_) {
+          if (const Var* root = ResolveBufferRoot(iter_arg->initValue_)) {
+            full_buffer_roots_[iter_arg.get()] = root;
+          }
+        }
       }
 
       bool is_sequential = op->kind_ != ForKind::Parallel;
@@ -2015,14 +2032,25 @@ class OutWindowExternalizer {
         loop_local_allocs_.pop_back();
         sequential_loops_.pop_back();
       }
+      auto visited_loop = As<ForStmt>(result);
+      AddLoopReturnRoots(visited_loop ? visited_loop : op);
       loop_iter_init_subst_ = std::move(saved_loop_iter_init_subst);
       return result;
     }
 
     StmtPtr VisitStmt_(const WhileStmtPtr& op) override {
+      for (const auto& iter_arg : op->iter_args_) {
+        if (iter_arg && iter_arg->initValue_) {
+          if (const Var* root = ResolveBufferRoot(iter_arg->initValue_)) {
+            full_buffer_roots_[iter_arg.get()] = root;
+          }
+        }
+      }
       ++while_depth_;
       auto result = IRMutator::VisitStmt_(op);
       --while_depth_;
+      auto visited_loop = As<WhileStmt>(result);
+      AddLoopReturnRoots(visited_loop ? visited_loop : op);
       return result;
     }
 
@@ -2033,14 +2061,35 @@ class OutWindowExternalizer {
       auto saved_scalar_defs = scalar_defs_;
       auto saved_tuple_result_subst = tuple_result_subst_;
 
+      RootSet later_reads = enclosing_later_full_parent_reads_;
+      std::unordered_map<const Stmt*, RootSet> later_reads_by_stmt;
+      later_reads_by_stmt.reserve(op->stmts_.size());
+      for (auto stmt_it = op->stmts_.rbegin(); stmt_it != op->stmts_.rend(); ++stmt_it) {
+        later_reads_by_stmt.emplace(stmt_it->get(), later_reads);
+        AddFullRootReadsFromStmt(*stmt_it, later_reads);
+      }
+
       for (const auto& stmt : op->stmts_) {
+        auto saved_enclosing_reads = enclosing_later_full_parent_reads_;
+        auto later_it = later_reads_by_stmt.find(stmt.get());
+        enclosing_later_full_parent_reads_ =
+            later_it != later_reads_by_stmt.end() ? later_it->second : saved_enclosing_reads;
+
         auto call_assign = As<AssignStmt>(stmt);
         auto bundle = call_assign ? TryRewriteCall(call_assign) : std::nullopt;
         if (bundle.has_value()) {
           changed = true;
           for (const auto& new_stmt : bundle->stmts) {
-            new_stmts.push_back(VisitStmt(new_stmt));
+            auto visited = VisitStmt(new_stmt);
+            if (auto visited_assign = As<AssignStmt>(visited)) {
+              AddFullBufferRootForAssign(visited_assign);
+              if (As<ScalarType>(visited_assign->var_->GetType())) {
+                scalar_defs_[visited_assign->var_.get()] = visited_assign->value_;
+              }
+            }
+            new_stmts.push_back(visited);
           }
+          enclosing_later_full_parent_reads_ = std::move(saved_enclosing_reads);
           continue;
         }
 
@@ -2049,9 +2098,11 @@ class OutWindowExternalizer {
         new_stmts.push_back(visited);
 
         auto visited_assign = As<AssignStmt>(visited);
+        if (visited_assign) AddFullBufferRootForAssign(visited_assign);
         if (visited_assign && As<ScalarType>(visited_assign->var_->GetType())) {
           scalar_defs_[visited_assign->var_.get()] = visited_assign->value_;
         }
+        enclosing_later_full_parent_reads_ = std::move(saved_enclosing_reads);
       }
 
       scalar_defs_ = std::move(saved_scalar_defs);
@@ -2076,6 +2127,243 @@ class OutWindowExternalizer {
       const std::unordered_set<const Var*>* loop_local_allocs = nullptr;
     };
 
+    static bool IsTensorTypedExpr(const ExprPtr& expr) {
+      return expr && AsTensorTypeLike(expr->GetType()) != nullptr;
+    }
+
+    const Var* ResolveBufferRoot(const ExprPtr& expr) const {
+      auto current = ResolveLoopInitExpr(expr);
+      auto var = AsVarLike(current);
+      if (!var) return nullptr;
+      return ResolveBufferRoot(var.get());
+    }
+
+    const Var* ResolveBufferRoot(const Var* var) const {
+      const Var* current = var;
+      std::unordered_set<const Var*> seen;
+      while (current && seen.insert(current).second) {
+        auto it = full_buffer_roots_.find(current);
+        if (it == full_buffer_roots_.end()) return nullptr;
+        if (it->second == current) return current;
+        current = it->second;
+      }
+      return current;
+    }
+
+    bool IsFullRootExpr(const ExprPtr& expr) const {
+      auto current = ResolveLoopInitExpr(expr);
+      auto var = AsVarLike(current);
+      return var && full_buffer_roots_.count(var.get()) > 0 && ResolveBufferRoot(var.get()) != nullptr;
+    }
+
+    static bool IsReadDirection(ParamDirection direction) {
+      return direction == ParamDirection::In || direction == ParamDirection::InOut;
+    }
+
+    void AddFullBufferRootForAssign(const AssignStmtPtr& assign) {
+      if (!assign) return;
+      if (auto call = As<Call>(assign->value_)) {
+        const auto& op_name = call->op_->name_;
+        if ((op_name == "tensor.reshape" || op_name == "tensor.assemble") && !call->args_.empty()) {
+          if (const Var* root = ResolveBufferRoot(call->args_[0])) {
+            full_buffer_roots_[assign->var_.get()] = root;
+          }
+        } else if (op_name == "tensor.create") {
+          full_buffer_roots_[assign->var_.get()] = assign->var_.get();
+        } else if (!codegen::IsBuiltinOp(op_name)) {
+          AddCallOutputRoots(assign, call);
+        }
+      } else if (auto tuple_get = As<TupleGetItemExpr>(assign->value_)) {
+        AddTupleGetItemRoot(assign, tuple_get);
+      } else if (auto src_var = AsVarLike(assign->value_)) {
+        if (const Var* root = ResolveBufferRoot(src_var.get())) {
+          full_buffer_roots_[assign->var_.get()] = root;
+        }
+      } else if (auto tuple = As<MakeTuple>(assign->value_)) {
+        std::vector<const Var*> roots;
+        roots.reserve(tuple->elements_.size());
+        for (const auto& element : tuple->elements_) {
+          roots.push_back(IsTensorTypedExpr(element) ? ResolveBufferRoot(element) : nullptr);
+        }
+        tuple_output_roots_[assign->var_.get()] = std::move(roots);
+      }
+    }
+
+    void AddCallOutputRoots(const AssignStmtPtr& assign, const CallPtr& call) {
+      auto callee = program_ ? program_->GetFunction(call->op_->name_) : nullptr;
+      if (!callee) return;
+
+      std::vector<const Var*> roots;
+      for (size_t i = 0; i < callee->param_directions_.size() && i < call->args_.size(); ++i) {
+        if (callee->param_directions_[i] != ParamDirection::Out &&
+            callee->param_directions_[i] != ParamDirection::InOut) {
+          continue;
+        }
+        roots.push_back(ResolveBufferRoot(call->args_[i]));
+      }
+
+      if (As<TupleType>(call->GetType())) {
+        tuple_output_roots_[assign->var_.get()] = std::move(roots);
+      } else if (!roots.empty() && roots[0]) {
+        full_buffer_roots_[assign->var_.get()] = roots[0];
+      }
+    }
+
+    void PrecomputeFullBufferRoots(const StmtPtr& stmt) {
+      if (!stmt) return;
+      if (auto seq = As<SeqStmts>(stmt)) {
+        for (const auto& child : seq->stmts_) {
+          PrecomputeFullBufferRoots(child);
+        }
+      } else if (auto for_stmt = As<ForStmt>(stmt)) {
+        for (const auto& iter_arg : for_stmt->iter_args_) {
+          if (iter_arg && iter_arg->initValue_) {
+            if (const Var* root = ResolveBufferRoot(iter_arg->initValue_)) {
+              full_buffer_roots_[iter_arg.get()] = root;
+            }
+          }
+        }
+        PrecomputeFullBufferRoots(for_stmt->body_);
+        AddLoopReturnRoots(for_stmt);
+      } else if (auto while_stmt = As<WhileStmt>(stmt)) {
+        for (const auto& iter_arg : while_stmt->iter_args_) {
+          if (iter_arg && iter_arg->initValue_) {
+            if (const Var* root = ResolveBufferRoot(iter_arg->initValue_)) {
+              full_buffer_roots_[iter_arg.get()] = root;
+            }
+          }
+        }
+        PrecomputeFullBufferRoots(while_stmt->body_);
+        AddLoopReturnRoots(while_stmt);
+      } else if (auto if_stmt = As<IfStmt>(stmt)) {
+        PrecomputeFullBufferRoots(if_stmt->then_body_);
+        if (if_stmt->else_body_.has_value()) {
+          PrecomputeFullBufferRoots(if_stmt->else_body_.value());
+        }
+      } else if (auto scope = As<ScopeStmt>(stmt)) {
+        PrecomputeFullBufferRoots(scope->body_);
+      } else if (auto assign = As<AssignStmt>(stmt)) {
+        PrecomputeFullBufferRootsInExpr(assign->value_);
+        AddFullBufferRootForAssign(assign);
+      } else if (auto eval = As<EvalStmt>(stmt)) {
+        PrecomputeFullBufferRootsInExpr(eval->expr_);
+      }
+    }
+
+    void PrecomputeFullBufferRootsInExpr(const ExprPtr& expr) {
+      if (auto call = As<Call>(expr)) {
+        for (const auto& arg : call->args_) {
+          PrecomputeFullBufferRootsInExpr(arg);
+        }
+      } else if (auto tuple = As<MakeTuple>(expr)) {
+        for (const auto& element : tuple->elements_) {
+          PrecomputeFullBufferRootsInExpr(element);
+        }
+      } else if (auto tuple_get = As<TupleGetItemExpr>(expr)) {
+        PrecomputeFullBufferRootsInExpr(tuple_get->tuple_);
+      }
+    }
+
+    void AddTupleGetItemRoot(const AssignStmtPtr& assign, const TupleGetItemExprPtr& tuple_get) {
+      auto tuple_var = AsVarLike(tuple_get->tuple_);
+      if (!tuple_var) return;
+
+      auto subst_it = tuple_result_subst_.find(tuple_var.get());
+      if (subst_it != tuple_result_subst_.end() && tuple_get->index_ >= 0 &&
+          static_cast<size_t>(tuple_get->index_) < subst_it->second.size()) {
+        if (const Var* root = ResolveBufferRoot(subst_it->second[static_cast<size_t>(tuple_get->index_)])) {
+          full_buffer_roots_[assign->var_.get()] = root;
+        }
+        return;
+      }
+
+      auto roots_it = tuple_output_roots_.find(tuple_var.get());
+      if (roots_it == tuple_output_roots_.end()) return;
+      if (tuple_get->index_ < 0 || static_cast<size_t>(tuple_get->index_) >= roots_it->second.size()) return;
+      if (const Var* root = roots_it->second[static_cast<size_t>(tuple_get->index_)]) {
+        full_buffer_roots_[assign->var_.get()] = root;
+      }
+    }
+
+    void AddLoopReturnRoots(const ForStmtPtr& loop) {
+      if (!loop) return;
+      for (size_t i = 0; i < loop->return_vars_.size(); ++i) {
+        const Var* root = nullptr;
+        if (i < loop->iter_args_.size()) {
+          root = ResolveBufferRoot(loop->iter_args_[i].get());
+        }
+        auto yield = transform_utils::GetLastYieldStmt(loop->body_);
+        if (!root && yield && i < yield->value_.size()) {
+          root = ResolveBufferRoot(yield->value_[i]);
+        }
+        if (root) full_buffer_roots_[loop->return_vars_[i].get()] = root;
+      }
+    }
+
+    void AddLoopReturnRoots(const WhileStmtPtr& loop) {
+      if (!loop) return;
+      for (size_t i = 0; i < loop->return_vars_.size(); ++i) {
+        const Var* root = nullptr;
+        if (i < loop->iter_args_.size()) {
+          root = ResolveBufferRoot(loop->iter_args_[i].get());
+        }
+        auto yield = transform_utils::GetLastYieldStmt(loop->body_);
+        if (!root && yield && i < yield->value_.size()) {
+          root = ResolveBufferRoot(yield->value_[i]);
+        }
+        if (root) full_buffer_roots_[loop->return_vars_[i].get()] = root;
+      }
+    }
+
+    void AddFullRootReadsFromCall(const CallPtr& call, RootSet& reads) const {
+      if (!call || !program_ || codegen::IsBuiltinOp(call->op_->name_)) return;
+      auto callee = program_->GetFunction(call->op_->name_);
+      if (!callee) return;
+      for (size_t i = 0; i < callee->param_directions_.size() && i < call->args_.size(); ++i) {
+        if (!IsReadDirection(callee->param_directions_[i])) continue;
+        if (!IsFullRootExpr(call->args_[i])) continue;
+        if (const Var* root = ResolveBufferRoot(call->args_[i])) {
+          reads.insert(root);
+        }
+      }
+    }
+
+    void AddFullRootReadsFromStmt(const StmtPtr& stmt, RootSet& reads) const {
+      if (!stmt) return;
+      if (auto assign = As<AssignStmt>(stmt)) {
+        AddFullRootReadsFromCall(As<Call>(assign->value_), reads);
+      } else if (auto eval = As<EvalStmt>(stmt)) {
+        AddFullRootReadsFromCall(As<Call>(eval->expr_), reads);
+      } else if (auto seq = As<SeqStmts>(stmt)) {
+        for (auto it = seq->stmts_.rbegin(); it != seq->stmts_.rend(); ++it) {
+          AddFullRootReadsFromStmt(*it, reads);
+        }
+      } else if (auto for_stmt = As<ForStmt>(stmt)) {
+        AddFullRootReadsFromStmt(for_stmt->body_, reads);
+      } else if (auto while_stmt = As<WhileStmt>(stmt)) {
+        AddFullRootReadsFromStmt(while_stmt->body_, reads);
+      } else if (auto if_stmt = As<IfStmt>(stmt)) {
+        AddFullRootReadsFromStmt(if_stmt->then_body_, reads);
+        if (if_stmt->else_body_.has_value()) {
+          AddFullRootReadsFromStmt(if_stmt->else_body_.value(), reads);
+        }
+      } else if (auto scope = As<ScopeStmt>(stmt)) {
+        AddFullRootReadsFromStmt(scope->body_, reads);
+      }
+    }
+
+    bool HasLaterFullParentReadOfRewrittenOutput(const CallPtr& call,
+                                                 const CalleeRewriteAnalysis& analysis) const {
+      for (const auto& output : analysis.outputs) {
+        if (output.out_param_index >= call->args_.size()) return true;
+        const Var* root = ResolveBufferRoot(call->args_[output.out_param_index]);
+        if (root && enclosing_later_full_parent_reads_.count(root) > 0) {
+          return true;
+        }
+      }
+      return false;
+    }
+
     std::optional<RewriteBundle> TryRewriteCall(const AssignStmtPtr& call_assign) {
       auto call = As<Call>(call_assign->value_);
       if (!call) return std::nullopt;
@@ -2093,6 +2381,7 @@ class OutWindowExternalizer {
 
       if (analysis.outputs.empty()) return std::nullopt;
       if (!ProveCallsiteDisjointness(call_assign, call, analysis)) return std::nullopt;
+      if (HasLaterFullParentReadOfRewrittenOutput(call, analysis)) return std::nullopt;
 
       std::unordered_map<const Var*, ExprPtr> callsite_subst;
       for (size_t i = 0; i < original_func->params_.size() && i < call->args_.size(); ++i) {
@@ -2377,7 +2666,10 @@ class OutWindowExternalizer {
     std::vector<std::unordered_set<const Var*>> loop_local_allocs_;
     std::unordered_map<const Var*, ExprPtr> loop_iter_init_subst_;
     std::unordered_map<const Var*, ExprPtr> scalar_defs_;
+    std::unordered_map<const Var*, const Var*> full_buffer_roots_;
+    std::unordered_map<const Var*, std::vector<const Var*>> tuple_output_roots_;
     std::unordered_map<const Var*, std::vector<ExprPtr>> tuple_result_subst_;
+    RootSet enclosing_later_full_parent_reads_;
     int while_depth_ = 0;
   };
 

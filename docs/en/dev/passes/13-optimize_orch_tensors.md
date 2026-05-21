@@ -94,6 +94,7 @@ Safety rules:
 - only statically provable affine offsets are accepted
 - multi-`Out` rewrite is all-or-nothing
 - sequential-loop siblings are rewritten only when every rewritten `Out` can be proven disjoint across sibling iterations
+- call-site externalization is skipped when a rewritten window output's buffer root is later read as a full-parent tensor in the enclosing orchestration scope; until the runtime has root-aware view/parent dependency tracking, this preserves auto dependency tracking on the same parent `Tensor`
 - `DeriveCallDirections` keeps its existing sound sequential `Out -> InOut` rule; Pattern 5 only makes disjoint windows explicit before that pass runs
 
 ## Example (Pattern 1)
