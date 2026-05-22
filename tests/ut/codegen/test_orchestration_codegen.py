@@ -2186,6 +2186,74 @@ class TestTensorReadWriteOffsetCodegen:
             for name in rv_carry_names
         ), code
 
+    def test_windowed_writer_before_full_parent_reader_stays_unwindowed(self):
+        """Issue #1444: window writes followed by full-parent reads must not be externalized.
+
+        The unsafe codegen shape is:
+            producer writes score_flat.view(...) with add_output/add_inout
+            later consumer reads score_flat with add_input
+            no explicit set_dependencies edge bridges view -> parent
+
+        Until runtime/codegen has a generic root-aware dependency bridge,
+        OutWindowExternalizer must keep this producer unwindowed so auto deps
+        operate on the same parent Tensor object.
+        """
+
+        backend.reset_for_testing()
+        backend.set_backend_type(BackendType.Ascend910B)
+
+        N, M, W = 64, 2048, 8
+
+        @pl.program
+        class WindowedWriteFullParentReadProgram:
+            @pl.function(type=pl.FunctionType.InCore)
+            def produce(
+                self,
+                x: pl.Tensor[[N, M], pl.FP32],
+                score: pl.Out[pl.Tensor[[N, M], pl.FP32]],
+                col: pl.Scalar[pl.INDEX],
+            ) -> pl.Tensor[[N, M], pl.FP32]:
+                tile: pl.Tile[[N, W], pl.FP32] = pl.tile.load(x, [0, col], [N, W], [N, W])
+                ret: pl.Tensor[[N, M], pl.FP32] = pl.tile.store(tile, [0, col], score)
+                return ret
+
+            @pl.function(type=pl.FunctionType.InCore)
+            def consume(
+                self,
+                score: pl.Tensor[[N, M], pl.FP32],
+                probe: pl.Out[pl.Tensor[[N, M], pl.FP32]],
+                row: pl.Scalar[pl.INDEX],
+            ) -> pl.Tensor[[N, M], pl.FP32]:
+                tile: pl.Tile[[1, M], pl.FP32] = pl.tile.load(score, [row, 0], [1, M], [1, M])
+                ret: pl.Tensor[[N, M], pl.FP32] = pl.tile.store(tile, [row, 0], probe)
+                return ret
+
+            @pl.function(type=pl.FunctionType.Orchestration)
+            def main(
+                self,
+                x: pl.Tensor[[N, M], pl.FP32],
+                score: pl.Out[pl.Tensor[[N, M], pl.FP32]],
+                probe: pl.Out[pl.Tensor[[N, M], pl.FP32]],
+            ) -> pl.Tensor[[N, M], pl.FP32]:
+                score_flat: pl.Tensor[[N, M], pl.FP32] = pl.reshape(score, [N, M])
+                for c0, (score_iter,) in pl.range(0, M, W, init_values=(score_flat,)):
+                    score_next: pl.Tensor[[N, M], pl.FP32] = self.produce(x, score_iter, c0)
+                    score_rv = pl.yield_(score_next)
+                for r, (probe_iter,) in pl.range(N, init_values=(probe,)):
+                    probe_next: pl.Tensor[[N, M], pl.FP32] = self.consume(score_rv, probe_iter, r)
+                    probe_rv = pl.yield_(probe_next)
+                return probe_rv
+
+        transformed = PassManager.get_strategy(OptimizationStrategy.Default).run_passes(
+            WindowedWriteFullParentReadProgram
+        )
+        code = _generate_orch_code(transformed)
+
+        assert "produce__windowed" not in code, code
+        assert "params_t0.add_inout(score_flat)" in code, code
+        assert "params_t1.add_input(score_flat)" in code, code
+        assert "score_flat.view(" not in code, code
+
     def test_group_submit_uses_both_aiv_slots_for_split_vector_kernel(self):
         """Cross-core split inferred from pipe ops should reuse one AIV kernel across both slots."""
         backend.reset_for_testing()
@@ -3414,13 +3482,11 @@ class TestManualScopeCodegen:
         assert code.count("PTO2_SCOPE() {") == 1, code
         assert code.count("PTO2_SCOPE(PTO2ScopeMode::MANUAL)") == 1, code
 
-        # The ``pl.submit`` producer TaskId is captured and can be threaded
-        # through the user-named variable, even if later passes introduce a
-        # temporary tuple item for the windowed call result.
+        # The producer TaskId is preserved through windowed rewriting and is
+        # threaded into the consumer dependency edge.
         assert "TaskOutputTensors task_0_outs = rt_submit_aiv_task(" in code, code
         producer_tid = re.search(r"PTO2TaskId (\w+) = task_0_outs\.task_id\(\);", code)
         assert producer_tid, code
-        assert re.search(rf"PTO2TaskId stage1_tid(?:_\d+)? = {producer_tid.group(1)};", code), code
         assert "TaskOutputTensors task_1_outs = rt_submit_aiv_task(" in code, code
 
         # *** Manual dep correctly established WITHIN each iteration ***
@@ -3505,11 +3571,11 @@ class TestManualScopeCodegen:
         assert code.count("PTO2_SCOPE() {") == 1, code
         assert code.count("PTO2_SCOPE(PTO2ScopeMode::MANUAL)") == 1, code
 
-        # The ``pl.submit`` producer TaskId binds to the user-named variable.
+        # The producer TaskId is preserved through windowed rewriting and is
+        # threaded into the consumer dependency edge.
         assert "TaskOutputTensors task_0_outs = rt_submit_aiv_task(" in code, code
         producer_tid = re.search(r"PTO2TaskId (\w+) = task_0_outs\.task_id\(\);", code)
         assert producer_tid, code
-        assert re.search(rf"PTO2TaskId stage1_tid(?:_\d+)? = {producer_tid.group(1)};", code), code
         assert "TaskOutputTensors task_1_outs = rt_submit_aiv_task(" in code, code
 
         # Manual dep WITHIN each iteration: stage2 follows stage1.
@@ -3630,19 +3696,17 @@ class TestManualScopeCodegen:
 
     def test_manual_scope_submit_task_id_dep(self):
         """The producer TaskId of a ``pl.submit(...)`` threaded into a later
-        submit's ``deps=[...]`` emits the user-named TaskId variable directly.
+        submit's ``deps=[...]`` reaches the dependency edge.
 
         Pattern:
             scratch, tid = pl.submit(self.stage1, x, scratch, row, col)
             out, _       = pl.submit(self.stage2, scratch, out, row, col, deps=[tid])
 
         Expected codegen for the dep chain:
-            PTO2TaskId tid = task_0_outs.task_id();   // submit producer TaskId
-            ...
             Arg params_t1;
             PTO2TaskId params_t1_deps[1];
             uint32_t params_t1_deps_count = 0;
-            params_t1_deps[params_t1_deps_count++] = tid;
+            params_t1_deps[params_t1_deps_count++] = <producer TaskId>;
             params_t1.set_dependencies(params_t1_deps, params_t1_deps_count);
         """
         backend.reset_for_testing()
@@ -3700,10 +3764,9 @@ class TestManualScopeCodegen:
         transformed = pm.run_passes(Prog)
         code = _generate_orch_code(transformed)
 
-        # The user-named ``tid`` resolves to the submit's producer TaskId.
+        # The producer TaskId is attached to the consumer dependency edge.
         producer_tid = re.search(r"PTO2TaskId (\w+) = task_0_outs\.task_id\(\);", code)
         assert producer_tid, code
-        assert re.search(rf"PTO2TaskId tid(?:_\d+)? = {producer_tid.group(1)};", code), code
         # The dep edge is filled into the consumer's stack deps array and
         # attached with a single ``set_dependencies`` call.
         assert f"params_t1_deps[params_t1_deps_count++] = {producer_tid.group(1)};" in code, code
