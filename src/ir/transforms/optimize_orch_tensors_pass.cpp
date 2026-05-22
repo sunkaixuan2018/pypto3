@@ -1994,8 +1994,6 @@ class OutWindowExternalizer {
 
   class OrchRewriter : public IRMutator {
    public:
-    using RootSet = std::unordered_set<const Var*>;
-
     OrchRewriter(ProgramPtr program, const AnalysisMap& analyses,
                  const std::unordered_map<std::string, FunctionPtr>& cloned_funcs,
                  const FunctionPtr& current_func)
@@ -2006,7 +2004,6 @@ class OutWindowExternalizer {
             full_buffer_roots_[param.get()] = param.get();
           }
         }
-        PrecomputeFullBufferRoots(current_func->body_);
       }
     }
 
@@ -2069,20 +2066,7 @@ class OutWindowExternalizer {
       auto saved_scalar_defs = scalar_defs_;
       auto saved_tuple_result_subst = tuple_result_subst_;
 
-      RootSet later_reads = enclosing_later_full_parent_reads_;
-      std::unordered_map<const Stmt*, RootSet> later_reads_by_stmt;
-      later_reads_by_stmt.reserve(op->stmts_.size());
-      for (auto stmt_it = op->stmts_.rbegin(); stmt_it != op->stmts_.rend(); ++stmt_it) {
-        later_reads_by_stmt.emplace(stmt_it->get(), later_reads);
-        AddFullRootReadsFromStmt(*stmt_it, later_reads);
-      }
-
       for (const auto& stmt : op->stmts_) {
-        auto saved_enclosing_reads = enclosing_later_full_parent_reads_;
-        auto later_it = later_reads_by_stmt.find(stmt.get());
-        enclosing_later_full_parent_reads_ =
-            later_it != later_reads_by_stmt.end() ? later_it->second : saved_enclosing_reads;
-
         auto call_assign = As<AssignStmt>(stmt);
         auto bundle = call_assign ? TryRewriteCall(call_assign) : std::nullopt;
         if (bundle.has_value()) {
@@ -2097,7 +2081,6 @@ class OutWindowExternalizer {
             }
             new_stmts.push_back(visited);
           }
-          enclosing_later_full_parent_reads_ = std::move(saved_enclosing_reads);
           continue;
         }
 
@@ -2111,7 +2094,6 @@ class OutWindowExternalizer {
         if (visited_assign && As<ScalarType>(visited_assign->var_->GetType())) {
           scalar_defs_[visited_assign->var_.get()] = visited_assign->value_;
         }
-        enclosing_later_full_parent_reads_ = std::move(saved_enclosing_reads);
       }
 
       scalar_defs_ = std::move(saved_scalar_defs);
@@ -2157,12 +2139,6 @@ class OutWindowExternalizer {
         current = it->second;
       }
       return current;
-    }
-
-    bool IsFullRootExpr(const ExprPtr& expr) const {
-      auto current = ResolveLoopInitExpr(expr);
-      auto var = AsVarLike(current);
-      return var && full_buffer_roots_.count(var.get()) > 0 && ResolveBufferRoot(var.get()) != nullptr;
     }
 
     static bool IsReadDirection(ParamDirection direction) {
@@ -2218,61 +2194,6 @@ class OutWindowExternalizer {
       }
     }
 
-    void PrecomputeFullBufferRoots(const StmtPtr& stmt) {
-      if (!stmt) return;
-      if (auto seq = As<SeqStmts>(stmt)) {
-        for (const auto& child : seq->stmts_) {
-          PrecomputeFullBufferRoots(child);
-        }
-      } else if (auto for_stmt = As<ForStmt>(stmt)) {
-        for (const auto& iter_arg : for_stmt->iter_args_) {
-          if (iter_arg && iter_arg->initValue_) {
-            if (const Var* root = ResolveBufferRoot(iter_arg->initValue_)) {
-              full_buffer_roots_[iter_arg.get()] = root;
-            }
-          }
-        }
-        PrecomputeFullBufferRoots(for_stmt->body_);
-        AddLoopReturnRoots(for_stmt);
-      } else if (auto while_stmt = As<WhileStmt>(stmt)) {
-        for (const auto& iter_arg : while_stmt->iter_args_) {
-          if (iter_arg && iter_arg->initValue_) {
-            if (const Var* root = ResolveBufferRoot(iter_arg->initValue_)) {
-              full_buffer_roots_[iter_arg.get()] = root;
-            }
-          }
-        }
-        PrecomputeFullBufferRoots(while_stmt->body_);
-        AddLoopReturnRoots(while_stmt);
-      } else if (auto if_stmt = As<IfStmt>(stmt)) {
-        PrecomputeFullBufferRoots(if_stmt->then_body_);
-        if (StmtPtr else_body = if_stmt->else_body_.value_or(nullptr)) {
-          PrecomputeFullBufferRoots(else_body);
-        }
-      } else if (auto scope = As<ScopeStmt>(stmt)) {
-        PrecomputeFullBufferRoots(scope->body_);
-      } else if (auto assign = As<AssignStmt>(stmt)) {
-        PrecomputeFullBufferRootsInExpr(assign->value_);
-        AddFullBufferRootForAssign(assign);
-      } else if (auto eval = As<EvalStmt>(stmt)) {
-        PrecomputeFullBufferRootsInExpr(eval->expr_);
-      }
-    }
-
-    void PrecomputeFullBufferRootsInExpr(const ExprPtr& expr) {
-      if (auto call = As<Call>(expr)) {
-        for (const auto& arg : call->args_) {
-          PrecomputeFullBufferRootsInExpr(arg);
-        }
-      } else if (auto tuple = As<MakeTuple>(expr)) {
-        for (const auto& element : tuple->elements_) {
-          PrecomputeFullBufferRootsInExpr(element);
-        }
-      } else if (auto tuple_get = As<TupleGetItemExpr>(expr)) {
-        PrecomputeFullBufferRootsInExpr(tuple_get->tuple_);
-      }
-    }
-
     void AddTupleGetItemRoot(const AssignStmtPtr& assign, const TupleGetItemExprPtr& tuple_get) {
       auto tuple_var = AsVarLike(tuple_get->tuple_);
       if (!tuple_var) return;
@@ -2321,43 +2242,6 @@ class OutWindowExternalizer {
           root = ResolveBufferRoot(yield->value_[i]);
         }
         if (root) full_buffer_roots_[loop->return_vars_[i].get()] = root;
-      }
-    }
-
-    void AddFullRootReadsFromCall(const CallPtr& call, RootSet& reads) const {
-      if (!call || !program_ || codegen::IsBuiltinOp(call->op_->name_)) return;
-      auto callee = program_->GetFunction(call->op_->name_);
-      if (!callee) return;
-      for (size_t i = 0; i < callee->param_directions_.size() && i < call->args_.size(); ++i) {
-        if (!IsReadDirection(callee->param_directions_[i])) continue;
-        if (!IsFullRootExpr(call->args_[i])) continue;
-        if (const Var* root = ResolveBufferRoot(call->args_[i])) {
-          reads.insert(root);
-        }
-      }
-    }
-
-    void AddFullRootReadsFromStmt(const StmtPtr& stmt, RootSet& reads) const {
-      if (!stmt) return;
-      if (auto assign = As<AssignStmt>(stmt)) {
-        AddFullRootReadsFromCall(As<Call>(assign->value_), reads);
-      } else if (auto eval = As<EvalStmt>(stmt)) {
-        AddFullRootReadsFromCall(As<Call>(eval->expr_), reads);
-      } else if (auto seq = As<SeqStmts>(stmt)) {
-        for (auto it = seq->stmts_.rbegin(); it != seq->stmts_.rend(); ++it) {
-          AddFullRootReadsFromStmt(*it, reads);
-        }
-      } else if (auto for_stmt = As<ForStmt>(stmt)) {
-        AddFullRootReadsFromStmt(for_stmt->body_, reads);
-      } else if (auto while_stmt = As<WhileStmt>(stmt)) {
-        AddFullRootReadsFromStmt(while_stmt->body_, reads);
-      } else if (auto if_stmt = As<IfStmt>(stmt)) {
-        AddFullRootReadsFromStmt(if_stmt->then_body_, reads);
-        if (StmtPtr else_body = if_stmt->else_body_.value_or(nullptr)) {
-          AddFullRootReadsFromStmt(else_body, reads);
-        }
-      } else if (auto scope = As<ScopeStmt>(stmt)) {
-        AddFullRootReadsFromStmt(scope->body_, reads);
       }
     }
 
@@ -2766,7 +2650,6 @@ class OutWindowExternalizer {
     std::unordered_map<const Var*, std::vector<const Var*>> tuple_output_roots_;
     std::unordered_map<const Var*, std::vector<ExprPtr>> tuple_result_subst_;
     std::unordered_map<const Var*, std::vector<VarPtr>> windowed_producers_by_root_;
-    RootSet enclosing_later_full_parent_reads_;
     int while_depth_ = 0;
     int manual_scope_depth_ = 0;
   };

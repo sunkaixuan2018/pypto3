@@ -838,6 +838,8 @@ class OrchestrationStmtCodegen : public CodegenBase {
       for (int64_t extent : loop_extents) {
         INTERNAL_CHECK_SPAN(extent > 0, for_stmt->span_)
             << "Internal error: auto dependency loop extent must be positive";
+        INTERNAL_CHECK_SPAN(slot_count <= std::numeric_limits<int64_t>::max() / extent, for_stmt->span_)
+            << "Internal error: auto dependency slot count overflow";
         slot_count *= extent;
       }
       {
