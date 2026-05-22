@@ -1094,6 +1094,87 @@ class TestOutWindowExternalizer:
         assert "pl.Tensor[[64, 64], pl.FP32" in printed_windowed
         assert "[0, 0]" in printed_windowed
 
+    def test_return_reordered_multi_out_later_parent_read_stays_baseline(self):
+        @pl.program
+        class Before:
+            @pl.function(type=pl.FunctionType.InCore)
+            def kv_stripe(
+                self,
+                data: pl.Tensor[[256, 64], pl.FP32],
+                row_offset: pl.Scalar[pl.INDEX],
+                k_out: pl.Out[pl.Tensor[[256, 64], pl.FP32]],
+                v_out: pl.Out[pl.Tensor[[256, 64], pl.FP32]],
+            ) -> tuple[pl.Tensor[[256, 64], pl.FP32], pl.Tensor[[256, 64], pl.FP32]]:
+                tile: pl.Tile[[64, 64], pl.FP32] = pl.load(data, [row_offset, 0], [64, 64])
+                k_next: pl.Tensor[[256, 64], pl.FP32] = pl.store(tile, [row_offset, 0], k_out)
+                v_next: pl.Tensor[[256, 64], pl.FP32] = pl.store(tile, [row_offset, 0], v_out)
+                return v_next, k_next
+
+            @pl.function(type=pl.FunctionType.InCore)
+            def consume_full(
+                self,
+                k: pl.Tensor[[256, 64], pl.FP32],
+            ) -> pl.Tensor[[256, 64], pl.FP32]:
+                return k
+
+            @pl.function(type=pl.FunctionType.Orchestration)
+            def main(
+                self,
+                data: pl.Tensor[[256, 64], pl.FP32],
+                k_out: pl.Out[pl.Tensor[[256, 64], pl.FP32]],
+                v_out: pl.Out[pl.Tensor[[256, 64], pl.FP32]],
+            ) -> pl.Tensor[[256, 64], pl.FP32]:
+                row: pl.Scalar[pl.INDEX] = 64
+                result: tuple[pl.Tensor[[256, 64], pl.FP32], pl.Tensor[[256, 64], pl.FP32]] = self.kv_stripe(
+                    data, row, k_out, v_out
+                )
+                k_next: pl.Tensor[[256, 64], pl.FP32] = result[1]
+                return self.consume_full(k_next)
+
+        After = _run_to_optimize_orch_tensors(Before)
+
+        assert After.get_function("kv_stripe__windowed") is None
+        printed_main = ir.python_print(_get_function(After, "main"))
+        assert "pl.tensor.slice(k_out" not in printed_main
+        assert "pl.tensor.slice(v_out" not in printed_main
+
+    def test_tensor_full_root_later_parent_read_stays_baseline(self):
+        @pl.program
+        class Before:
+            @pl.function(type=pl.FunctionType.InCore)
+            def kernel_stripe(
+                self,
+                data: pl.Tensor[[256, 64], pl.FP32],
+                row_offset: pl.Scalar[pl.INDEX],
+                out: pl.Out[pl.Tensor[[256, 64], pl.FP32]],
+            ) -> pl.Tensor[[256, 64], pl.FP32]:
+                tile: pl.Tile[[64, 64], pl.FP32] = pl.load(data, [row_offset, 0], [64, 64])
+                ret: pl.Tensor[[256, 64], pl.FP32] = pl.store(tile, [row_offset, 0], out)
+                return ret
+
+            @pl.function(type=pl.FunctionType.InCore)
+            def consume_full(
+                self,
+                out: pl.Tensor[[256, 64], pl.FP32],
+            ) -> pl.Tensor[[256, 64], pl.FP32]:
+                return out
+
+            @pl.function(type=pl.FunctionType.Orchestration)
+            def main(
+                self,
+                data: pl.Tensor[[256, 64], pl.FP32],
+            ) -> pl.Tensor[[256, 64], pl.FP32]:
+                out: pl.Tensor[[256, 64], pl.FP32] = pl.full([256, 64], dtype=pl.FP32, value=0.0)
+                row: pl.Scalar[pl.INDEX] = 64
+                out_next: pl.Tensor[[256, 64], pl.FP32] = self.kernel_stripe(data, row, out)
+                return self.consume_full(out_next)
+
+        After = _run_to_optimize_orch_tensors(Before)
+
+        assert After.get_function("kernel_stripe__windowed") is None
+        printed_main = ir.python_print(_get_function(After, "main"))
+        assert "pl.tensor.slice(out" not in printed_main
+
     def test_multi_out_final_store_all_or_nothing_stays_baseline(self):
         @pl.program
         class Before:

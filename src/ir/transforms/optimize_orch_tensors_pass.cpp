@@ -167,6 +167,10 @@ bool IsTensorAllocationOp(const CallPtr& call) {
   return call->op_->name_ == "tensor.create" || call->op_->name_ == "tensor.full";
 }
 
+bool IsOutputDirection(ParamDirection direction, bool include_inout) {
+  return direction == ParamDirection::Out || (include_inout && direction == ParamDirection::InOut);
+}
+
 std::unordered_set<const Var*> CollectLoopLocalTensorAllocs(const ForStmtPtr& loop) {
   class Collector : public IRVisitor {
    public:
@@ -218,11 +222,12 @@ struct OutParamReturnMapping {
 /// Build the mapping from Out params to return indices for an InCore function.
 /// Scans tile.store calls before the ReturnStmt to find which Out param
 /// each return value stores to.
-std::vector<OutParamReturnMapping> BuildOutParamReturnMappings(const FunctionPtr& func) {
-  // Collect Out param vars and their indices
+std::vector<OutParamReturnMapping> BuildOutParamReturnMappings(const FunctionPtr& func,
+                                                               bool include_inout = false) {
+  // Collect output param vars and their indices.
   std::unordered_map<const Var*, size_t> out_var_to_param_idx;
   for (size_t i = 0; i < func->params_.size(); ++i) {
-    if (i < func->param_directions_.size() && func->param_directions_[i] == ParamDirection::Out) {
+    if (i < func->param_directions_.size() && IsOutputDirection(func->param_directions_[i], include_inout)) {
       out_var_to_param_idx[func->params_[i].get()] = i;
     }
   }
@@ -2039,8 +2044,10 @@ class OutWindowExternalizer {
     }
 
     StmtPtr VisitStmt_(const WhileStmtPtr& op) override {
+      auto saved_loop_iter_init_subst = loop_iter_init_subst_;
       for (const auto& iter_arg : op->iter_args_) {
         if (iter_arg && iter_arg->initValue_) {
+          loop_iter_init_subst_[iter_arg.get()] = iter_arg->initValue_;
           if (const Var* root = ResolveBufferRoot(iter_arg->initValue_)) {
             full_buffer_roots_[iter_arg.get()] = root;
           }
@@ -2051,6 +2058,7 @@ class OutWindowExternalizer {
       --while_depth_;
       auto visited_loop = As<WhileStmt>(result);
       AddLoopReturnRoots(visited_loop ? visited_loop : op);
+      loop_iter_init_subst_ = std::move(saved_loop_iter_init_subst);
       return result;
     }
 
@@ -2168,7 +2176,7 @@ class OutWindowExternalizer {
           if (const Var* root = ResolveBufferRoot(call->args_[0])) {
             full_buffer_roots_[assign->var_.get()] = root;
           }
-        } else if (op_name == "tensor.create") {
+        } else if (IsTensorAllocationOp(call)) {
           full_buffer_roots_[assign->var_.get()] = assign->var_.get();
         } else if (!codegen::IsBuiltinOp(op_name)) {
           AddCallOutputRoots(assign, call);
@@ -2193,13 +2201,10 @@ class OutWindowExternalizer {
       auto callee = program_ ? program_->GetFunction(call->op_->name_) : nullptr;
       if (!callee) return;
 
-      std::vector<const Var*> roots;
-      for (size_t i = 0; i < callee->param_directions_.size() && i < call->args_.size(); ++i) {
-        if (callee->param_directions_[i] != ParamDirection::Out &&
-            callee->param_directions_[i] != ParamDirection::InOut) {
-          continue;
-        }
-        roots.push_back(ResolveBufferRoot(call->args_[i]));
+      std::vector<const Var*> roots(callee->return_types_.size(), nullptr);
+      for (const auto& mapping : BuildOutParamReturnMappings(callee, /*include_inout=*/true)) {
+        if (mapping.return_index >= roots.size() || mapping.param_index >= call->args_.size()) continue;
+        roots[mapping.return_index] = ResolveBufferRoot(call->args_[mapping.param_index]);
       }
 
       if (As<TupleType>(call->GetType())) {
