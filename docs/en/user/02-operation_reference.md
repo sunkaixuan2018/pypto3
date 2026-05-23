@@ -45,7 +45,7 @@ Operate on `Tensor` objects (DDR memory).
 | `slice` | `(tensor: Tensor, shape: Sequence[IntLike], offset: Sequence[IntLike]) -> Tensor` | Slice. Sugar: `A[0:16, :]` |
 | `reshape` | `(tensor: Tensor, shape: Sequence[IntLike]) -> Tensor` | Reshape |
 | `transpose` | `(tensor: Tensor, axis1: int, axis2: int) -> Tensor` | Swap two axes |
-| `assemble` | `(target: Tensor, source: Tensor, offset: Sequence[IntLike]) -> Tensor` | Write source into target at offset. Sugar (pre-SSA only): `target[i:i+H, j:j+W] = source` |
+| `assemble` | `(target: Tensor, source: Tensor, offset: Sequence[IntLike], *, atomic: AtomicType = AtomicType.None_) -> Tensor` | Write source into target at offset. Sugar (pre-SSA only): `target[i:i+H, j:j+W] = source`. `atomic=AtomicType.Add` accumulates instead of overwriting (split-K) — only valid when the target is a function output (global memory); non-deterministic FP, target must be pre-zeroed, dtypes fp32/fp16/int32/int16/int8 |
 | `scatter_update` | `(input: Tensor, dim: int, index: Tensor, src: Tensor) -> Tensor` | Update rows of `input` at sparse positions given by `index` with values from `src`. `input`/`src`: 2D `[rows, d]` or 4D `[B, S, 1, d]`; `index`: 2D `[b, s]` integer. Only `dim=-2` is supported |
 | `add` | `(lhs: Tensor, rhs: Tensor \| int \| float \| Scalar) -> Tensor` | Element-wise add |
 | `sub` | `(lhs: Tensor, rhs: Tensor \| int \| float \| Scalar) -> Tensor` | Element-wise subtract |
@@ -71,7 +71,7 @@ Transfer data between memory hierarchy levels.
 | Name | Signature | Description |
 | ---- | --------- | ----------- |
 | `load` | `(tensor: Tensor, offsets: Sequence[IntLike], shapes: Sequence[IntLike], target_memory: Mem = Mem.Vec, transpose: bool = False) -> Tile` | DDR → on-chip tile (transpose only for Mat). Both `offsets` and `shapes` use the source tensor's coordinate system. |
-| `store` | `(tile: Tile, offsets: Sequence[IntLike], output_tensor: Tensor) -> Tensor` | Tile → DDR (pipe inferred from source memory) |
+| `store` | `(tile: Tile, offsets: Sequence[IntLike], output_tensor: Tensor, *, atomic: AtomicType = AtomicType.None_) -> Tensor` | Tile → DDR (pipe inferred from source memory). `atomic=AtomicType.Add` accumulates the tile into existing DDR contents (split-K); non-deterministic FP, destination must be pre-zeroed, dtypes fp32/fp16/int32/int16/int8 |
 | `assemble` | `(target: Tile, source: Tile, offset: Sequence[IntLike]) -> Tile` | Write source tile into target at offset. Sugar (pre-SSA only): `target[i:i+H, j:j+W] = source` |
 | `scatter_update` | `(input: Tile, dim: int, index: Tile, src: Tile, scratch: Tile) -> Tile` | Update rows of `input` tile at sparse positions given by `index` tile with values from `src` tile. `input`/`src`: 2D `[rows, d]` or 4D `[B, S, 1, d]`; `index`: 2D `[b, s]` integer; `scratch`: 2D `[1, d]` Vec tile used as a per-row temporary (created via `pl.tile.create([1, d], dtype, target_memory=Mem.Vec)`). Only `dim=-2` is supported |
 | `read` | `(tile: Tile, indices: IntLike \| Sequence[IntLike]) -> Scalar` | Read scalar at indices. Sugar: `A[i, j]` |
