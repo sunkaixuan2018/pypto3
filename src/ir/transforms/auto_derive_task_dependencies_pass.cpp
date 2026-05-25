@@ -632,11 +632,11 @@ class AutoDepMutator : public IRMutator {
         if (!storage_ || !storage_->MayAlias(access.location.root, prior.location.root)) continue;
         if (!RegionsMayOverlap(access.location.region, prior.location.region)) continue;
         if (!HasHazard(access.kind, prior.kind)) continue;
+        if (ContainsVar(user_edges, prior.task_id_var)) continue;
         if (prior.dynamic_producer || !prior.task_id_var) {
           fallback_stack_.back() = true;
           return call;
         }
-        if (ContainsVar(user_edges, prior.task_id_var)) continue;
         AppendUnique(&compiler_edges, prior.task_id_var);
       }
     }

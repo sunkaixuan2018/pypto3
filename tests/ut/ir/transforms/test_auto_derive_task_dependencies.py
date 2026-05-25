@@ -125,15 +125,19 @@ class TestAutoDeriveTaskDependencies:
             @pl.function(type=pl.FunctionType.InCore)
             def fill(
                 self,
-                out: pl.Out[pl.Tensor[[64], pl.FP32]],
-            ) -> pl.Tensor[[64], pl.FP32]:
+                out: pl.Out[pl.Tensor[[64], pl.FP32, pl.MemRef("shared_ddr", 0, 256)]],
+            ) -> pl.Tensor[[64], pl.FP32, pl.MemRef("shared_ddr", 0, 256)]:
                 return out
 
             @pl.function(type=pl.FunctionType.Orchestration)
-            def main(self, scratch: pl.Tensor[[64], pl.FP32]) -> pl.Tensor[[64], pl.FP32]:
+            def main(
+                self,
+                first: pl.Tensor[[64], pl.FP32, pl.MemRef("shared_ddr", 0, 256)],
+                second: pl.Tensor[[64], pl.FP32, pl.MemRef("shared_ddr", 0, 256)],
+            ) -> pl.Tensor[[64], pl.FP32, pl.MemRef("shared_ddr", 0, 256)]:
                 with pl.manual_scope():
-                    _first, first_tid = pl.submit(self.fill, scratch)
-                    out, _ = pl.submit(self.fill, scratch)
+                    _first, first_tid = pl.submit(self.fill, first)
+                    out, _ = pl.submit(self.fill, second)
                 return out
 
         out = _run_auto_deps(Prog)
