@@ -276,6 +276,11 @@ bool AutoDepsLoopCarryDebugEnabled() {
   return enabled;
 }
 
+void DebugLog(const std::string& message) {
+  if (!AutoDepsLoopCarryDebugEnabled()) return;
+  std::cerr << "[auto-deps-loop-debug] " << message << std::endl;
+}
+
 std::string DebugVar(const VarPtr& var) {
   if (!var) return "<null>";
   std::ostringstream oss;
@@ -735,6 +740,8 @@ class AutoDepMutator : public IRMutator {
       return IRMutator::VisitStmt_(op);
     }
 
+    DebugLog("enter_runtime_scope name_hint=" + op->name_hint_ +
+             " loop_depth=" + std::to_string(loop_depth_));
     prior_stack_.emplace_back();
     fallback_stack_.push_back(false);
     INTERNAL_CHECK_SPAN(op->body_, op->span_) << "RuntimeScopeStmt has null body";
@@ -744,10 +751,12 @@ class AutoDepMutator : public IRMutator {
     fallback_stack_.pop_back();
     prior_stack_.pop_back();
     if (fallback) {
+      DebugLog("fallback_runtime_scope name_hint=" + op->name_hint_);
       auto stripped_body = StripCompilerDeps(new_body);
       return std::make_shared<const RuntimeScopeStmt>(false, op->name_hint_, std::move(stripped_body),
                                                       op->span_, op->leading_comments_, op->attrs_);
     }
+    DebugLog("keep_runtime_scope_manual name_hint=" + op->name_hint_);
     if (new_body.get() != op->body_.get()) {
       return std::make_shared<const RuntimeScopeStmt>(op->manual_, op->name_hint_, std::move(new_body),
                                                       op->span_, op->leading_comments_, op->attrs_);
@@ -764,18 +773,17 @@ class AutoDepMutator : public IRMutator {
     VarPtr task_id = LookupTaskId(op.get());
     bool needs_fallback = false;
     auto user_edges = CanonicalizeTaskIds(GetDepAttr(call, kAttrManualDepEdges));
-    const bool debug_loop_carry = AutoDepsLoopCarryDebugEnabled() && loop_depth_ == 0 && call->op_ &&
-                                  call->op_->name_ == "consume" && !user_edges.empty();
+    const bool debug_loop_carry = AutoDepsLoopCarryDebugEnabled();
     auto summary = SummarizeAccesses(call, op, user_edges, &needs_fallback);
     if (debug_loop_carry) {
-      std::cerr << "[auto-deps-loop-debug] call=" << call->op_->name_ << " task_id=" << DebugVar(task_id)
-                << " user_edges=" << DebugVarList(user_edges)
-                << " summary_accesses=" << summary.accesses.size()
-                << " needs_fallback_from_summary=" << (needs_fallback ? "true" : "false") << std::endl;
+      DebugLog("call=" + call->op_->name_ + " loop_depth=" + std::to_string(loop_depth_) +
+               " task_id=" + DebugVar(task_id) + " user_edges=" + DebugVarList(user_edges) +
+               " summary_accesses=" + std::to_string(summary.accesses.size()) +
+               " needs_fallback_from_summary=" + (needs_fallback ? "true" : "false"));
     }
     if (needs_fallback) {
       if (debug_loop_carry) {
-        std::cerr << "[auto-deps-loop-debug] fallback_reason=summary_unknown_location" << std::endl;
+        DebugLog("fallback_reason=summary_unknown_location call=" + call->op_->name_);
       }
       fallback_stack_.back() = true;
       return call;
@@ -791,18 +799,19 @@ class AutoDepMutator : public IRMutator {
         if (!HasHazard(access.kind, prior.kind)) continue;
         const bool covered_by_user_edge = ContainsVar(user_edges, prior.task_id_var);
         if (debug_loop_carry) {
-          std::cerr << "[auto-deps-loop-debug] prior_task_id=" << DebugVar(prior.task_id_var)
-                    << " covered_by_user_edge=" << (covered_by_user_edge ? "true" : "false")
-                    << " dynamic_producer=" << (prior.dynamic_producer ? "true" : "false")
-                    << " current_task_id=" << DebugVar(task_id) << std::endl;
+          DebugLog("hazard call=" + call->op_->name_ + " prior_task_id=" + DebugVar(prior.task_id_var) +
+                   " covered_by_user_edge=" + (covered_by_user_edge ? std::string("true") : "false") +
+                   " dynamic_producer=" + (prior.dynamic_producer ? std::string("true") : "false") +
+                   " current_task_id=" + DebugVar(task_id));
         }
         if (covered_by_user_edge) continue;
         if (prior.dynamic_producer || !prior.task_id_var) {
           if (debug_loop_carry) {
-            std::cerr << "[auto-deps-loop-debug] fallback_reason="
-                      << (prior.dynamic_producer ? "dynamic_prior_producer" : "missing_prior_task_id")
-                      << " user_edges=" << DebugVarList(user_edges)
-                      << " prior_task_id=" << DebugVar(prior.task_id_var) << std::endl;
+            DebugLog(
+                "fallback_reason=" +
+                std::string(prior.dynamic_producer ? "dynamic_prior_producer" : "missing_prior_task_id") +
+                " call=" + call->op_->name_ + " user_edges=" + DebugVarList(user_edges) +
+                " prior_task_id=" + DebugVar(prior.task_id_var));
           }
           fallback_stack_.back() = true;
           return call;
