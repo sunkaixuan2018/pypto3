@@ -563,6 +563,78 @@ class TestAutoDeriveTaskDependencies:
         assert len(scopes) == 1
         assert scopes[0].manual is False
 
+    def test_loop_direct_body_tid_dep_behavior(self):
+        @pl.program
+        class Prog:
+            @pl.function(type=pl.FunctionType.InCore)
+            def fill(
+                self,
+                out: pl.Out[pl.Tensor[[64], pl.FP32]],
+            ) -> pl.Tensor[[64], pl.FP32]:
+                return out
+
+            @pl.function(type=pl.FunctionType.InCore)
+            def consume(self, x: pl.Tensor[[64], pl.FP32]) -> pl.Tensor[[64], pl.FP32]:
+                return x
+
+            @pl.function(type=pl.FunctionType.Orchestration)
+            def main(self, scratch: pl.Tensor[[64], pl.FP32]) -> pl.Tensor[[64], pl.FP32]:
+                with pl.manual_scope():
+                    carried = scratch
+                    for _i in pl.range(0, 4):
+                        carried, producer_tid = pl.submit(self.fill, carried)
+                    out, _ = pl.submit(self.consume, carried, deps=[producer_tid])
+                return out
+
+        out = _run_auto_deps(Prog)
+        scopes = _runtime_scopes(out)
+        assert len(scopes) == 1
+        assert scopes[0].manual is True
+
+        consume_call = _user_calls(out, "consume")[0]
+        user_edges = list(consume_call.attrs.get("manual_dep_edges", []))
+        assert [edge.name_hint for edge in user_edges] == ["producer_tid"]
+        assert _compiler_edges(consume_call) == []
+
+    def test_loop_carried_last_tid_dep_behavior(self):
+        @pl.program
+        class Prog:
+            @pl.function(type=pl.FunctionType.InCore)
+            def fill(
+                self,
+                out: pl.Out[pl.Tensor[[64], pl.FP32]],
+            ) -> pl.Tensor[[64], pl.FP32]:
+                return out
+
+            @pl.function(type=pl.FunctionType.InCore)
+            def consume(self, x: pl.Tensor[[64], pl.FP32]) -> pl.Tensor[[64], pl.FP32]:
+                return x
+
+            @pl.function(type=pl.FunctionType.Orchestration)
+            def main(self, scratch: pl.Tensor[[64], pl.FP32]) -> pl.Tensor[[64], pl.FP32]:
+                with pl.manual_scope():
+                    carried = scratch
+                    last_tid = None
+                    for _i, (carried, last_tid) in pl.range(
+                        0,
+                        4,
+                        init_values=(carried, last_tid),  # pyright: ignore[reportArgumentType]
+                    ):
+                        carried, last_tid = pl.submit(self.fill, carried)
+                        carried, last_tid = pl.yield_(carried, last_tid)
+                    out, _ = pl.submit(self.consume, carried, deps=[last_tid])
+                return out
+
+        out = _run_auto_deps(Prog)
+        scopes = _runtime_scopes(out)
+        assert len(scopes) == 1
+        assert scopes[0].manual is True
+
+        consume_call = _user_calls(out, "consume")[0]
+        user_edges = list(consume_call.attrs.get("manual_dep_edges", []))
+        assert [edge.name_hint for edge in user_edges] == ["last_tid"]
+        assert _compiler_edges(consume_call) == []
+
     def test_partial_user_deps_with_dynamic_hazard_still_falls_back(self):
         @pl.program
         class Prog:
