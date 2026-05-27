@@ -9,6 +9,7 @@
  * -----------------------------------------------------------------------------------------------------------
  */
 
+#include <algorithm>
 #include <any>
 #include <cstddef>
 #include <cstdint>
@@ -260,6 +261,18 @@ bool ContainsVar(const std::vector<VarPtr>& vars, const VarPtr& candidate) {
     if (var && var->UniqueId() == candidate->UniqueId()) return true;
   }
   return false;
+}
+
+YieldStmtPtr GetTrailingYield(const StmtPtr& stmt) {
+  if (auto yield = As<YieldStmt>(stmt)) return yield;
+  auto seq = As<SeqStmts>(stmt);
+  if (!seq || seq->stmts_.empty()) return nullptr;
+  return As<YieldStmt>(seq->stmts_.back());
+}
+
+bool IsTaskIdVar(const VarPtr& var) {
+  auto scalar_ty = As<ScalarType>(var ? var->GetType() : TypePtr{});
+  return scalar_ty && scalar_ty->dtype_ == DataType::TASK_ID;
 }
 
 void AppendUnique(std::vector<VarPtr>* vars, const VarPtr& candidate) {
@@ -609,10 +622,50 @@ class SubmitTaskIdCollector : public IRVisitor {
     IRVisitor::VisitStmt_(op);
   }
 
+  void VisitStmt_(const ForStmtPtr& op) override {
+    IRVisitor::VisitStmt_(op);
+    PropagateLoopCarriedTaskIds(op->iter_args_, op->return_vars_, op->body_);
+  }
+
+  void VisitStmt_(const WhileStmtPtr& op) override {
+    IRVisitor::VisitStmt_(op);
+    PropagateLoopCarriedTaskIds(op->iter_args_, op->return_vars_, op->body_);
+  }
+
   const std::unordered_map<const Call*, VarPtr>& task_id_by_call() const { return task_id_by_call_; }
   const std::unordered_map<uint64_t, VarPtr>& task_id_by_var_id() const { return task_id_by_var_id_; }
 
  private:
+  VarPtr CanonicalTaskIdForExpr(const ExprPtr& expr) const {
+    auto var = AsVarLike(expr);
+    if (!var) return nullptr;
+
+    auto it = task_id_by_var_id_.find(var->UniqueId());
+    if (it != task_id_by_var_id_.end()) return it->second;
+
+    if (IsTaskIdVar(var)) return var;
+    return nullptr;
+  }
+
+  void PropagateLoopCarriedTaskIds(const std::vector<IterArgPtr>& iter_args,
+                                   const std::vector<VarPtr>& return_vars, const StmtPtr& body) {
+    auto yield = GetTrailingYield(body);
+    if (!yield) return;
+
+    const size_t count = std::min({iter_args.size(), return_vars.size(), yield->value_.size()});
+    for (size_t i = 0; i < count; ++i) {
+      VarPtr task_id = CanonicalTaskIdForExpr(yield->value_[i]);
+      if (!task_id) continue;
+
+      if (iter_args[i]) {
+        task_id_by_var_id_[iter_args[i]->UniqueId()] = task_id;
+      }
+      if (return_vars[i]) {
+        task_id_by_var_id_[return_vars[i]->UniqueId()] = task_id;
+      }
+    }
+  }
+
   std::unordered_map<const Var*, CallPtr> call_by_tuple_;
   std::unordered_map<const Var*, std::unordered_map<int, VarPtr>> tuple_get_by_tuple_;
   std::unordered_map<const Call*, VarPtr> task_id_by_call_;
@@ -679,7 +732,7 @@ class AutoDepMutator : public IRMutator {
 
     VarPtr task_id = LookupTaskId(op.get());
     bool needs_fallback = false;
-    auto user_edges = GetDepAttr(call, kAttrManualDepEdges);
+    auto user_edges = CanonicalizeTaskIds(GetDepAttr(call, kAttrManualDepEdges));
     auto summary = SummarizeAccesses(call, op, user_edges, &needs_fallback);
     if (needs_fallback) {
       fallback_stack_.back() = true;
@@ -750,6 +803,21 @@ class AutoDepMutator : public IRMutator {
     if (!var) return nullptr;
     auto it = task_id_by_var_id_->find(var->UniqueId());
     return it != task_id_by_var_id_->end() ? it->second : nullptr;
+  }
+
+  VarPtr CanonicalTaskId(const VarPtr& var) const {
+    if (!var) return nullptr;
+    if (auto mapped = LookupTaskIdForVar(var)) return mapped;
+    return IsTaskIdVar(var) ? var : nullptr;
+  }
+
+  std::vector<VarPtr> CanonicalizeTaskIds(const std::vector<VarPtr>& vars) const {
+    std::vector<VarPtr> canonical;
+    canonical.reserve(vars.size());
+    for (const auto& var : vars) {
+      AppendUnique(&canonical, CanonicalTaskId(var));
+    }
+    return canonical;
   }
 
   AccessSummary SummarizeAccesses(const CallPtr& call, const CallPtr& original_call,
