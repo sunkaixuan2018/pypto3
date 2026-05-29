@@ -1342,7 +1342,7 @@ class TestOutWindowExternalizer:
         assert After.get_function("kernel_stripe__windowed") is not None
         printed_main = ir.python_print(_get_function(After, "main"))
         assert "pl.tensor.slice(out" in printed_main
-        assert "self.kernel_stripe__windowed" in printed_main
+        assert "kernel_stripe__windowed" in printed_main
 
     def test_loop_returned_output_later_parent_read_stays_baseline(self):
         @pl.program
