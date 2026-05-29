@@ -49,7 +49,7 @@ def _init_side_src() -> torch.Tensor:
     return (flat.reshape(T, 1) + 1.0) / 256.0
 
 
-@pl.jit.inline
+@pl.inline
 def write_route_outputs(route_src, indices):
     route_src_flat = pl.reshape(route_src, [N_ROUTE])
     indices_flat = pl.reshape(indices, [N_ROUTE])
@@ -65,14 +65,14 @@ def write_route_outputs(route_src, indices):
     return pl.reshape(indices_flat, [T, TOPK])
 
 
-@pl.jit.inline
+@pl.inline
 def copy_side_buffer(side_src, side_buf):
     with pl.at(level=pl.Level.CORE_GROUP, name_hint="copy_side_buffer"):
         side_buf[:, :] = side_src[:, :]
     return side_buf
 
 
-@pl.jit.inline
+@pl.inline
 def xnorm_first_chunk_amax(x_norm, x_norm_scale_dq_buf):
     with pl.at(level=pl.Level.CORE_GROUP, name_hint="xnorm_first_chunk_amax"):
         xn_a_f32 = pl.cast(x_norm[:, 0:QUANT_CHUNK], target_type=pl.FP32)
@@ -81,7 +81,7 @@ def xnorm_first_chunk_amax(x_norm, x_norm_scale_dq_buf):
     return x_norm_scale_dq_buf
 
 
-@pl.jit.inline
+@pl.inline
 def xnorm_scale_only(x_norm, x_norm_scale_dq_buf):
     with pl.at(level=pl.Level.CORE_GROUP, name_hint="x_norm_q"):
         xn_amax = pl.full([1, T], dtype=pl.FP32, value=INT8_AMAX_EPS)
@@ -95,7 +95,7 @@ def xnorm_scale_only(x_norm, x_norm_scale_dq_buf):
     return x_norm_scale_dq_buf
 
 
-@pl.jit.inline
+@pl.inline
 def route_stats_plain(indices, route_stats):
     with pl.at(level=pl.Level.CORE_GROUP, name_hint="route_stats_plain"):
         sum_e = pl.cast(0, pl.INT32)
@@ -117,7 +117,7 @@ def route_stats_plain(indices, route_stats):
     return route_stats
 
 
-@pl.jit.inline
+@pl.inline
 def route_stats_xnorm_scale(indices, x_norm_scale_dq_buf, route_stats):
     with pl.at(level=pl.Level.CORE_GROUP, name_hint="route_stats_xnorm_scale"):
         sum_e = pl.cast(0, pl.INT32)
