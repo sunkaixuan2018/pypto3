@@ -2086,6 +2086,44 @@ class OrchestrationStmtCodegen : public CodegenBase {
     return out_indices;
   }
 
+  // Precise return-position -> callee param-index map, memoized per callee.
+  // Empty when the callee has no traceable top-level ReturnStmt (Group/Spmd
+  // wrappers) — callers then fall back to the direction-based tail heuristic.
+  const std::vector<std::optional<size_t>>& GetReturnedParamIndices(const FunctionPtr& callee) {
+    auto it = returned_param_indices_cache_.find(callee.get());
+    if (it != returned_param_indices_cache_.end()) return it->second;
+    auto inserted =
+        returned_param_indices_cache_.emplace(callee.get(), FindReturnedParamIndices(callee, program_));
+    return inserted.first->second;
+  }
+
+  // Decide whether the precise return->param map is trustworthy for this call.
+  // It must be non-empty AND every return position whose declared type is a
+  // tensor must have resolved to a param. If a tensor writeback failed to
+  // trace, we keep the legacy heuristic to avoid regressing shapes the tracer
+  // does not model (a missed tensor alias would emit an undeclared symbol).
+  static bool IsReturnedParamMapPrecise(const std::vector<std::optional<size_t>>& ret_map,
+                                        const CallPtr& call) {
+    if (ret_map.empty()) return false;
+    auto tuple_ty = As<TupleType>(call->GetType());
+    if (!tuple_ty) return false;
+    // Kernel-result positions to validate. For a submit call the trailing tuple
+    // element is the producer TASK_ID, not a kernel result, so it has no
+    // ret_map entry — exclude it from the expected count.
+    size_t expected = tuple_ty->types_.size();
+    if (IsSubmitCall(call) && expected > 0) --expected;
+    // A short map leaves trailing tensor outputs unchecked: treat as imprecise
+    // so the caller falls back to the heuristic instead of silently skipping an
+    // unmapped tensor alias.
+    if (ret_map.size() < expected) return false;
+    for (size_t j = 0; j < expected; ++j) {
+      if (AsTensorTypeLike(tuple_ty->types_[j]) && !ret_map[j].has_value()) {
+        return false;
+      }
+    }
+    return true;
+  }
+
   void EmitTensorAlias(const std::string& alias_name, const CallPtr& call, size_t arg_idx) {
     std::string out_arg = TryGetVarName(call->args_[arg_idx]);
     if (!out_arg.empty() && alias_name != out_arg) {
@@ -2140,42 +2178,55 @@ class OrchestrationStmtCodegen : public CodegenBase {
     FunctionPtr callee = program_->GetFunction(call->op_->name_);
     if (!callee) return;
 
-    // Classify output slots by the callee's ``ParamDirection`` — not by the
-    // call-site ``ArgDirection``. A call-site ``pl.no_dep(t)`` /
-    // ``pl.at(no_dep_args=[t])`` rewrites a slot's ArgDirection to ``NoDep``
-    // regardless of whether the callee declared the param as Out / InOut.
-    // The slot is still a writer — the return tuple still carries the
-    // post-call value at that position, and downstream consumers referencing
-    // the SSA result still need a binding to the runtime output tensor.
-    // Mirrors ``GenerateSubmitReturnAliases`` (submit path).
+    // Prefer the precise return-position -> callee param map derived from the
+    // callee's ReturnStmt. It correctly handles a kernel that takes an InOut
+    // param written in place but NOT returned (issue #1573) — the legacy
+    // tail-alignment heuristic puts that param in ``out_indices`` and shifts
+    // every carry to the wrong source tensor. Fall back to the heuristic when
+    // the map is not fully trustworthy (Group/Spmd wrappers with no traceable
+    // top-level ReturnStmt, or return shapes the tracer cannot model).
+    const auto& ret_param_map = GetReturnedParamIndices(callee);
+    const bool precise = IsReturnedParamMapPrecise(ret_param_map, call);
+
+    // Legacy heuristic state — only computed when the precise map is unusable.
+    // Classify output slots by the callee's ``ParamDirection`` (not the
+    // call-site ``ArgDirection``): a ``pl.no_dep(t)`` rewrites a slot's
+    // ArgDirection to ``NoDep`` even though the callee declared it Out/InOut,
+    // and the return tuple still carries the post-call value at that position.
     std::vector<size_t> out_indices;
-    auto effective_dirs = GetEffectiveDirections(callee);
-    for (size_t i = 0; i < effective_dirs.size(); ++i) {
-      if (effective_dirs[i] == ParamDirection::Out || effective_dirs[i] == ParamDirection::InOut) {
-        out_indices.push_back(i);
+    size_t tuple_out_base = 0;
+    if (!precise) {
+      auto effective_dirs = GetEffectiveDirections(callee);
+      for (size_t i = 0; i < effective_dirs.size(); ++i) {
+        if (effective_dirs[i] == ParamDirection::Out || effective_dirs[i] == ParamDirection::InOut) {
+          out_indices.push_back(i);
+        }
       }
+      int max_tuple_index = -1;
+      for (const auto& elem : elements_it->second) {
+        max_tuple_index = std::max(max_tuple_index, elem.index);
+      }
+      size_t tuple_arity = max_tuple_index >= 0 ? static_cast<size_t>(max_tuple_index + 1) : 0;
+      tuple_out_base = tuple_arity >= out_indices.size() ? (tuple_arity - out_indices.size()) : 0;
     }
 
-    int max_tuple_index = -1;
     for (const auto& elem : elements_it->second) {
-      max_tuple_index = std::max(max_tuple_index, elem.index);
-    }
-    size_t tuple_arity = max_tuple_index >= 0 ? static_cast<size_t>(max_tuple_index + 1) : 0;
-    size_t tuple_out_base = tuple_arity >= out_indices.size() ? (tuple_arity - out_indices.size()) : 0;
-
-    for (const auto& elem : elements_it->second) {
-      // Some wrappers (notably SPMD helpers) return auxiliary scalars before
-      // Out/InOut tensors, e.g. (idx, out_tensor). Map tuple tail elements to
-      // Out/InOut params and ignore leading non-output tuple elements.
-      if (elem.index < 0) {
-        continue;
-      }
+      if (elem.index < 0) continue;
       size_t elem_pos = static_cast<size_t>(elem.index);
-      if (elem_pos < tuple_out_base) {
-        // Leading tuple elements are auxiliary values (e.g. loop iv from
-        // SPMD wrappers). They are not returned by runtime task submission.
-        // If such scalar is referenced later, materialize a safe default to
-        // keep generated orchestration compilable.
+
+      // Resolve the callee param index this tuple element writes back to.
+      std::optional<size_t> param_idx_opt;
+      if (precise) {
+        if (elem_pos < ret_param_map.size()) param_idx_opt = ret_param_map[elem_pos];
+      } else if (elem_pos >= tuple_out_base) {
+        size_t out_pos = elem_pos - tuple_out_base;
+        if (out_pos < out_indices.size()) param_idx_opt = out_indices[out_pos];
+      }
+
+      if (!param_idx_opt) {
+        // Not a param writeback: a leading auxiliary value (e.g. an SPMD loop
+        // iv). They carry no runtime output. If such a scalar is referenced
+        // later, materialize a safe default so generated code stays compilable.
         if (effective_uses_.count(elem.var)) {
           std::string elem_name = ReserveVarEmitName(elem.var);
           if (auto st = As<ScalarType>(elem.var->GetType())) {
@@ -2184,11 +2235,8 @@ class OrchestrationStmtCodegen : public CodegenBase {
         }
         continue;
       }
-      size_t out_pos = elem_pos - tuple_out_base;
-      if (out_pos >= out_indices.size()) {
-        continue;
-      }
-      size_t param_idx = out_indices[out_pos];
+
+      size_t param_idx = *param_idx_opt;
       INTERNAL_CHECK_SPAN(param_idx < call->args_.size(), call->span_)
           << "Internal error: resolved param_idx " << param_idx << " out of range for " << call->op_->name_
           << " (has " << call->args_.size() << " args)";
@@ -2249,32 +2297,32 @@ class OrchestrationStmtCodegen : public CodegenBase {
     INTERNAL_CHECK_SPAN(callee != nullptr, call->span_)
         << "Internal error: submit callee '" << call->op_->name_ << "' not found";
 
-    // Kernel output param positions, in declared order. We classify by the
-    // callee's ``ParamDirection`` (not by the call-site ``ArgDirection``): a
-    // call-site ``pl.no_dep(t)`` / ``pl.at(no_dep_args=[t])`` rewrites a slot's
-    // ArgDirection to ``NoDep`` regardless of whether the callee declared the
-    // param as In or Out. The slot is still a writer — the return tuple still
-    // carries the post-call value at that position, and downstream consumers
-    // referencing the SSA result still need a binding to the runtime output
-    // tensor. Looking only at ``ArgDirection`` would drop those bindings and
-    // produce undeclared ``__rv_*`` symbols in the emitted code.
-    auto effective_dirs = GetEffectiveDirections(callee);
-    std::vector<size_t> out_indices;
-    for (size_t i = 0; i < effective_dirs.size(); ++i) {
-      if (effective_dirs[i] == ParamDirection::Out || effective_dirs[i] == ParamDirection::InOut) {
-        out_indices.push_back(i);
-      }
-    }
+    // Prefer the precise return-position -> callee param map (handles an InOut
+    // param written in place but not returned — issue #1573). Fall back to the
+    // direction-based tail heuristic when the map is not fully trustworthy
+    // (Group/Spmd wrappers, or shapes the tracer cannot model).
+    const auto& ret_param_map = GetReturnedParamIndices(callee);
+    const bool precise = IsReturnedParamMapPrecise(ret_param_map, call);
 
-    // Map the kernel-result portion (tuple elements ``[0, n_outs)``) onto the
-    // Out/InOut params. Some wrappers (notably SPMD helpers) return auxiliary
-    // scalars *before* the tensor outputs — mirror ``GenerateTupleReturnAliases``
-    // and tail-align: result element ``elem_pos`` is an Out/InOut tensor iff
-    // ``elem_pos >= tuple_out_base``, where ``tuple_out_base`` skips the
-    // leading aux elements. Leading aux scalars carry no runtime output and
-    // are left undeclared (a referenced one would be a codegen bug surfaced
-    // elsewhere, same as the non-submit path).
-    const size_t tuple_out_base = n_outs >= out_indices.size() ? (n_outs - out_indices.size()) : 0;
+    // Legacy heuristic state — only computed when the precise map is unusable.
+    // Kernel output param positions, in declared order, classified by the
+    // callee's ``ParamDirection`` (not the call-site ``ArgDirection``): a
+    // ``pl.no_dep(t)`` rewrites a slot's ArgDirection to ``NoDep`` even though
+    // the callee declared it Out/InOut, yet the return tuple still carries the
+    // post-call value there. Some SPMD wrappers return auxiliary scalars
+    // *before* the tensor outputs, so result element ``elem_pos`` is an
+    // Out/InOut tensor iff ``elem_pos >= tuple_out_base``.
+    std::vector<size_t> out_indices;
+    size_t tuple_out_base = 0;
+    if (!precise) {
+      auto effective_dirs = GetEffectiveDirections(callee);
+      for (size_t i = 0; i < effective_dirs.size(); ++i) {
+        if (effective_dirs[i] == ParamDirection::Out || effective_dirs[i] == ParamDirection::InOut) {
+          out_indices.push_back(i);
+        }
+      }
+      tuple_out_base = n_outs >= out_indices.size() ? (n_outs - out_indices.size()) : 0;
+    }
 
     for (const auto& elem : elements_it->second) {
       if (elem.index < 0) continue;
@@ -2288,13 +2336,32 @@ class OrchestrationStmtCodegen : public CodegenBase {
         manual_task_id_map_[elem.var] = tid_name;
         continue;
       }
-      // A kernel result element. Skip the trailing TaskId / out-of-range and
-      // the leading aux-scalar elements; the rest tail-align onto out_indices.
-      if (elem_pos >= n_outs || elem_pos < tuple_out_base) continue;
-      size_t out_pos = elem_pos - tuple_out_base;
-      if (out_pos >= out_indices.size()) continue;
+      // A kernel result element. Skip the trailing TaskId / out-of-range.
+      if (elem_pos >= n_outs) continue;
+      std::optional<size_t> param_idx_opt;
+      if (precise) {
+        if (elem_pos < ret_param_map.size()) param_idx_opt = ret_param_map[elem_pos];
+      } else if (elem_pos >= tuple_out_base) {
+        size_t out_pos = elem_pos - tuple_out_base;
+        if (out_pos < out_indices.size()) param_idx_opt = out_indices[out_pos];
+      }
+      if (!param_idx_opt) {
+        // Leading aux scalar / untraced position: no runtime output. If it is
+        // referenced later, materialize a safe scalar default so the generated
+        // code stays compilable (mirrors GenerateTupleReturnAliases).
+        if (effective_uses_.count(elem.var)) {
+          std::string elem_name = ReserveVarEmitName(elem.var);
+          if (auto st = As<ScalarType>(elem.var->GetType())) {
+            code_ << Indent() << st->dtype_.ToCTypeString() << " " << elem_name << " = 0;\n";
+          }
+        }
+        continue;
+      }
       if (!effective_uses_.count(elem.var)) continue;
-      size_t param_idx = out_indices[out_pos];
+      size_t param_idx = *param_idx_opt;
+      INTERNAL_CHECK_SPAN(param_idx < callee->params_.size(), call->span_)
+          << "Internal error: resolved param_idx " << param_idx << " out of range for " << call->op_->name_
+          << " (has " << callee->params_.size() << " params)";
       std::string elem_name = ReserveVarEmitName(elem.var);
       if (param_idx < call->args_.size()) {
         // Caller-allocated: the param was passed positionally as an arg.
@@ -2589,6 +2656,12 @@ class OrchestrationStmtCodegen : public CodegenBase {
   std::unordered_set<const Var*> effective_uses_;
   std::unordered_map<std::string, int64_t> gm_pipe_workspace_elements_by_callee_;
   std::unordered_map<std::string, std::string> tensor_create_size_expr_by_emit_name_;
+  /// Memoizes ``FindReturnedParamIndices`` per callee Function. Tuple/submit
+  /// alias generation runs once per call site, but distinct call sites may
+  /// share a callee; caching the per-callee return→param map keeps the codegen
+  /// from re-walking the same callee body and stays within the O(N log N) pass
+  /// budget.
+  std::unordered_map<const Function*, std::vector<std::optional<size_t>>> returned_param_indices_cache_;
 };
 
 OrchestrationResult GenerateOrchestration(const ir::ProgramPtr& program, const ir::FunctionPtr& func) {
