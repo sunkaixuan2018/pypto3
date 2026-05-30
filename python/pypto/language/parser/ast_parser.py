@@ -171,6 +171,31 @@ def _fold_const_slice_extent(upper: object, lower: object) -> int | None:
     return upper_value - lower_value
 
 
+def _get_source_valid_shape(source_type: ir.Type) -> list[ir.Expr] | None:
+    """Return the source's view ``valid_shape``, or ``None`` when no view metadata.
+
+    Pure accessor — does NOT decide whether the source is actually narrowed
+    (whether ``valid_shape`` differs from ``shape``). Callers that need the
+    narrowing semantics should compare against ``source_type.shape`` themselves
+    (e.g. via :func:`_shape_exprs_match`).
+
+    TensorType reads ``tensor_view.valid_shape``; TileType uses
+    ``get_effective_tile_view()`` so a canonicalized implicit view (stored as
+    ``None``) still surfaces its semantic ``valid_shape``.
+    """
+    if isinstance(source_type, ir.TensorType):
+        view = source_type.tensor_view
+        if view is None or not view.valid_shape:
+            return None
+        return list(view.valid_shape)
+    if isinstance(source_type, ir.TileType):
+        view = source_type.get_effective_tile_view()
+        if not view.valid_shape:
+            return None
+        return list(view.valid_shape)
+    return None
+
+
 def _shape_exprs_match(lhs: Sequence[ir.Expr], rhs: Sequence[ir.Expr]) -> bool:
     """Return whether two shape-like expression lists are statically identical."""
     if len(lhs) != len(rhs):
@@ -1565,28 +1590,117 @@ class ASTParser:
         # prepended when the source carries the tile 2D-floor's padding.
         lead_units = src_rank - natural_rank
         expected_extents = [1] * lead_units + [extents[d] for d in kept_dims]
+        # A narrowed source (static_shape padded for ISA alignment, valid_shape
+        # carrying the logical extent — same pattern pl.store accepts on the
+        # tile path) is allowed when its valid_shape matches the window.
+        source_valid_shape = _get_source_valid_shape(source_type)
         for src_axis, want in enumerate(expected_extents):
             requested_const = _fold_const_slice_extent(want, 0)
             source_const = _fold_const_slice_extent(source_type.shape[src_axis], 0)
-            if requested_const is not None and source_const is not None and requested_const != source_const:
-                raise ParserTypeError(
-                    f"Subscript-write shape mismatch on source axis {src_axis}: "
-                    f"window expects {requested_const} elements, source has {source_const}",
-                    span=span,
-                    hint="Make the source's extents match the rank-reduced lhs window, "
-                    "or adjust the slice bounds",
-                )
+            if requested_const is None or source_const is None:
+                continue
+            if requested_const == source_const:
+                continue
+            if source_valid_shape is not None:
+                valid_const = _fold_const_slice_extent(source_valid_shape[src_axis], 0)
+                # Dynamic valid_shape (folds to None) — parser cannot disprove
+                # the match, so trust it, symmetric to dynamic slot / dynamic
+                # static_shape above. Constant valid_shape only accepts on a
+                # match.
+                if valid_const is None or valid_const == requested_const:
+                    continue
+            raise ParserTypeError(
+                f"Subscript-write shape mismatch on source axis {src_axis}: "
+                f"window expects {requested_const} elements, source has {source_const}",
+                span=span,
+                hint="Make the source's static_shape or valid_shape match the "
+                "rank-reduced lhs window, or adjust the slice bounds",
+            )
 
         if src_rank != len(extents):
-            # Lift the rank-reduced source back to the full-rank target window
-            # (unit dims at the dropped positions) so the assemble's source/window
-            # ranks match — mirrors the implicit reshape numpy does on a write.
-            reshape_op = ir_op.tensor.reshape if kind_name == "tensor" else ir_op.tile.reshape
-            source_expr = reshape_op(source_expr, list(extents), span=span)
+            source_expr = self._lift_subscript_write_source_rank(
+                source_expr,
+                source_type,
+                source_valid_shape,
+                drop_dims,
+                extents,
+                lead_units,
+                kind_name,
+                span,
+            )
 
         assemble_call = assemble_op(base_expr, source_expr, offsets, span=span)
         var = self._assign_or_let(var_name, assemble_call, span)
         self.scope_manager.define_var(var_name, var, span=span)
+
+    def _lift_subscript_write_source_rank(
+        self,
+        source_expr: ir.Expr,
+        source_type: ir.TensorType | ir.TileType,
+        source_valid_shape: list[ir.Expr] | None,
+        drop_dims: list[int],
+        extents: list[int | ir.Expr],
+        lead_units: int,
+        kind_name: str,
+        span: ir.Span,
+    ) -> ir.Expr:
+        """Reshape source up to the full-rank target window for rank-reducing writes.
+
+        Inserts unit dims at the ``drop_dims`` positions so the assemble's
+        source/window ranks match — mirrors the implicit reshape numpy does on
+        write. Reshape target always derives from the source's *own* padded
+        ``static_shape`` (minus any tile 2D-floor lead unit axes), so the
+        reshape product check passes whether or not the source carries a
+        narrower ``valid_shape`` (issue #1509).
+
+        When the source carries an explicit narrower ``valid_shape``, that
+        narrowing is carried forward via ``tensor.reshape``'s optional 3rd
+        argument; ``tile.reshape`` has no such parameter, so a narrowed tile
+        + rank-lift combo is rejected here (the user should switch to
+        ``pl.store``).
+        """
+        # "Narrowed" means valid_shape is actually smaller than shape; a view
+        # with valid_shape == shape (e.g. a tile's canonical implicit view) is
+        # semantically equivalent to no view and must NOT be treated as a
+        # narrow source — otherwise canonical 1D-tile rank-lift writes would
+        # hit the issue #1509 path meant for ISA-padded sources.
+        is_narrowed = source_valid_shape is not None and not _shape_exprs_match(
+            source_type.shape, source_valid_shape
+        )
+
+        # tile.reshape has no valid_shape parameter, so a narrowed tile +
+        # rank-lift would silently drop the narrowing. Reject upfront and point
+        # users to pl.store.
+        if is_narrowed and kind_name != "tensor":
+            raise UnsupportedFeatureError(
+                "Subscript-write with rank reduction is not supported when "
+                "the source tile carries an explicit valid_shape — "
+                "tile.reshape cannot carry valid_shape across the rank lift.",
+                span=span,
+                hint="Write the tile via pl.store directly, or use slice "
+                "indices on every axis instead of scalar indices to avoid "
+                "rank reduction.",
+            )
+
+        drop_set = set(drop_dims)
+        unit: ir.Expr = ir.ConstInt(1, DataType.INDEX, span)
+
+        def _lift_shape(seq: Sequence[int | ir.Expr]) -> list[int | ir.Expr]:
+            # Skip the tile 2D-floor lead unit axes — they were padded into seq
+            # only to satisfy the tile ≥2D invariant; the lift reconstructs the
+            # target rank from the kept positions and the drop_dims unit fillers.
+            it = iter(list(seq)[lead_units:])
+            return [unit if d in drop_set else next(it) for d in range(len(extents))]
+
+        reshape_op = ir_op.tensor.reshape if kind_name == "tensor" else ir_op.tile.reshape
+        reshape_args: list[list[int | ir.Expr]] = [_lift_shape(source_type.shape)]
+        if is_narrowed:
+            # Tensor path with a genuinely narrower valid_shape — carry it via
+            # reshape's optional 3rd arg so the narrowing survives the rank
+            # lift (issue #1509). Asserted non-None by the is_narrowed guard.
+            assert source_valid_shape is not None
+            reshape_args.append(_lift_shape(source_valid_shape))
+        return reshape_op(source_expr, *reshape_args, span=span)
 
     def _parse_array_subscript_assignment(
         self,
