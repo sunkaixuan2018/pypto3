@@ -5181,6 +5181,7 @@ class ASTParser:
                 not match the expected shape.
         """
         from pypto.language.arg_direction import NAME_TO_DIRECTION  # noqa: PLC0415
+
         attrs_kw: ast.keyword | None = next((kw for kw in keywords if kw.arg == "attrs"), None)
         if attrs_kw is None:
             return _CallAttrMetadata()
