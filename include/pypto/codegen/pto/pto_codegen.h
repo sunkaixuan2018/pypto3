@@ -12,6 +12,7 @@
 #ifndef PYPTO_CODEGEN_PTO_PTO_CODEGEN_H_
 #define PYPTO_CODEGEN_PTO_PTO_CODEGEN_H_
 
+#include <cstddef>
 #include <cstdint>
 #include <map>
 #include <memory>
@@ -137,6 +138,20 @@ class PTOCodegen : public CodegenBase {
    * @return Tensor view name
    */
   std::string GetOrCreateTensorView(const ir::VarPtr& tensor);
+
+  /**
+   * @brief Look up the tensor view for a variable without creating/failing.
+   *
+   * Like GetOrCreateTensorView but returns an empty string when no view is
+   * registered (and none is reachable via an IterArg init chain), instead of
+   * raising. Callers that have a valid fallback (e.g. yielding a tensor that
+   * has no make_tensor_view, or propagating a plain tensor alias) use this to
+   * avoid a hard failure.
+   *
+   * @param tensor Tensor variable
+   * @return Tensor view SSA name, or "" if none is registered
+   */
+  [[nodiscard]] std::string TryGetTensorView(const ir::VarPtr& tensor) const;
 
   /**
    * @brief Get or emit a numeric constant of any dtype (int, index, or float).
@@ -393,7 +408,8 @@ class PTOCodegen : public CodegenBase {
    * DistributedTensor parameter at the end of the func.func signature
    * (after explicit tensor/scalar params, before dynamic-shape ``index``
    * params). The mapping ``dist_tensor_var → ctx_ssa`` lets the
-   * pld.tile.remote_load / pld.system.notify / pld.system.wait codegen
+   * pld.system.get_comm_ctx / pld.tile.remote_load / pld.tensor.put /
+   * pld.system.notify / pld.system.wait codegen
    * recover the matching context pointer.
    *
    * @param dist_var DistributedTensor parameter variable.
@@ -501,6 +517,18 @@ class PTOCodegen : public CodegenBase {
    * @brief Check if the current function is an AIV (Vector) function
    */
   [[nodiscard]] bool IsAIVFunction() const;
+
+  /**
+   * @brief Check if the current function carries the `dual_aiv_dispatch`
+   * attribute (910B no-split dual-AIV dispatch). In that mode the single cube
+   * consumer reads the FULL slot while two AIV subblocks share it, so the
+   * cross-core tpush transport widens only the COLUMN axis to the producer's
+   * box (carrying its fillpad'd columns) while PRESERVING the row
+   * `valid_shape[0]`: subblock 0's real push stays full and subblock 1's
+   * 0-row replay stays a no-op. Genuine `split==1/2` paths widen both axes --
+   * see `EmitSplitTpushTransportValidShape`.
+   */
+  [[nodiscard]] bool IsDualAivDispatchFunction() const;
 
  protected:
   // Override visitor methods for code generation - Statements
@@ -650,8 +678,10 @@ class PTOCodegen : public CodegenBase {
     std::map<const ir::Var*, std::string> var_to_mlir;
     std::map<const ir::Var*, std::string> tensor_to_view;
     std::map<const ir::Var*, std::string> tensor_to_base_ptr;  ///< tensor var → base ptr SSA
-    std::map<const ir::Var*, std::string> memref_to_mlir;      ///< keyed by base_ Ptr
-    std::map<const ir::Var*, const ir::Var*> var_to_memref;    ///< maps tile var → base_ Ptr
+    std::map<std::string, std::string>
+        view_ssa_to_base_ptr;  ///< tensor_view SSA → base ptr SSA (for rebinding IfStmt phi return_vars)
+    std::map<const ir::Var*, std::string> memref_to_mlir;    ///< keyed by base_ Ptr
+    std::map<const ir::Var*, const ir::Var*> var_to_memref;  ///< maps tile var → base_ Ptr
     std::map<const ir::Var*, std::shared_ptr<const ir::TileType>>
         memref_to_tile_type;  ///< keyed by base_ Ptr
 
@@ -694,7 +724,8 @@ class PTOCodegen : public CodegenBase {
     /// Mapping from DistributedTensor parameter Var → CommContext pointer
     /// arg SSA name. Populated in GenerateFunction when appending the
     /// trailing ``!pto.ptr<i64>`` ctx params. Consumed by
-    /// pld.tile.remote_load / pld.system.notify / pld.system.wait codegen
+    /// pld.system.get_comm_ctx / pld.tile.remote_load / pld.tensor.put /
+    /// pld.system.notify / pld.system.wait codegen
     /// to recover the per-tensor CommContext pointer.
     std::map<const ir::Var*, std::string> dist_tensor_to_ctx;
 
@@ -711,6 +742,7 @@ class PTOCodegen : public CodegenBase {
       var_to_mlir.clear();
       tensor_to_view.clear();
       tensor_to_base_ptr.clear();
+      view_ssa_to_base_ptr.clear();
       memref_to_mlir.clear();
       var_to_memref.clear();
       memref_to_tile_type.clear();

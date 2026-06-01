@@ -107,7 +107,7 @@ const Tensor& tmp = alloc_0.get_ref(0);
 
 All task submission is wrapped in a top-level `PTO2_SCOPE()`. Codegen no longer
 decides scope placement from the `for` / `if` structure: the
-[MaterializeRuntimeScopes](../passes/37-materialize_runtime_scopes.md) pass
+[MaterializeRuntimeScopes](../passes/38-materialize_runtime_scopes.md) pass
 inserts explicit AUTO `RuntimeScopeStmt` nodes (the function body and each
 `for` / `if` body) into the IR, and codegen emits `PTO2_SCOPE` 1:1 from those
 nodes (manual scopes lower to `PTO2_SCOPE(PTO2ScopeMode::MANUAL)`):
@@ -438,14 +438,25 @@ variables. Each entry resolves at codegen time through
 | `pl.submit` producer TaskId (the augmented Call's TaskId tuple element) | `PTO2TaskId <tid_name> = task_<n>_outs.task_id();` where `task_<n>_outs` is the `TaskOutputTensors` captured from the submit |
 | `None` seed (the literal in a `deps=[None]` entry or a TaskId iter_arg init) | `PTO2TaskId::invalid()` |
 | Loop-carry iter_arg (TaskId companion threaded through a loop) | A named variable threaded through the for-loop, either scalar or array — see below |
+| Array-slot read (`prev = tids[k]` — `array.get_element` on an `Array[TASK_ID]`) | `PTO2TaskId <name> = <arr>[k];` — a scalar snapshot local; the dep references this local, not a re-read of the slot, so a later `tids[k] = ...` overwrite does not change it |
 
 The kernel-result tuple elements of a `pl.submit` call alias the kernel's
 `Out`/`InOut` args exactly like an ordinary multi-output kernel call.
 
-A dep array-fill entry is wrapped in `if (<task_id>.is_valid())` when the
-source is an iter_arg / array-slot carry (first-iteration seed may still be
-the invalid sentinel) and appended unconditionally for direct
-`pl.submit`-producer TaskId bindings.
+Every dep array-fill entry is wrapped in `if (<task_id>.is_valid())` —
+including direct `pl.submit`-producer TaskId bindings. `EmitManualDeps` guards
+every scalar (string-backed) TaskId uniformly because any TaskId may hold the
+`PTO2TaskId::invalid()` sentinel (a first-iteration iter_arg carry, an unwritten
+array slot, an array-slot read, or a `None` seed). Array-carry iter_args fill
+one guarded slot per element.
+
+**Lexical-scope lifetime.** TaskId bindings name C++ locals (`PTO2TaskId tid
+= ...`) declared inside the generated `PTO2_SCOPE { ... }` block they are
+produced in. Each `PTO2_SCOPE` (AUTO or MANUAL) snapshots `manual_task_id_map_`
+on entry and restores it on exit, so a binding produced inside a scope does not
+leak to an enclosing scope where its identifier would be out of C++ scope. Loop
+/ branch carries are declared *before* their body's `PTO2_SCOPE`, so they
+correctly survive the block.
 
 ### Array carry for `pl.parallel` TaskId iter_args
 
@@ -477,6 +488,32 @@ A `pl.range` (Sequential) loop whose yield value is the rv of an inner
 becomes an array carry of the same N, slot-by-slot copied on outer yield.
 This propagation is the structural source of the multi-iter fence semantics
 in topologies like case1 (outer SEQ × inner PARALLEL).
+
+### Phase-fence dummy barriers
+
+After `DeriveCallDirections`, the `ExpandManualPhaseFence` pass may compress a
+profitable stable full-array manual dependency by rewriting selected
+`manual_dep_edges=[tids]` consumer calls to `manual_dep_edges=[barrier_tid]`.
+It inserts a marked `system.task_dummy` call whose own `manual_dep_edges` still
+references the original TaskId array. Orchestration codegen lowers that marked
+call to `rt_submit_dummy_task(...)`, then emits ordinary scalar dependency
+lowering for the rewritten consumers.
+
+This preserves the phase boundary while avoiding repeated all-to-all fanout:
+
+```text
+tids[N] -> dummy barrier -> consumers[M]
+```
+
+Shapes that are not clearly safe or profitable stay on the direct
+`manual_dep_edges` lowering path. In particular, `manual_scope` treats explicit
+deps as authoritative: a `pl.parallel` body that reads `deps=[tids]` and then
+updates `tids[branch]` is a same-carrier dependency chain, not a snapshot
+source for pre-loop compression. Users who want layer-parallel snapshot
+semantics should write a separate `tids_next` carrier and carry it back after
+the parallel body via loop-carried `init_values` / `pl.yield_`. We do not spell
+this as plain `tids = tids_next` here because the current codegen path does not
+support an ordinary `AssignStmt` on `ArrayType`.
 
 **Constraints checked at codegen entry (with user-facing CHECK messages):**
 

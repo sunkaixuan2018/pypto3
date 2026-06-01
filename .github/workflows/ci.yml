@@ -75,14 +75,60 @@ jobs:
     - name: Test unit tests
       run: pytest tests/ut -n auto --maxprocesses 8 -v
 
+  codegen-tests:
+    # Codegen-only: verifies IR → kernel/orch C++ generation without going
+    # on-board. --codegen-only skips assembly (ptoas), pto-isa, simpler and
+    # device execution (see tests/st/harness/core/test_runner.py), so this
+    # runs on a CPU runner and never competes for NPU cards.
+    runs-on: [self-hosted, linux, arm64, cpu]
+    env:
+      CMAKE_BUILD_PARALLEL_LEVEL: 16
+      CMAKE_C_COMPILER_LAUNCHER: ccache
+      CMAKE_CXX_COMPILER_LAUNCHER: ccache
+      CCACHE_DIR: /root/.cache/ccache
+      CCACHE_MAXSIZE: 5G
+      PIP_CACHE_DIR: /root/.cache/pip
+    container:
+      image: localhost:5000/ci-py310:latest
+      options: >-
+        -v /home/ci-runner/hw-native-sys-pypto/ci-cache/pip:/root/.cache/pip
+        -v /home/ci-runner/hw-native-sys-pypto/ci-cache/ccache:/root/.cache/ccache
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          submodules: true
+
+      - name: Show ccache stats (before)
+        run: ccache -s || true
+
+      - name: Install project and dependencies
+        run: |
+          python -m pip install --upgrade pip
+          pip install scikit-build-core nanobind cmake ninja
+          rm -rf ./build ./_skbuild
+          test ! -e ./build && test ! -e ./_skbuild && echo "OK: pypto build removed"
+          pip install --no-build-isolation .[dev]
+
+      - name: Show ccache stats (after)
+        run: ccache -s || true
+
+      - name: Test codegen (codegen-only, no device)
+        # test_torch_codegen_paged_attention does a numeric golden compare whose
+        # bf16/fp16 accumulation is sensitive to the host torch/BLAS build; it
+        # drifts past tolerance on this CPU container, so it runs in the npu
+        # system-tests job instead (it needs no device, only that environment).
+        run: >-
+          pytest tests/st/codegen -v --codegen-only
+          --ignore=tests/st/codegen/torch/test_torch_codegen_paged_attention.py
+
   system-tests:
-    runs-on: [self-hosted, linux, arm64, npu]
+    runs-on: [self-hosted, linux, arm64, npu-1-device]
     env:
       ASCEND_HOME_PATH: /usr/local/Ascend/cann-9.0.0
       PTOAS_ROOT: ${{ github.workspace }}/ptoas-bin
       PTO_ISA_ROOT: ${{ github.workspace }}/pto-isa
-      PTOAS_VERSION: v0.40
-      PTOAS_SHA256: 2fe83fe0c9087d40e2a4312e9816e8a1a16f63a48b0bcb21e27fb63736e0fab6
+      PTOAS_VERSION: v0.42
+      PTOAS_SHA256: 216c68fc9bb629a41ae2c9d1d0ec2f912b48b67c7c8f57687d6161e2f07c66a6
       CMAKE_BUILD_PARALLEL_LEVEL: 16
       CMAKE_C_COMPILER_LAUNCHER: ccache
       CMAKE_CXX_COMPILER_LAUNCHER: ccache
@@ -153,7 +199,7 @@ jobs:
           timeout 60 git clone https://github.com/hw-native-sys/pto-isa.git $GITHUB_WORKSPACE/pto-isa \
             || { rm -rf $GITHUB_WORKSPACE/pto-isa; timeout 300 git clone https://gitcode.com/luohuan40/pto-isa.git $GITHUB_WORKSPACE/pto-isa; }
           cd $GITHUB_WORKSPACE/pto-isa
-          git checkout 2c607938
+          git checkout 8bd3ac8f30bd237f9eaf12c142002a5cc0edb143
 
       - name: Install simpler
         run: |
@@ -166,7 +212,14 @@ jobs:
 
       - name: Test system tests
         timeout-minutes: 15
-        run: pytest tests/st -v --device="$DEVICE_RANGE" --precompile-workers=128 --pto-isa-commit=2c607938 --ignore=tests/st/distributed
+        # tests/st/codegen is device-free and runs in the separate CPU
+        # codegen-tests job (--codegen-only). On-board execution tests
+        # (incl. the paged-attention pipelines) live under tests/st/runtime.
+        # test_torch_codegen_paged_attention is passed explicitly so it still
+        # runs here despite the tests/st/codegen ignore: its numeric golden
+        # compare is unstable on the CPU container's torch/BLAS build (see the
+        # codegen-tests job), so it needs this environment.
+        run: pytest tests/st tests/st/codegen/torch/test_torch_codegen_paged_attention.py -v --device="$DEVICE_RANGE" --precompile-workers=128 --pto-isa-commit=8bd3ac8f30bd237f9eaf12c142002a5cc0edb143 --ignore=tests/st/distributed --ignore=tests/st/codegen
 
       - name: Test multi-orch L2 (isolated pytest invocation)
         # A ``Worker(level=2)`` device session currently leaves runtime
@@ -175,12 +228,12 @@ jobs:
         # isolation bug). Running this file in its own pytest process
         # keeps the L2 leak from poisoning ``test_l3_distributed``.
         timeout-minutes: 3
-        run: pytest tests/st/distributed/test_l2_multi_orch.py -v --device="$DEVICE_RANGE" --pto-isa-commit=2c607938
+        run: pytest tests/st/distributed/test_l2_multi_orch.py -v --device="$DEVICE_RANGE" --pto-isa-commit=8bd3ac8f30bd237f9eaf12c142002a5cc0edb143
 
       - name: Test swimlane output
         run: |
           pytest tests/st/runtime/framework_and_models/test_perf_swimlane.py \
-            -v --device="$DEVICE_ID" --platform=a2a3 --enable-l2-swimlane --forked --pto-isa-commit=2c607938
+            -v --device="$DEVICE_ID" --platform=a2a3 --enable-l2-swimlane --forked --pto-isa-commit=8bd3ac8f30bd237f9eaf12c142002a5cc0edb143
 
   dist-system-tests:
     # No container: HCCL needs host-only env (HCCL_LOGIC_SUPERPOD_ID, plugin
@@ -190,7 +243,7 @@ jobs:
     # Checkout / install happen under ./dist-checkout so they don't collide
     # with system-tests' workspace (which is owned by container root and
     # would EACCES our ci-runner cleanup).
-    runs-on: [self-hosted, linux, arm64, npu]
+    runs-on: [self-hosted, linux, arm64, npu-2-device]
     defaults:
       run:
         working-directory: dist-checkout
@@ -198,8 +251,8 @@ jobs:
       ASCEND_HOME_PATH: /usr/local/Ascend/cann-9.0.0
       PTOAS_ROOT: ${{ github.workspace }}/dist-checkout/ptoas-bin
       PTO_ISA_ROOT: ${{ github.workspace }}/dist-checkout/pto-isa
-      PTOAS_VERSION: v0.40
-      PTOAS_SHA256: 2fe83fe0c9087d40e2a4312e9816e8a1a16f63a48b0bcb21e27fb63736e0fab6
+      PTOAS_VERSION: v0.42
+      PTOAS_SHA256: 216c68fc9bb629a41ae2c9d1d0ec2f912b48b67c7c8f57687d6161e2f07c66a6
       CMAKE_BUILD_PARALLEL_LEVEL: 16
       CMAKE_C_COMPILER_LAUNCHER: ccache
       CMAKE_CXX_COMPILER_LAUNCHER: ccache
@@ -243,22 +296,33 @@ jobs:
           timeout 60 git clone https://github.com/hw-native-sys/pto-isa.git "$PTO_ISA_ROOT" \
             || { rm -rf "$PTO_ISA_ROOT"; timeout 300 git clone https://gitcode.com/luohuan40/pto-isa.git "$PTO_ISA_ROOT"; }
           cd "$PTO_ISA_ROOT"
-          git checkout 2c607938
+          git checkout 6909e5c4
 
-      - name: Bootstrap conda + CANN env
-        # Activate conda py310 + source CANN set_env.sh, then dump the whole
-        # env into $GITHUB_ENV so later steps inherit it.
-        # LD_LIBRARY_PATH is prepended with $CONDA_PREFIX/lib because ptoas
-        # needs GLIBCXX_3.4.29 (system libstdc++ is too old).
+      - name: Bootstrap conda + per-job venv + write activate.sh
+        # Set up a per-job venv layered on conda py310 and generate
+        # activate.sh so each later step enters the env with a single
+        # `source activate.sh`
+        #
+        # LD_LIBRARY_PATH is prepended with $CONDA_PREFIX/lib because
+        # ptoas needs GLIBCXX_3.4.29 (system libstdc++ is too old).
         run: |
           source /home/ci-runner/miniconda3/etc/profile.d/conda.sh
           conda activate py310
+          python -m venv venv --system-site-packages
+          cat > activate.sh <<'EOF'
+          source /home/ci-runner/miniconda3/etc/profile.d/conda.sh
+          conda activate py310
+          source "$GITHUB_WORKSPACE/dist-checkout/venv/bin/activate"
           source /usr/local/Ascend/cann-9.0.0/set_env.sh
           export LD_LIBRARY_PATH="$CONDA_PREFIX/lib:$LD_LIBRARY_PATH"
-          env | grep -vE '^(_=|SHLVL=|PWD=|OLDPWD=|PS1=|PROMPT_COMMAND=|GITHUB_|RUNNER_|INPUT_)' >> "$GITHUB_ENV"
+          # PTO2_RING_* come from the runner's systemd Environment and
+          # break HCCL tests on this host; unset them before pytest.
+          unset PTO2_RING_HEAP PTO2_RING_TASK_WINDOW PTO2_RING_DEP_POOL
+          EOF
 
       - name: Install project and dependencies
         run: |
+          source activate.sh
           rm -rf ./build ./_skbuild ./runtime/build ./runtime/_skbuild
           python -m pip install --upgrade pip
           pip install scikit-build-core nanobind cmake ninja
@@ -267,16 +331,18 @@ jobs:
 
       - name: Test distributed system tests
         timeout-minutes: 10
-        run: pytest tests/st/distributed -v --device="$DEVICE_RANGE" --pto-isa-commit=2c607938 --ignore=tests/st/distributed/test_l2_multi_orch.py
+        run: |
+          source activate.sh
+          python -m pytest tests/st/distributed -v --device="$DEVICE_RANGE" --pto-isa-commit=6909e5c4 --ignore=tests/st/distributed/test_l2_multi_orch.py
 
   pypto-lib-model:
-    runs-on: [self-hosted, linux, arm64, npu]
+    runs-on: [self-hosted, linux, arm64, npu-1-device]
     env:
       ASCEND_HOME_PATH: /usr/local/Ascend/cann-9.0.0
       PTOAS_ROOT: ${{ github.workspace }}/ptoas-bin
       PTO_ISA_ROOT: ${{ github.workspace }}/pto-isa
-      PTOAS_VERSION: v0.40
-      PTOAS_SHA256: 2fe83fe0c9087d40e2a4312e9816e8a1a16f63a48b0bcb21e27fb63736e0fab6
+      PTOAS_VERSION: v0.42
+      PTOAS_SHA256: 216c68fc9bb629a41ae2c9d1d0ec2f912b48b67c7c8f57687d6161e2f07c66a6
       CMAKE_BUILD_PARALLEL_LEVEL: 16
       CMAKE_C_COMPILER_LAUNCHER: ccache
       CMAKE_CXX_COMPILER_LAUNCHER: ccache
@@ -343,7 +409,7 @@ jobs:
           timeout 60 git clone https://github.com/hw-native-sys/pto-isa.git $GITHUB_WORKSPACE/pto-isa \
             || { rm -rf $GITHUB_WORKSPACE/pto-isa; timeout 300 git clone https://gitcode.com/luohuan40/pto-isa.git $GITHUB_WORKSPACE/pto-isa; }
           cd $GITHUB_WORKSPACE/pto-isa
-          git checkout 2c607938
+          git checkout 8bd3ac8f30bd237f9eaf12c142002a5cc0edb143
 
       - name: Install simpler
         run: |
@@ -365,18 +431,6 @@ jobs:
           PYTHONPATH: ${{ github.workspace }}/pypto-lib
         run: python models/qwen3/14b/decode_layer.py -p a2a3 -d "$DEVICE_ID"
 
-      - name: Run pypto-lib DeepSeek-V4 decode indexer example
-        working-directory: ${{ github.workspace }}/pypto-lib
-        env:
-          PYTHONPATH: ${{ github.workspace }}/pypto-lib
-        run: python models/deepseek/v4/decode_indexer.py -p a2a3 -d "$DEVICE_ID"
-
-      - name: Run pypto-lib DeepSeek-V4 hc_pre example
-        working-directory: ${{ github.workspace }}/pypto-lib
-        env:
-          PYTHONPATH: ${{ github.workspace }}/pypto-lib
-        run: python models/deepseek/v4/hc_pre.py -p a2a3 -d "$DEVICE_ID"
-
       - name: Run pypto-lib DeepSeek-V4 decode_attention_swa example
         working-directory: ${{ github.workspace }}/pypto-lib
         env:
@@ -393,8 +447,8 @@ jobs:
     runs-on: ubuntu-latest
     env:
       PTOAS_ROOT: ${{ github.workspace }}/ptoas-bin
-      PTOAS_VERSION: v0.40
-      PTOAS_SHA256: 64c835839a9e1c3696617f82f3710705b3bd4b0bc0de3049d21b08885ac41c39
+      PTOAS_VERSION: v0.42
+      PTOAS_SHA256: 3b3879bd5c991d116a30ff3152d6e2941758b293394bdb106f5bb71bb1e5c9df
     container:
       image: ghcr.io/hw-native-sys/pypto/github-ci:latest
     steps:
@@ -436,10 +490,10 @@ jobs:
         # against the runtime's bundled pto-isa, which still clones from the
         # stale PTO-ISA/pto-isa mirror (lacks pto::Coalesce) until the runtime
         # submodule is bumped past simpler #806. Re-enable once that lands.
-        run: pytest tests/st/runtime/ops/test_assemble.py tests/st/runtime/ops/test_mscatter.py tests/st/runtime/framework_and_models/test_qwen3_decode_scope3_mixed.py tests/st/runtime/control_flow/test_dyn_orch_shape.py::TestDynOrchShapeOperations::test_dyn_orch_paged_attention -v --platform=a5sim --forked --pto-isa-commit=2c607938 -k "not TestMscatter"
+        run: pytest tests/st/runtime/ops/test_assemble.py tests/st/runtime/ops/test_mscatter.py tests/st/runtime/framework_and_models/test_qwen3_decode_scope3_mixed.py tests/st/runtime/control_flow/test_dyn_orch_shape.py::TestDynOrchShapeOperations::test_dyn_orch_paged_attention -v --platform=a5sim --forked --pto-isa-commit=8bd3ac8f30bd237f9eaf12c142002a5cc0edb143 -k "not TestMscatter"
 
       - name: Test A5 cross-core system tests (simulator)
-        run: pytest tests/st/runtime/cross_core/test_cross_core.py -v --forked --platform=a5sim --pto-isa-commit=2c607938
+        run: pytest tests/st/runtime/cross_core/test_cross_core.py -v --forked --platform=a5sim --pto-isa-commit=8bd3ac8f30bd237f9eaf12c142002a5cc0edb143
 
       - name: Test A2A3 cross-core system tests (simulator)
-        run: pytest tests/st/runtime/cross_core/test_cross_core.py -v --forked --platform=a2a3sim --pto-isa-commit=2c607938
+        run: pytest tests/st/runtime/cross_core/test_cross_core.py -v --forked --platform=a2a3sim --pto-isa-commit=8bd3ac8f30bd237f9eaf12c142002a5cc0edb143

@@ -17,6 +17,7 @@ orchestration codegen 在发出 `Arg::set_dependencies(...)` 前合并并去重�
 ```text
 ... -> DeriveCallDirections
     -> AutoDeriveTaskDependencies
+    -> ExpandManualPhaseFence
     -> CollectCommGroups
     -> Simplify (final)
 ```

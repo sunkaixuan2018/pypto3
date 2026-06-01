@@ -843,6 +843,46 @@ class TestEdgeCases:
         After = passes.convert_to_ssa()(Before)
         ir.assert_structural_equal(After, Expected)
 
+    def test_tile_view_valid_shape_substitution(self):
+        """Variables in TileType.tile_view.valid_shape must be renamed after SSA.
+
+        Dual of test_tensor_view_valid_shape_substitution: the pass walks the
+        Call's return type and rewrites the TileView.valid_shape branch
+        (convert_to_ssa_pass.cpp SubstType, TileType case). A scalar that is
+        SSA-versioned must propagate into the resulting Tile's valid_shape.
+        """
+
+        @pl.program
+        class Before:
+            @pl.function(type=pl.FunctionType.InCore)
+            def main(
+                self,
+                x: pl.Tensor[[16, 64], pl.FP32],
+                n: pl.Scalar[pl.INDEX],
+            ) -> pl.Tensor[[8, 64], pl.FP32]:
+                valid_len: pl.Scalar[pl.INDEX] = pl.min(n, 64)
+                t = pl.load(x, [0, 0], [16, 64])
+                s = pl.tile.slice(t, [8, 64], [0, 0], valid_shape=[8, valid_len])
+                out = pl.store(s, [0, 0], x)
+                return out
+
+        @pl.program
+        class Expected:
+            @pl.function(type=pl.FunctionType.InCore, strict_ssa=True)
+            def main(
+                self,
+                x: pl.Tensor[[16, 64], pl.FP32],
+                n: pl.Scalar[pl.INDEX],
+            ) -> pl.Tensor[[8, 64], pl.FP32]:
+                valid_len_0: pl.Scalar[pl.INDEX] = pl.min(n, 64)
+                t_0 = pl.load(x, [0, 0], [16, 64])
+                s_0 = pl.tile.slice(t_0, [8, 64], [0, 0], valid_shape=[8, valid_len_0])
+                out_0 = pl.store(s_0, [0, 0], x)
+                return out_0
+
+        After = passes.convert_to_ssa()(Before)
+        ir.assert_structural_equal(After, Expected)
+
     def test_unused_variable(self):
         """Unused variable should still be versioned."""
 
@@ -1634,6 +1674,79 @@ class TestEscapingVariables:
         ir.assert_structural_equal(After, Expected)
 
 
+class TestSubmitSSA:
+    """SSA renaming must reach into Submit's first-class ``args_`` and ``deps_``.
+
+    ``Submit`` is a sibling call-like Expr kind (see pass-submit-awareness.md):
+    ConvertToSSA's ExprSubstituter overrides VisitExpr_(SubmitPtr) and relies on
+    the base IRMutator to walk both ``args_`` and ``deps_``. A reassigned arg
+    must rebind to its latest SSA version in ``args_``, and a producer TaskId
+    used in a consumer's ``deps=[...]`` must rebind to the versioned TaskId Var.
+    """
+
+    def test_submit_args_and_deps_versioned(self):
+        """A reassigned Submit arg picks up its latest SSA version, and a
+        downstream ``deps=[a_tid]`` rebinds to the versioned producer TaskId."""
+
+        @pl.program
+        class Before:
+            @pl.function(type=pl.FunctionType.InCore)
+            def producer(self, x: pl.Tensor[[64], pl.FP32]) -> pl.Tensor[[64], pl.FP32]:
+                return x
+
+            @pl.function(type=pl.FunctionType.InCore)
+            def consumer(
+                self,
+                x: pl.Tensor[[64], pl.FP32],
+                out: pl.Out[pl.Tensor[[64], pl.FP32]],
+            ) -> pl.Tensor[[64], pl.FP32]:
+                return out
+
+            @pl.function(type=pl.FunctionType.Orchestration)
+            def main(
+                self,
+                x: pl.Tensor[[64], pl.FP32],
+                out: pl.Out[pl.Tensor[[64], pl.FP32]],
+            ) -> pl.Tensor[[64], pl.FP32]:
+                # Reassign x so SSA mints a fresh version; the producer Submit
+                # must reference that latest version in args_, not the param.
+                x = pl.add(x, 1.0)
+                with pl.manual_scope():
+                    a, a_tid = pl.submit(self.producer, x)
+                    # deps=[a_tid] lives on Submit::deps_ and must be versioned too.
+                    b, b_tid = pl.submit(self.consumer, a, out, deps=[a_tid])
+                return out
+
+        @pl.program
+        class Expected:
+            @pl.function(type=pl.FunctionType.InCore, strict_ssa=True)
+            def producer(self, x: pl.Tensor[[64], pl.FP32]) -> pl.Tensor[[64], pl.FP32]:
+                return x
+
+            @pl.function(type=pl.FunctionType.InCore, strict_ssa=True)
+            def consumer(
+                self,
+                x: pl.Tensor[[64], pl.FP32],
+                out: pl.Out[pl.Tensor[[64], pl.FP32]],
+            ) -> pl.Tensor[[64], pl.FP32]:
+                return out
+
+            @pl.function(type=pl.FunctionType.Orchestration, strict_ssa=True)
+            def main(
+                self,
+                x: pl.Tensor[[64], pl.FP32],
+                out: pl.Out[pl.Tensor[[64], pl.FP32]],
+            ) -> pl.Tensor[[64], pl.FP32]:
+                x_1 = pl.add(x, 1.0)
+                with pl.manual_scope():
+                    a, a_tid = pl.submit(self.producer, x_1)
+                    b, b_tid = pl.submit(self.consumer, a, out, deps=[a_tid])
+                return out
+
+        After = passes.convert_to_ssa()(Before)
+        ir.assert_structural_equal(After, Expected)
+
+
 class TestMidBodyYieldGuard:
     """ConvertToSSA rejects a body whose SeqStmts contains a YieldStmt before
     the trailing position via INTERNAL_CHECK in ExtractYield/ReplaceOrAppendYield.
@@ -1787,6 +1900,49 @@ class TestCallAttrSubstitution:
             f"{device_expr.name_hint!r}"
         )
 
+    def test_device_var_attr_versioned_before_after(self):
+        """Full structural before/after for the ``device=r`` Call-attr rewrite.
+
+        Complements the object-identity check above: the whole host_orch loop
+        must round-trip with ``device=`` rebound to the versioned induction Var
+        (``r_0``) — the same Var the slice ``outputs[r_0]`` uses. The pass
+        rewrites the attr ExprPtr in ConvertScope/SubstCallAttrs (kAttrDevice).
+        """
+        SIZE = 8
+
+        @pl.program
+        class Before:
+            @pl.function(type=pl.FunctionType.Orchestration)
+            def chip_orch(self, out: pl.Out[pl.Tensor[[SIZE], pl.FP32]]) -> pl.Tensor[[SIZE], pl.FP32]:
+                return out
+
+            @pl.function(level=pl.Level.HOST, role=pl.Role.Orchestrator)
+            def host_orch(
+                self,
+                outputs: pl.Out[pl.Tensor[[2, SIZE], pl.FP32]],
+            ) -> pl.Tensor[[2, SIZE], pl.FP32]:
+                for r in pl.range(2):
+                    self.chip_orch(outputs[r], device=r)
+                return outputs
+
+        @pl.program
+        class Expected:
+            @pl.function(type=pl.FunctionType.Orchestration, strict_ssa=True)
+            def chip_orch(self, out: pl.Out[pl.Tensor[[SIZE], pl.FP32]]) -> pl.Tensor[[SIZE], pl.FP32]:
+                return out
+
+            @pl.function(level=pl.Level.HOST, role=pl.Role.Orchestrator, strict_ssa=True)
+            def host_orch(
+                self,
+                outputs: pl.Out[pl.Tensor[[2, SIZE], pl.FP32]],
+            ) -> pl.Tensor[[2, SIZE], pl.FP32]:
+                for r_0 in pl.range(0, 2, 1):
+                    self.chip_orch(outputs[r_0], device=r_0)
+                return outputs
+
+        After = passes.convert_to_ssa()(Before)
+        ir.assert_structural_equal(After, Expected)
+
     def test_device_const_attr_preserved(self):
         """``device=<ConstInt>`` is untouched by SSA — it has no Var to rewrite,
         so the Call's attrs vector should not be rebuilt unnecessarily."""
@@ -1933,6 +2089,52 @@ class TestSpmdCoreNumSubstitution:
             f"SpmdScopeStmt.core_num must reference the SSA-versioned n_rows Var "
             f"({assigned}); got {core_num_n_rows}"
         )
+
+
+class TestScopeTransparentToSSA:
+    """RuntimeScopeStmt is transparent to SSA: a for/if body wrapped in a
+    ``with pl.scope()`` keeps its carry-yield *inside* the scope, and
+    ConvertToSSA / SSAVerify must look through the scope to associate it."""
+
+    @staticmethod
+    def _verify_ssa(program):
+        ps = passes.IRPropertySet()
+        ps.insert(passes.IRProperty.SSAForm)
+        passes.run_verifier(ps)(program)  # raises on violation
+
+    def test_loop_carried_yield_inside_scope_converts_and_verifies(self):
+        from pypto import backend  # noqa: PLC0415
+        from pypto.backend import BackendType  # noqa: PLC0415
+
+        backend.reset_for_testing()
+        backend.set_backend_type(BackendType.Ascend910B)
+        try:
+
+            @pl.program
+            class Prog:
+                @pl.function(type=pl.FunctionType.AIV)
+                def kernel(
+                    self,
+                    a: pl.Tensor[[16, 16], pl.FP32],
+                    out: pl.Out[pl.Tensor[[16, 16], pl.FP32]],
+                ) -> pl.Tensor[[16, 16], pl.FP32]:
+                    t: pl.Tile[[16, 16], pl.FP32] = pl.load(a, [0, 0], [16, 16])
+                    r: pl.Tensor[[16, 16], pl.FP32] = pl.store(t, [0, 0], out)
+                    return r
+
+                @pl.function(type=pl.FunctionType.Orchestration, auto_scope=False)
+                def orch(self, a: pl.Tensor[[16, 16], pl.FP32], out: pl.Out[pl.Tensor[[16, 16], pl.FP32]]):
+                    for i, (acc,) in pl.range(4, init_values=(out,)):
+                        with pl.scope():
+                            nxt: pl.Tensor[[16, 16], pl.FP32] = self.kernel(a, acc)
+                            acc = pl.yield_(nxt)
+                    return acc
+
+            after = passes.convert_to_ssa()(Prog)
+            # Scope is transparent → SSAForm holds (carry-yield seen through scope).
+            self._verify_ssa(after)
+        finally:
+            backend.reset_for_testing()
 
 
 if __name__ == "__main__":

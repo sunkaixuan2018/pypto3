@@ -790,21 +790,28 @@ class OrchestrationStmtCodegen : public CodegenBase {
     code_ << Indent() << "PTO2_SCOPE(" << (scope->manual_ ? "PTO2ScopeMode::MANUAL" : "") << ") {\n";
     indent_ += 4;
     PushCppScope();
-    decltype(manual_task_id_map_) saved_map;
-    decltype(array_carry_vars_) saved_array_carry;
+    // Snapshot the TaskId / array-carry bindings on entry to EVERY generated
+    // PTO2_SCOPE (AUTO or MANUAL); restore on exit. A binding added inside the
+    // block names a C++ local (e.g. ``PTO2TaskId tid = ...``, ``PTO2TaskId prev
+    // = arr[k]``) declared inside the generated ``{ }`` — it dies at the closing
+    // brace, so it must not leak to the enclosing scope where a later
+    // ``set_dependencies`` / array-yield would reference a now-out-of-scope
+    // identifier (issue #1577). The snapshot is by COPY so outer entries stay
+    // visible inside the block: a task in the scope can still fence on TaskIds
+    // produced by tasks emitted in the enclosing (auto or outer) scope. Loop /
+    // branch carries are registered *before* their body's PTO2_SCOPE (outside
+    // this frame), so they correctly survive the block.
+    auto saved_map = manual_task_id_map_;
+    auto saved_array_carry = array_carry_vars_;
     if (scope->manual_) {
       ++in_manual_scope_depth_;
-      saved_map = std::move(manual_task_id_map_);
-      saved_array_carry = std::move(array_carry_vars_);
-      manual_task_id_map_.clear();
-      array_carry_vars_.clear();
     }
     VisitStmt(scope->body_);
     if (scope->manual_) {
       --in_manual_scope_depth_;
-      manual_task_id_map_ = std::move(saved_map);
-      array_carry_vars_ = std::move(saved_array_carry);
     }
+    manual_task_id_map_ = std::move(saved_map);
+    array_carry_vars_ = std::move(saved_array_carry);
     PopCppScope();
     indent_ -= 4;
     code_ << Indent() << "}\n";
@@ -912,6 +919,13 @@ class OrchestrationStmtCodegen : public CodegenBase {
       // TaskId of a ``pl.submit(...)`` call is handled separately (see
       // ``GenerateSubmitReturnAliases``) — it is a tuple element of the
       // kernel Call, not a standalone op.
+      if (op_name == "system.task_dummy") {
+        INTERNAL_CHECK_SPAN(call->GetAttr<bool>(kAttrDummyTask, false), assign->span_)
+            << "Internal error: system.task_dummy must be marked with attrs['" << kAttrDummyTask << "']";
+        EmitDummyTask(call, var_name);
+        manual_task_id_map_[assign->var_.get()] = var_name;
+        return;
+      }
       if (op_name == "system.task_invalid") {
         // The Python literal ``None`` in a TaskId position lowers here.
         code_ << Indent() << "PTO2TaskId " << var_name << " = PTO2TaskId::invalid();\n";
@@ -956,6 +970,25 @@ class OrchestrationStmtCodegen : public CodegenBase {
             if (auto extent = As<ConstInt>(arr_ty->extent())) {
               RegisterArrayCarry(assign->var_.get(), var_name, extent->value_);
             }
+          }
+        } else if (op_name == "array.get_element") {
+          auto scalar_ty = As<ScalarType>(assign->var_->GetType());
+          if (scalar_ty && scalar_ty->dtype_ == DataType::TASK_ID) {
+            manual_task_id_map_[assign->var_.get()] = var_name;
+          }
+        }
+        // ``prev = tids[k]`` reads one slot of a TaskId array into a scalar
+        // C++ local (``PTO2TaskId prev = arr[k];``). Register the LHS so a
+        // downstream ``deps=[prev]`` resolves to this snapshot local (string
+        // variant) — mirroring the producer-TaskId registration in
+        // ``GenerateSubmitReturnAliases``. Binding to the local (not the
+        // ``arr[k]`` slot) preserves snapshot semantics: a later
+        // ``arr[k] = ...`` overwrite must not retroactively change ``prev``.
+        // Non-TaskId ``get_element`` results are not dependency sources, so
+        // they are intentionally left unregistered.
+        if (op_name == "array.get_element") {
+          if (auto st = As<ScalarType>(assign->var_->GetType()); st && st->dtype_ == DataType::TASK_ID) {
+            manual_task_id_map_[assign->var_.get()] = var_name;
           }
         }
       } else if (!IsBuiltinOp(op_name)) {
@@ -1499,19 +1532,26 @@ class OrchestrationStmtCodegen : public CodegenBase {
   }
 
   // Render the launched function's core_num attribute as a C++ scalar expression.
-  // Accepts a ConstInt literal or a Var resolving to an orchestration-scope scalar
-  // variable (routed through TryGetVarName so SSA/emit-name mapping is respected).
+  // Handles a ConstInt literal, a Var resolving to an orchestration-scope scalar
+  // variable, or a composite scalar expression (e.g. ``b_dim * 64``,
+  // ``b_dim // 8``). ``GenerateExprString`` resolves leaf Vars via TryGetVarName
+  // (so SSA/emit-name mapping is respected) and recurses through arithmetic
+  // operators — the same path used to render ForStmt bounds.
   [[nodiscard]] std::string RenderLaunchCoreNum(const ExprPtr& expr) const {
     if (auto ci = As<ConstInt>(expr)) {
       return std::to_string(ci->value_);
     }
-    if (As<Var>(expr) != nullptr) {
-      return TryGetVarName(expr);
-    }
-    INTERNAL_CHECK_SPAN(false, expr->span_)
+    // Var/IterArg or composite index arithmetic (BinaryExpr/UnaryExpr). Keep a
+    // core_num-specific diagnostic here rather than falling through to
+    // ``GenerateExprString``'s generic NotImplementedError.
+    const bool renderable = AsVarLike(expr) != nullptr ||
+                            std::dynamic_pointer_cast<const BinaryExpr>(expr) != nullptr ||
+                            std::dynamic_pointer_cast<const UnaryExpr>(expr) != nullptr;
+    INTERNAL_CHECK_SPAN(renderable, expr->span_)
         << "Unsupported core_num expression kind for orchestration codegen: "
-        << "expected ConstInt or Var, got kind=" << static_cast<int>(expr->GetKind());
-    return "";
+        << "expected ConstInt, Var, or composite index arithmetic, got kind="
+        << static_cast<int>(expr->GetKind());
+    return GenerateExprString(expr);
   }
 
   void EmitLaunchSpec(const std::string& ind, const std::string& task_var, const FunctionPtr& launch_func) {
@@ -1640,9 +1680,13 @@ class OrchestrationStmtCodegen : public CodegenBase {
     for (const auto& edge : edges) {
       if (!edge) continue;
       auto it = manual_task_id_map_.find(edge.get());
-      INTERNAL_CHECK_SPAN(it != manual_task_id_map_.end(), call->span_)
-          << "Internal error: manual_dep_edge var '" << edge->name_hint_
-          << "' has no producer task in current manual scope";
+      if (it == manual_task_id_map_.end()) {
+        // Compiler-derived edges may reference TaskIds produced inside a
+        // closed ``pl.scope()`` that is no longer visible at this point in
+        // the manual scope.  ``CountManualDeps`` already skips these, so
+        // emit must be consistent: silently drop the out-of-scope edge.
+        continue;
+      }
       if (std::get_if<int>(&it->second)) {
         // Invariant: a ``manual_dep_edges`` entry should never resolve
         // directly to a kernel-Call LHS (int-variant entry). The parser
@@ -1670,6 +1714,29 @@ class OrchestrationStmtCodegen : public CodegenBase {
       }
     }
     code_ << Indent() << task_var << ".set_dependencies(" << deps_arr << ", " << deps_cnt << ");\n";
+  }
+
+  void EmitDummyTask(const CallPtr& call, const std::string& tid_name) {
+    const int barrier_idx = phase_fence_barrier_counter_++;
+    const std::string task_var = "params_phase_fence_barrier_" + std::to_string(barrier_idx);
+    const std::string deps_cnt = task_var + "_deps_count";
+    const std::string outs_var = "phase_fence_barrier_" + std::to_string(barrier_idx) + "_outs";
+    const size_t dep_capacity = CountManualDeps(GetDependencyEdges(call));
+    code_ << "\n";
+    code_ << Indent() << "// Phase-fence barrier " << barrier_idx << ": dependency-only dummy task\n";
+    EmitTaskParamsDecl(Indent(), task_var);
+    if (dep_capacity > 0) {
+      EmitManualDeps(call, task_var);
+    } else {
+      code_ << Indent() << "uint32_t " << deps_cnt << " = 0;\n";
+    }
+    code_ << Indent() << "PTO2TaskId " << tid_name << " = PTO2TaskId::invalid();\n";
+    code_ << Indent() << "if (" << deps_cnt << " > 0) {\n";
+    indent_ += 4;
+    code_ << Indent() << "TaskOutputTensors " << outs_var << " = rt_submit_dummy_task(" << task_var << ");\n";
+    code_ << Indent() << tid_name << " = " << outs_var << ".task_id();\n";
+    indent_ -= 4;
+    code_ << Indent() << "}\n";
   }
 
   static constexpr size_t kMaxAllocTensorsArgs = 16;
@@ -2055,6 +2122,44 @@ class OrchestrationStmtCodegen : public CodegenBase {
     return out_indices;
   }
 
+  // Precise return-position -> callee param-index map, memoized per callee.
+  // Empty when the callee has no traceable top-level ReturnStmt (Group/Spmd
+  // wrappers) — callers then fall back to the direction-based tail heuristic.
+  const std::vector<std::optional<size_t>>& GetReturnedParamIndices(const FunctionPtr& callee) {
+    auto it = returned_param_indices_cache_.find(callee.get());
+    if (it != returned_param_indices_cache_.end()) return it->second;
+    auto inserted =
+        returned_param_indices_cache_.emplace(callee.get(), FindReturnedParamIndices(callee, program_));
+    return inserted.first->second;
+  }
+
+  // Decide whether the precise return->param map is trustworthy for this call.
+  // It must be non-empty AND every return position whose declared type is a
+  // tensor must have resolved to a param. If a tensor writeback failed to
+  // trace, we keep the legacy heuristic to avoid regressing shapes the tracer
+  // does not model (a missed tensor alias would emit an undeclared symbol).
+  static bool IsReturnedParamMapPrecise(const std::vector<std::optional<size_t>>& ret_map,
+                                        const CallPtr& call) {
+    if (ret_map.empty()) return false;
+    auto tuple_ty = As<TupleType>(call->GetType());
+    if (!tuple_ty) return false;
+    // Kernel-result positions to validate. For a submit call the trailing tuple
+    // element is the producer TASK_ID, not a kernel result, so it has no
+    // ret_map entry — exclude it from the expected count.
+    size_t expected = tuple_ty->types_.size();
+    if (IsSubmitCall(call) && expected > 0) --expected;
+    // A short map leaves trailing tensor outputs unchecked: treat as imprecise
+    // so the caller falls back to the heuristic instead of silently skipping an
+    // unmapped tensor alias.
+    if (ret_map.size() < expected) return false;
+    for (size_t j = 0; j < expected; ++j) {
+      if (AsTensorTypeLike(tuple_ty->types_[j]) && !ret_map[j].has_value()) {
+        return false;
+      }
+    }
+    return true;
+  }
+
   void EmitTensorAlias(const std::string& alias_name, const CallPtr& call, size_t arg_idx) {
     std::string out_arg = TryGetVarName(call->args_[arg_idx]);
     if (!out_arg.empty() && alias_name != out_arg) {
@@ -2109,42 +2214,55 @@ class OrchestrationStmtCodegen : public CodegenBase {
     FunctionPtr callee = program_->GetFunction(call->op_->name_);
     if (!callee) return;
 
-    // Classify output slots by the callee's ``ParamDirection`` — not by the
-    // call-site ``ArgDirection``. A call-site ``pl.no_dep(t)`` /
-    // ``pl.at(no_dep_args=[t])`` rewrites a slot's ArgDirection to ``NoDep``
-    // regardless of whether the callee declared the param as Out / InOut.
-    // The slot is still a writer — the return tuple still carries the
-    // post-call value at that position, and downstream consumers referencing
-    // the SSA result still need a binding to the runtime output tensor.
-    // Mirrors ``GenerateSubmitReturnAliases`` (submit path).
+    // Prefer the precise return-position -> callee param map derived from the
+    // callee's ReturnStmt. It correctly handles a kernel that takes an InOut
+    // param written in place but NOT returned (issue #1573) — the legacy
+    // tail-alignment heuristic puts that param in ``out_indices`` and shifts
+    // every carry to the wrong source tensor. Fall back to the heuristic when
+    // the map is not fully trustworthy (Group/Spmd wrappers with no traceable
+    // top-level ReturnStmt, or return shapes the tracer cannot model).
+    const auto& ret_param_map = GetReturnedParamIndices(callee);
+    const bool precise = IsReturnedParamMapPrecise(ret_param_map, call);
+
+    // Legacy heuristic state — only computed when the precise map is unusable.
+    // Classify output slots by the callee's ``ParamDirection`` (not the
+    // call-site ``ArgDirection``): a ``pl.no_dep(t)`` rewrites a slot's
+    // ArgDirection to ``NoDep`` even though the callee declared it Out/InOut,
+    // and the return tuple still carries the post-call value at that position.
     std::vector<size_t> out_indices;
-    auto effective_dirs = GetEffectiveDirections(callee);
-    for (size_t i = 0; i < effective_dirs.size(); ++i) {
-      if (effective_dirs[i] == ParamDirection::Out || effective_dirs[i] == ParamDirection::InOut) {
-        out_indices.push_back(i);
+    size_t tuple_out_base = 0;
+    if (!precise) {
+      auto effective_dirs = GetEffectiveDirections(callee);
+      for (size_t i = 0; i < effective_dirs.size(); ++i) {
+        if (effective_dirs[i] == ParamDirection::Out || effective_dirs[i] == ParamDirection::InOut) {
+          out_indices.push_back(i);
+        }
       }
+      int max_tuple_index = -1;
+      for (const auto& elem : elements_it->second) {
+        max_tuple_index = std::max(max_tuple_index, elem.index);
+      }
+      size_t tuple_arity = max_tuple_index >= 0 ? static_cast<size_t>(max_tuple_index + 1) : 0;
+      tuple_out_base = tuple_arity >= out_indices.size() ? (tuple_arity - out_indices.size()) : 0;
     }
 
-    int max_tuple_index = -1;
     for (const auto& elem : elements_it->second) {
-      max_tuple_index = std::max(max_tuple_index, elem.index);
-    }
-    size_t tuple_arity = max_tuple_index >= 0 ? static_cast<size_t>(max_tuple_index + 1) : 0;
-    size_t tuple_out_base = tuple_arity >= out_indices.size() ? (tuple_arity - out_indices.size()) : 0;
-
-    for (const auto& elem : elements_it->second) {
-      // Some wrappers (notably SPMD helpers) return auxiliary scalars before
-      // Out/InOut tensors, e.g. (idx, out_tensor). Map tuple tail elements to
-      // Out/InOut params and ignore leading non-output tuple elements.
-      if (elem.index < 0) {
-        continue;
-      }
+      if (elem.index < 0) continue;
       size_t elem_pos = static_cast<size_t>(elem.index);
-      if (elem_pos < tuple_out_base) {
-        // Leading tuple elements are auxiliary values (e.g. loop iv from
-        // SPMD wrappers). They are not returned by runtime task submission.
-        // If such scalar is referenced later, materialize a safe default to
-        // keep generated orchestration compilable.
+
+      // Resolve the callee param index this tuple element writes back to.
+      std::optional<size_t> param_idx_opt;
+      if (precise) {
+        if (elem_pos < ret_param_map.size()) param_idx_opt = ret_param_map[elem_pos];
+      } else if (elem_pos >= tuple_out_base) {
+        size_t out_pos = elem_pos - tuple_out_base;
+        if (out_pos < out_indices.size()) param_idx_opt = out_indices[out_pos];
+      }
+
+      if (!param_idx_opt) {
+        // Not a param writeback: a leading auxiliary value (e.g. an SPMD loop
+        // iv). They carry no runtime output. If such a scalar is referenced
+        // later, materialize a safe default so generated code stays compilable.
         if (effective_uses_.count(elem.var)) {
           std::string elem_name = ReserveVarEmitName(elem.var);
           if (auto st = As<ScalarType>(elem.var->GetType())) {
@@ -2153,11 +2271,8 @@ class OrchestrationStmtCodegen : public CodegenBase {
         }
         continue;
       }
-      size_t out_pos = elem_pos - tuple_out_base;
-      if (out_pos >= out_indices.size()) {
-        continue;
-      }
-      size_t param_idx = out_indices[out_pos];
+
+      size_t param_idx = *param_idx_opt;
       INTERNAL_CHECK_SPAN(param_idx < call->args_.size(), call->span_)
           << "Internal error: resolved param_idx " << param_idx << " out of range for " << call->op_->name_
           << " (has " << call->args_.size() << " args)";
@@ -2218,32 +2333,32 @@ class OrchestrationStmtCodegen : public CodegenBase {
     INTERNAL_CHECK_SPAN(callee != nullptr, call->span_)
         << "Internal error: submit callee '" << call->op_->name_ << "' not found";
 
-    // Kernel output param positions, in declared order. We classify by the
-    // callee's ``ParamDirection`` (not by the call-site ``ArgDirection``): a
-    // call-site ``pl.no_dep(t)`` / ``pl.at(no_dep_args=[t])`` rewrites a slot's
-    // ArgDirection to ``NoDep`` regardless of whether the callee declared the
-    // param as In or Out. The slot is still a writer — the return tuple still
-    // carries the post-call value at that position, and downstream consumers
-    // referencing the SSA result still need a binding to the runtime output
-    // tensor. Looking only at ``ArgDirection`` would drop those bindings and
-    // produce undeclared ``__rv_*`` symbols in the emitted code.
-    auto effective_dirs = GetEffectiveDirections(callee);
-    std::vector<size_t> out_indices;
-    for (size_t i = 0; i < effective_dirs.size(); ++i) {
-      if (effective_dirs[i] == ParamDirection::Out || effective_dirs[i] == ParamDirection::InOut) {
-        out_indices.push_back(i);
-      }
-    }
+    // Prefer the precise return-position -> callee param map (handles an InOut
+    // param written in place but not returned — issue #1573). Fall back to the
+    // direction-based tail heuristic when the map is not fully trustworthy
+    // (Group/Spmd wrappers, or shapes the tracer cannot model).
+    const auto& ret_param_map = GetReturnedParamIndices(callee);
+    const bool precise = IsReturnedParamMapPrecise(ret_param_map, call);
 
-    // Map the kernel-result portion (tuple elements ``[0, n_outs)``) onto the
-    // Out/InOut params. Some wrappers (notably SPMD helpers) return auxiliary
-    // scalars *before* the tensor outputs — mirror ``GenerateTupleReturnAliases``
-    // and tail-align: result element ``elem_pos`` is an Out/InOut tensor iff
-    // ``elem_pos >= tuple_out_base``, where ``tuple_out_base`` skips the
-    // leading aux elements. Leading aux scalars carry no runtime output and
-    // are left undeclared (a referenced one would be a codegen bug surfaced
-    // elsewhere, same as the non-submit path).
-    const size_t tuple_out_base = n_outs >= out_indices.size() ? (n_outs - out_indices.size()) : 0;
+    // Legacy heuristic state — only computed when the precise map is unusable.
+    // Kernel output param positions, in declared order, classified by the
+    // callee's ``ParamDirection`` (not the call-site ``ArgDirection``): a
+    // ``pl.no_dep(t)`` rewrites a slot's ArgDirection to ``NoDep`` even though
+    // the callee declared it Out/InOut, yet the return tuple still carries the
+    // post-call value there. Some SPMD wrappers return auxiliary scalars
+    // *before* the tensor outputs, so result element ``elem_pos`` is an
+    // Out/InOut tensor iff ``elem_pos >= tuple_out_base``.
+    std::vector<size_t> out_indices;
+    size_t tuple_out_base = 0;
+    if (!precise) {
+      auto effective_dirs = GetEffectiveDirections(callee);
+      for (size_t i = 0; i < effective_dirs.size(); ++i) {
+        if (effective_dirs[i] == ParamDirection::Out || effective_dirs[i] == ParamDirection::InOut) {
+          out_indices.push_back(i);
+        }
+      }
+      tuple_out_base = n_outs >= out_indices.size() ? (n_outs - out_indices.size()) : 0;
+    }
 
     for (const auto& elem : elements_it->second) {
       if (elem.index < 0) continue;
@@ -2257,13 +2372,32 @@ class OrchestrationStmtCodegen : public CodegenBase {
         manual_task_id_map_[elem.var] = tid_name;
         continue;
       }
-      // A kernel result element. Skip the trailing TaskId / out-of-range and
-      // the leading aux-scalar elements; the rest tail-align onto out_indices.
-      if (elem_pos >= n_outs || elem_pos < tuple_out_base) continue;
-      size_t out_pos = elem_pos - tuple_out_base;
-      if (out_pos >= out_indices.size()) continue;
+      // A kernel result element. Skip the trailing TaskId / out-of-range.
+      if (elem_pos >= n_outs) continue;
+      std::optional<size_t> param_idx_opt;
+      if (precise) {
+        if (elem_pos < ret_param_map.size()) param_idx_opt = ret_param_map[elem_pos];
+      } else if (elem_pos >= tuple_out_base) {
+        size_t out_pos = elem_pos - tuple_out_base;
+        if (out_pos < out_indices.size()) param_idx_opt = out_indices[out_pos];
+      }
+      if (!param_idx_opt) {
+        // Leading aux scalar / untraced position: no runtime output. If it is
+        // referenced later, materialize a safe scalar default so the generated
+        // code stays compilable (mirrors GenerateTupleReturnAliases).
+        if (effective_uses_.count(elem.var)) {
+          std::string elem_name = ReserveVarEmitName(elem.var);
+          if (auto st = As<ScalarType>(elem.var->GetType())) {
+            code_ << Indent() << st->dtype_.ToCTypeString() << " " << elem_name << " = 0;\n";
+          }
+        }
+        continue;
+      }
       if (!effective_uses_.count(elem.var)) continue;
-      size_t param_idx = out_indices[out_pos];
+      size_t param_idx = *param_idx_opt;
+      INTERNAL_CHECK_SPAN(param_idx < callee->params_.size(), call->span_)
+          << "Internal error: resolved param_idx " << param_idx << " out of range for " << call->op_->name_
+          << " (has " << callee->params_.size() << " params)";
       std::string elem_name = ReserveVarEmitName(elem.var);
       if (param_idx < call->args_.size()) {
         // Caller-allocated: the param was passed positionally as an arg.
@@ -2495,6 +2629,7 @@ class OrchestrationStmtCodegen : public CodegenBase {
   std::string current_result_var_;
   std::vector<VarPtr> current_return_vars_;
   int task_counter_ = 0;
+  int phase_fence_barrier_counter_ = 0;
   int alloc_counter_ = 0;
   /// Depth of nested ``RuntimeScopeStmt(manual=true)``. While > 0, the codegen
   /// suppresses the implicit ``PTO2_SCOPE()`` wrapper around ForStmt/IfStmt
@@ -2516,7 +2651,10 @@ class OrchestrationStmtCodegen : public CodegenBase {
   ///     across iterations). Each element of the vector is the C++ expression
   ///     naming one slot of the array (e.g. ``out_arr[0]``, ``out_arr[1]``).
   ///     EmitManualDeps fills each valid slot into the ``<task>_deps`` array.
-  /// Cleared on entry to each manual scope.
+  /// On entry to a manual scope, snapshotted (by copy) and restored on exit
+  /// so the outer entries remain visible *inside* the inner scope while the
+  /// inner-scope adds — which reference C++ identifiers that die with the
+  /// inner block — are discarded once the manual scope exits.
   std::unordered_map<const Var*, std::variant<int, std::string, std::vector<std::string>>>
       manual_task_id_map_;
   /// Records the C++ array allocation backing a TaskId carry that holds an
@@ -2554,6 +2692,12 @@ class OrchestrationStmtCodegen : public CodegenBase {
   std::unordered_set<const Var*> effective_uses_;
   std::unordered_map<std::string, int64_t> gm_pipe_workspace_elements_by_callee_;
   std::unordered_map<std::string, std::string> tensor_create_size_expr_by_emit_name_;
+  /// Memoizes ``FindReturnedParamIndices`` per callee Function. Tuple/submit
+  /// alias generation runs once per call site, but distinct call sites may
+  /// share a callee; caching the per-callee return→param map keeps the codegen
+  /// from re-walking the same callee body and stays within the O(N log N) pass
+  /// budget.
+  std::unordered_map<const Function*, std::vector<std::optional<size_t>>> returned_param_indices_cache_;
 };
 
 OrchestrationResult GenerateOrchestration(const ir::ProgramPtr& program, const ir::FunctionPtr& func) {

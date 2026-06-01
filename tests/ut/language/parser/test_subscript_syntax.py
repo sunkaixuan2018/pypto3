@@ -676,6 +676,76 @@ class TestTensorSubscriptWrite:
         assert isinstance(truly_symbolic, ir.Function)
         assert "tensor.assemble" in truly_symbolic.as_python()
 
+    def test_tensor_subscript_write_accepts_narrow_valid_shape(self):
+        """src.static=[16, 8] padded for ISA alignment, valid_shape=[16, 4];
+        a window expecting 4 cols must be accepted (mirrors pl.store)."""
+
+        @pl.function
+        def narrow_write(
+            out: pl.Tensor[[64, 128], pl.FP32],
+            src: pl.Tensor[[16, 8], pl.FP32],
+        ) -> pl.Tensor[[64, 128], pl.FP32]:
+            narrowed = pl.set_validshape(src, 16, 4)
+            out[0:16, 0:4] = narrowed
+            return out
+
+        assert isinstance(narrow_write, ir.Function)
+        printed = narrow_write.as_python()
+        assert "tensor.assemble" in printed
+
+    def test_tensor_subscript_write_rejects_static_and_valid_mismatch(self):
+        """src.static=[16, 8], valid=[16, 4]; window 6 cols matches neither — still reject."""
+
+        with pytest.raises(ParserTypeError, match="shape mismatch on source axis 1"):
+
+            @pl.function
+            def bad_neither_match(
+                out: pl.Tensor[[64, 128], pl.FP32],
+                src: pl.Tensor[[16, 8], pl.FP32],
+            ) -> pl.Tensor[[64, 128], pl.FP32]:
+                narrowed = pl.set_validshape(src, 16, 4)
+                out[0:16, 0:6] = narrowed
+                return out
+
+    def test_tensor_subscript_write_dynamic_valid_shape_trusted(self):
+        """Dynamic valid_shape (Scalar[INDEX]) cannot be disproven at parse time —
+        parser must trust it (symmetric to dynamic slot / dynamic static_shape)."""
+
+        @pl.function
+        def dynamic_valid(
+            out: pl.Tensor[[64, 128], pl.FP32],
+            src: pl.Tensor[[16, 8], pl.FP32],
+            valid_cols: pl.Scalar[pl.INDEX],
+        ) -> pl.Tensor[[64, 128], pl.FP32]:
+            narrowed = pl.set_validshape(src, 16, valid_cols)
+            out[0:16, 0:4] = narrowed
+            return out
+
+        assert isinstance(dynamic_valid, ir.Function)
+        assert "tensor.assemble" in dynamic_valid.as_python()
+
+    def test_tensor_subscript_write_rank_reduce_narrow_valid_preserves_static(self):
+        """Rank-reducing write + narrow valid_shape must lift the padded
+        static_shape (not the window extents) and carry valid_shape through
+        reshape's 3rd arg — otherwise the reshape product check rejects."""
+
+        @pl.function
+        def rank_reduce_narrow(
+            C: pl.Tensor[[32, 8, 8], pl.FP32],
+            src: pl.Tensor[[16, 16], pl.FP32],
+            i: pl.Scalar[pl.INDEX],
+        ) -> pl.Tensor[[32, 8, 8], pl.FP32]:
+            # static=[16,16] (ISA-padded), valid=[8,8] matches the [8, 8] window
+            narrowed = pl.set_validshape(src, 8, 8)
+            C[i, :, :] = narrowed
+            return C
+
+        printed = rank_reduce_narrow.as_python()
+        # The lift must preserve src's padded [16, 16] and carry [8, 8] forward.
+        assert "tensor.assemble" in printed
+        # 3-arg tensor.reshape with the padded static and the narrowed valid_shape.
+        assert "pl.tensor.reshape(narrowed, [1, 16, 16], [1, 8, 8])" in printed
+
 
 class TestTileSubscriptWrite:
     """Tests for tile subscript-write syntax on Tile types."""
@@ -728,6 +798,85 @@ class TestTileSubscriptWrite:
         # window [1, 128] == rhs shape [1, 128], so no reshape is inserted.
         assert "tile.assemble" in printed
         assert "tile.reshape" not in printed
+
+    def test_tile_subscript_write_accepts_narrow_valid_shape(self):
+        """Tile src with static=[16, 8] (ISA padding) and valid=[16, 4] writes into
+        a [16, 4] window — accept, mirroring pl.store's tile-side behavior."""
+
+        @pl.function
+        def narrow_tile_write(
+            x: pl.Tensor[[64, 128], pl.FP32],
+            src: pl.Tile[[16, 8], pl.FP32],
+        ) -> pl.Tensor[[64, 128], pl.FP32]:
+            t: pl.Tile[[64, 128], pl.FP32] = pl.load(x, [0, 0], [64, 128])
+            narrowed = pl.set_validshape(src, 16, 4)
+            t[0:16, 0:4] = narrowed
+            return pl.store(t, [0, 0], x)
+
+        printed = narrow_tile_write.as_python()
+        assert "tile.assemble" in printed
+
+    def test_tile_subscript_write_rank_reduce_1d_src_no_narrowing(self):
+        """1D tile src → 2D tile target with rank-reducing index must still lift
+        cleanly when the source carries no actual narrowing (valid == static).
+        Guards against treating canonical implicit views as narrowed."""
+
+        @pl.function
+        def lift_1d(
+            x: pl.Tensor[[64, 16], pl.FP32],
+            row: pl.Tile[[16], pl.FP32],
+            i: pl.Scalar[pl.INDEX],
+        ) -> pl.Tensor[[64, 16], pl.FP32]:
+            t: pl.Tile[[64, 16], pl.FP32] = pl.tile.load(x, [0, 0], [64, 16])
+            t[i] = row
+            return pl.tile.store(t, [0, 0], x)
+
+        printed = lift_1d.as_python()
+        assert "tile.assemble" in printed
+        assert "pl.tile.reshape(row, [1, 16])" in printed
+
+    def test_tile_subscript_write_rank_reduce_with_lead_unit(self):
+        """tile 2D-floor source [1, N] (lead_units=1) lifted into a 3D target
+        with 2 scalar drops + 1 slice. The lift must skip the tile floor's
+        leading unit axes when reconstructing the target shape — without that,
+        ``[1, N]`` would mis-iterate to ``[1, 1, 1]`` and the reshape product
+        check would reject."""
+
+        @pl.function
+        def lift_with_lead(
+            x: pl.Tensor[[8, 64, 128], pl.FP32],
+            i: pl.Scalar[pl.INDEX],
+            j: pl.Scalar[pl.INDEX],
+        ) -> pl.Tensor[[8, 64, 128], pl.FP32]:
+            t: pl.Tile[[8, 64, 128], pl.FP32] = pl.tile.load(x, [0, 0, 0], [8, 64, 128])
+            plane: pl.Tile[[64, 128], pl.FP32] = t[i]  # rank-reducing read
+            row: pl.Tile[[1, 128], pl.FP32] = plane[j]  # 2D-floor: lead_units=1
+            t[i, j, :] = row
+            return pl.tile.store(t, [0, 0, 0], x)
+
+        printed = lift_with_lead.as_python()
+        assert "tile.assemble" in printed
+        # Target shape must use src.shape[lead_units:] (= [128]) at the kept axis,
+        # not src.shape[0] (= the floor's lead unit).
+        assert "pl.tile.reshape(row, [1, 1, 128])" in printed
+
+    def test_tile_subscript_write_rank_reduce_narrow_valid_rejected(self):
+        """Tile rank-reduce + narrow valid_shape is rejected: tile.reshape
+        cannot carry valid_shape, so the rank lift would silently lose the
+        narrowing. Force users to take the pl.store path instead."""
+
+        with pytest.raises(UnsupportedFeatureError, match=r"tile\.reshape cannot carry valid_shape"):
+
+            @pl.function
+            def bad_tile(
+                x: pl.Tensor[[32, 16, 16], pl.FP32],
+                src: pl.Tile[[16, 16], pl.FP32],
+                i: pl.Scalar[pl.INDEX],
+            ) -> pl.Tensor[[32, 16, 16], pl.FP32]:
+                t: pl.Tile[[8, 16, 16], pl.FP32] = pl.tile.load(x, [0, 0, 0], [8, 16, 16])
+                narrowed = pl.set_validshape(src, 8, 8)
+                t[i, :, :] = narrowed
+                return pl.tile.store(t, [0, 0, 0], x)
 
 
 if __name__ == "__main__":

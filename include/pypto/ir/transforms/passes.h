@@ -687,6 +687,16 @@ Pass FuseCreateAssembleToSlice();
 Pass DeriveCallDirections();
 
 /**
+ * @brief Expand profitable manual_scope Array[TASK_ID] fanout deps into
+ *        explicit dependency-only dummy barrier calls.
+ *
+ * Rewrites selected consumer ``manual_dep_edges=[source_array]`` to
+ * ``manual_dep_edges=[barrier_tid]`` after inserting a marked
+ * ``system.task_dummy`` assignment at the chosen phase-fence placement point.
+ */
+Pass ExpandManualPhaseFence();
+
+/**
  * @brief Derive explicit task-to-task dependency edges inside manual runtime
  *        scopes.
  *

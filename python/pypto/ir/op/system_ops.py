@@ -163,12 +163,37 @@ def _build_pipe_init_args(
     ]
 
 
+def _build_pipe_init_kwargs(
+    dir_mask: int,
+    slot_size: int,
+    slot_num: int | None,
+    local_slot_num: int | None,
+    id: int | None,
+) -> dict[str, int]:
+    """Build the attribute kwargs shared by aic/aiv_initialize_pipe.
+
+    Value constraints (slot_num > 0, local_slot_num > 0, local_slot_num <=
+    slot_num) are enforced downstream by the IR verifier and PTOAS, matching how
+    dir_mask / slot_size are handled, so they are not re-checked here.
+    """
+    kwargs: dict[str, int] = {"dir_mask": dir_mask, "slot_size": slot_size}
+    if slot_num is not None:
+        kwargs["slot_num"] = slot_num
+    if local_slot_num is not None:
+        kwargs["local_slot_num"] = local_slot_num
+    if id is not None:
+        kwargs["id"] = id
+    return kwargs
+
+
 def aic_initialize_pipe(
     c2v_consumer_buf: PipeBufOperand = 0,
     v2c_consumer_buf: PipeBufOperand = 0,
     *,
     dir_mask: int,
     slot_size: int,
+    slot_num: int | None = None,
+    local_slot_num: int | None = None,
     id: int | None = None,
     span: Span | None = None,
 ) -> Call:
@@ -179,13 +204,16 @@ def aic_initialize_pipe(
         v2c_consumer_buf: V2C consumer buffer base (Expr, int, or DSL ``Scalar``; default 0)
         dir_mask: Direction mask for pipe
         slot_size: Size of each pipe slot
+        slot_num: Optional ring-buffer slot count. Omit to let PTOAS pick its
+            default (8 unidirectional, 4 per direction bidirectional).
+        local_slot_num: Optional local slot count (a2/a3 only, must be
+            ``<= slot_num``). On a3 the reserved/imported buffer is sized
+            ``slot_size * local_slot_num``; on a5 it is ``slot_size * slot_num``.
         id: Optional frontend pipe id. Omit to use PTOAS default id 0.
         span: Optional source span
     """
     actual_span = _get_span_or_capture(span, frame_offset=1)
-    kwargs = {"dir_mask": dir_mask, "slot_size": slot_size}
-    if id is not None:
-        kwargs["id"] = id
+    kwargs = _build_pipe_init_kwargs(dir_mask, slot_size, slot_num, local_slot_num, id)
     args = _build_pipe_init_args(c2v_consumer_buf, v2c_consumer_buf, actual_span)
     return _ir_core.create_op_call("system.aic_initialize_pipe", args, kwargs, actual_span)
 
@@ -196,6 +224,8 @@ def aiv_initialize_pipe(
     *,
     dir_mask: int,
     slot_size: int,
+    slot_num: int | None = None,
+    local_slot_num: int | None = None,
     id: int | None = None,
     span: Span | None = None,
 ) -> Call:
@@ -206,13 +236,16 @@ def aiv_initialize_pipe(
         v2c_consumer_buf: V2C consumer buffer base (Expr, int, or DSL ``Scalar``; default 0)
         dir_mask: Direction mask for pipe
         slot_size: Size of each pipe slot
+        slot_num: Optional ring-buffer slot count. Omit to let PTOAS pick its
+            default (8 unidirectional, 4 per direction bidirectional).
+        local_slot_num: Optional local slot count (a2/a3 only, must be
+            ``<= slot_num``). On a3 the reserved/imported buffer is sized
+            ``slot_size * local_slot_num``; on a5 it is ``slot_size * slot_num``.
         id: Optional frontend pipe id. Omit to use PTOAS default id 0.
         span: Optional source span
     """
     actual_span = _get_span_or_capture(span, frame_offset=1)
-    kwargs = {"dir_mask": dir_mask, "slot_size": slot_size}
-    if id is not None:
-        kwargs["id"] = id
+    kwargs = _build_pipe_init_kwargs(dir_mask, slot_size, slot_num, local_slot_num, id)
     args = _build_pipe_init_args(c2v_consumer_buf, v2c_consumer_buf, actual_span)
     return _ir_core.create_op_call("system.aiv_initialize_pipe", args, kwargs, actual_span)
 

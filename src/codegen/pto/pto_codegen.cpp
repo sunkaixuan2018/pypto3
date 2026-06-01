@@ -241,7 +241,7 @@ class TupleConsumerCollector : public ir::IRVisitor {
   explicit TupleConsumerCollector(const ir::Var* tuple_var, size_t arity)
       : tuple_var_(tuple_var), elements_(arity, nullptr) {}
 
-  const std::vector<ir::VarPtr>& elements() const { return elements_; }
+  [[nodiscard]] const std::vector<ir::VarPtr>& elements() const { return elements_; }
 
  protected:
   void VisitStmt_(const ir::AssignStmtPtr& op) override {
@@ -1289,6 +1289,11 @@ bool PTOCodegen::IsAIVFunction() const {
   return fs_.current_function && fs_.current_function->func_type_ == ir::FunctionType::AIV;
 }
 
+bool PTOCodegen::IsDualAivDispatchFunction() const {
+  return fs_.current_function && fs_.current_function->HasAttr("dual_aiv_dispatch") &&
+         fs_.current_function->GetAttr<bool>("dual_aiv_dispatch", false);
+}
+
 void PTOCodegen::EmitExtraAllocTiles() {
   for (const auto& alloc : fs_.extra_alloc_tiles) {
     stream_ << GetIndent() << alloc.name << " = pto.alloc_tile";
@@ -1382,6 +1387,32 @@ void PTOCodegen::VisitStmt_(const AssignStmtPtr& op) {
       fs_.current_result_buf.clear();
       fs_.current_result_tile_type = nullptr;
       return;
+    }
+  }
+
+  // Plain tensor alias: `lhs_tensor = rhs_var` with no Call on the RHS. This
+  // arises when Simplify folds an empty loop-result ForStmt into a plain
+  // AssignStmt — e.g. a constant-trip `pl.pipeline`'s statically-empty main
+  // loop becomes `t__rv_vN_main = t__iter_vM`. The deleted ForStmt would have
+  // registered the loop-result tensor view / SSA name for its return var (see
+  // VisitStmt_(ForStmtPtr) in pto_control_flow_codegen.cpp), so a later
+  // tile.store into the alias can resolve its view instead of
+  // GetOrCreateTensorView tripping its INTERNAL_CHECK on the synthetic var.
+  // We additionally propagate the base-ptr mapping so element-wise alias
+  // consumers (pl.read / pl.write / store_scalar) resolve to the backing
+  // pointer rather than the view SSA — as the IfStmt in-place-return path
+  // (VisitStmt_(IfStmtPtr)) does for merged tensors.
+  // Non-fatal: if the RHS has no registered view, fall through to the generic
+  // handling rather than throwing eagerly on a view that may never be consumed.
+  if (auto rhs_var = AsVarLike(op->value_)) {
+    if (ir::AsTensorTypeLike(op->var_->GetType())) {
+      const std::string view = TryGetTensorView(rhs_var);
+      if (!view.empty()) {
+        BindTensorView(op->var_, view);
+        BindVarToMlir(op->var_, view);  // view name == SSA name, as in ForStmt
+        RegisterBasePtr(op->var_, GetTensorBasePtr(rhs_var));
+        return;
+      }
     }
   }
 
@@ -1566,21 +1597,22 @@ int64_t PTOCodegen::GetConstIntValue(const ExprPtr& expr) const {
   return 0;
 }
 
-std::string PTOCodegen::GetOrCreateTensorView(const VarPtr& tensor_var) {
+std::string PTOCodegen::TryGetTensorView(const VarPtr& tensor_var) const {
   auto it = fs_.tensor_to_view.find(GetVarKey(tensor_var));
   if (it != fs_.tensor_to_view.end()) return it->second;
-  // For IterArg, follow initValue_ chain to the original tensor parameter
+  // For IterArg, follow initValue_ chain to the original tensor parameter.
   if (auto iter_arg = As<ir::IterArg>(tensor_var)) {
-    if (auto init_var = As<ir::Var>(iter_arg->initValue_)) {
-      return GetOrCreateTensorView(init_var);
-    }
-    if (auto init_iter = As<ir::IterArg>(iter_arg->initValue_)) {
-      return GetOrCreateTensorView(init_iter);
-    }
+    if (auto init_var = As<ir::Var>(iter_arg->initValue_)) return TryGetTensorView(init_var);
+    if (auto init_iter = As<ir::IterArg>(iter_arg->initValue_)) return TryGetTensorView(init_iter);
   }
-  INTERNAL_CHECK_SPAN(false, tensor_var->span_)
-      << "Tensor view not found for parameter: " << tensor_var->name_hint_;
   return "";
+}
+
+std::string PTOCodegen::GetOrCreateTensorView(const VarPtr& tensor_var) {
+  std::string view = TryGetTensorView(tensor_var);
+  INTERNAL_CHECK_SPAN(!view.empty(), tensor_var->span_)
+      << "Tensor view not found for parameter: " << tensor_var->name_hint_;
+  return view;
 }
 
 std::string PTOCodegen::GetTensorViewTypeString(const ir::TensorType* tensor_type) const {

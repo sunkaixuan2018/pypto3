@@ -256,6 +256,12 @@ inline const PassProperties kCanonicalizeIOOrderProperties{
 inline const PassProperties kDeriveCallDirectionsProperties{.required = {IRProperty::SplitIncoreOrch},
                                                             .produced = {IRProperty::CallDirectionsResolved}};
 
+inline const PassProperties kExpandManualPhaseFenceProperties{
+    .required = {IRProperty::NoNestedCalls, IRProperty::NormalizedStmtStructure,
+                 IRProperty::CallDirectionsResolved},
+    .produced = {IRProperty::NoNestedCalls, IRProperty::NormalizedStmtStructure,
+                 IRProperty::CallDirectionsResolved}};
+
 // -- Automatic manual-scope task dependency pass -----------------------------
 //
 // Reads ``Call.attrs_["arg_directions"]`` and writes

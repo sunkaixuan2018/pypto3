@@ -106,7 +106,7 @@ const Tensor& tmp = alloc_0.get_ref(0);
 ### 阶段 6–8：任务提交与控制流
 
 所有任务提交包裹在顶层 `PTO2_SCOPE()` 中。codegen 不再依据 `for` / `if` 结构
-决定 scope 位置：[MaterializeRuntimeScopes](../passes/37-materialize_runtime_scopes.md)
+决定 scope 位置：[MaterializeRuntimeScopes](../passes/38-materialize_runtime_scopes.md)
 pass 会向 IR 中插入显式的 AUTO `RuntimeScopeStmt` 节点（函数体以及每个
 `for` / `if` 体），codegen 从这些节点 1:1 地 emit `PTO2_SCOPE`（manual scope
 降级为 `PTO2_SCOPE(PTO2ScopeMode::MANUAL)`）：
@@ -432,13 +432,22 @@ kwarg 写入 `Call.attrs["manual_dep_edges"]`。编译器推导的 manual-scope
 | `pl.submit` 的 producer TaskId（增广 Call 的 TaskId tuple 元素） | `PTO2TaskId <tid_name> = task_<n>_outs.task_id();`，其中 `task_<n>_outs` 是 submit 捕获的 `TaskOutputTensors` |
 | `None` 种子（`deps=[None]` 条目中的字面量，或 TaskId iter_arg init） | `PTO2TaskId::invalid()` |
 | 循环 carry iter_arg（穿行循环的 TaskId 配套） | for 循环中穿行的命名变量——标量或数组，见下 |
+| 数组槽读取（`prev = tids[k]`——对 `Array[TASK_ID]` 的 `array.get_element`） | `PTO2TaskId <name> = <arr>[k];`——一个标量快照局部变量；dep 引用该局部变量而非重新读取槽位，因此之后的 `tids[k] = ...` 覆写不会改变它 |
 
 `pl.submit` call 的 kernel-result tuple 元素与普通多输出 kernel call 一样，
 直接 alias kernel 的 `Out`/`InOut` 参数。
 
-dep 数组填充条目在 source 是 iter_arg / 数组槽 carry 时会被
-`if (<task_id>.is_valid())` 包裹（首轮迭代种子可能仍是 invalid 哨兵）；
-对直接 `pl.submit` producer TaskId 绑定则无条件追加。
+每个 dep 数组填充条目都会被 `if (<task_id>.is_valid())` 包裹——包括直接来自
+`pl.submit` 的 producer TaskId。`EmitManualDeps` 对所有标量（string 形式）
+TaskId 统一加守卫，因为任何 TaskId 都可能持有 `PTO2TaskId::invalid()` 哨兵
+（首轮迭代的 iter_arg carry、未写入的数组槽、数组槽读取，或 `None` 种子）。
+array-carry iter_arg 则按元素逐槽生成带守卫的填充。
+
+**词法作用域生命周期。** TaskId 绑定命名的是在其产生所在的 `PTO2_SCOPE { ... }`
+块内声明的 C++ 局部变量（`PTO2TaskId tid = ...`）。每个 `PTO2_SCOPE`（AUTO 或
+MANUAL）在进入时快照 `manual_task_id_map_`、退出时恢复，因此在某作用域内产生的
+绑定不会泄漏到外层作用域（否则其标识符会超出 C++ 作用域）。循环 / 分支的 carry
+在其 body 的 `PTO2_SCOPE` *之前*声明，因此能正确地在块结束后存活。
 
 ### `pl.parallel` TaskId iter_arg 的 array carry
 
@@ -464,6 +473,30 @@ dep 数组填充条目在 source 是 iter_arg / 数组槽 carry 时会被
 的 rv，会继承同一个 N：它自身的 iter_arg 也成为大小 N 的数组 carry，
 外层 yield 时按槽位拷贝。这种结构上的传播就是 case1（外层 SEQ × 内层 PARALLEL）
 等拓扑中"多 iter fence 语义"的来源。
+
+### Phase-fence dummy barrier
+
+`DeriveCallDirections` 之后，`ExpandManualPhaseFence` pass 可能压缩有收益且稳定的完整数组
+manual dependency：它把选中的 `manual_dep_edges=[tids]` consumer call 改写为
+`manual_dep_edges=[barrier_tid]`。该 pass 会插入一个带标记的 `system.task_dummy`
+call；这个 dummy call 自己的 `manual_dep_edges` 仍然引用原始 TaskId 数组。Orchestration
+codegen 会把带标记的 call 降低为 `rt_submit_dummy_task(...)`，随后对被改写的 consumer
+继续使用普通标量 dependency lowering。
+
+这会保留 phase boundary，同时避免重复 all-to-all fanout：
+
+```text
+tids[N] -> dummy barrier -> consumers[M]
+```
+
+如果形状、安全性或收益不够明确，则继续走原有直接 `manual_dep_edges` lowering 路径。
+尤其在 `manual_scope` 中，用户显式写出的 deps 是权威约束：如果 `pl.parallel`
+body 读取 `deps=[tids]`，随后又更新 `tids[branch]`，这表示 same-carrier
+dependency chain，而不是可在 loop 前压缩的 snapshot source。若用户需要
+layer-parallel snapshot 语义，应写入单独的 `tids_next` carrier，并通过
+loop-carried `init_values` / `pl.yield_` 在 parallel body 之后传回。这里不写成
+普通的 `tids = tids_next`，因为当前 codegen 路径暂不支持 `ArrayType` 的普通
+`AssignStmt`。
 
 **codegen 入口检查的约束（带用户友好 CHECK 消息）：**
 

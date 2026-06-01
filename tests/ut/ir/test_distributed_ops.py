@@ -24,6 +24,8 @@ After the MemRef-mirror redesign:
 
 import pytest
 from pypto import DataType, ir
+from pypto.ir.op.distributed import tensor_ops as dist_tensor_ops
+from pypto.ir.op.distributed import tile_ops as dist_tile_ops
 
 
 def _make_shape_tuple(values: list[int], span: ir.Span) -> ir.MakeTuple:
@@ -326,6 +328,156 @@ def test_remote_load_rejects_non_make_tuple_offsets():
 
 
 # ---------------------------------------------------------------------------
+# pld.tile.remote_store op (mirrors remote_load coverage)
+# ---------------------------------------------------------------------------
+
+
+def test_remote_store_returns_unknown_type():
+    """Positive: remote_store is side-effect-only — result is UnknownType."""
+    span = ir.Span.unknown()
+    tile_var = ir.Var("t", ir.TileType([32, 16], DataType.FP16), span)
+    target = _make_distributed_tensor_var("data", [64, 32], DataType.FP16, span)
+    peer = ir.Var("peer", ir.ScalarType(DataType.INT32), span)
+    offsets = _make_shape_tuple([0, 0], span)
+
+    call = ir.create_op_call(
+        "pld.tile.remote_store",
+        [tile_var, target, peer, offsets],
+        {},
+        span,
+    )
+    assert isinstance(call.type, ir.UnknownType)
+
+
+def test_remote_store_rejects_plain_tensor_target():
+    """Negative: a plain pl.Tensor target is refused — must be window-bound."""
+    span = ir.Span.unknown()
+    tile_var = ir.Var("t", ir.TileType([32, 16], DataType.FP32), span)
+    plain = ir.Var(
+        "x",
+        ir.TensorType([ir.ConstInt(64, DataType.INT64, span)], DataType.FP32),
+        span,
+    )
+    peer = ir.Var("peer", ir.ScalarType(DataType.INT32), span)
+    offsets = _make_shape_tuple([0], span)
+
+    with pytest.raises(Exception, match="DistributedTensor"):
+        ir.create_op_call(
+            "pld.tile.remote_store",
+            [tile_var, plain, peer, offsets],
+            {},
+            span,
+        )
+
+
+def test_remote_store_rejects_non_scalar_peer():
+    """Negative: peer must be a ScalarType expression (rank index)."""
+    span = ir.Span.unknown()
+    tile_var = ir.Var("t", ir.TileType([32, 16], DataType.FP32), span)
+    target = _make_distributed_tensor_var("data", [64, 32], DataType.FP32, span)
+    bad_peer = _make_shape_tuple([0, 0], span)  # MakeTuple, not a scalar
+    offsets = _make_shape_tuple([0, 0], span)
+
+    with pytest.raises(Exception, match="peer must be a scalar"):
+        ir.create_op_call(
+            "pld.tile.remote_store",
+            [tile_var, target, bad_peer, offsets],
+            {},
+            span,
+        )
+
+
+def test_remote_store_rejects_mismatched_offsets_rank():
+    """Negative: offsets rank must match target tensor rank."""
+    span = ir.Span.unknown()
+    tile_var = ir.Var("t", ir.TileType([32, 16], DataType.FP32), span)
+    target = _make_distributed_tensor_var("data", [64, 32], DataType.FP32, span)
+    peer = ir.Var("peer", ir.ScalarType(DataType.INT32), span)
+    bad_offsets = _make_shape_tuple([0], span)  # 1-D, but target is 2-D
+
+    with pytest.raises(Exception, match="offsets rank"):
+        ir.create_op_call(
+            "pld.tile.remote_store",
+            [tile_var, target, peer, bad_offsets],
+            {},
+            span,
+        )
+
+
+def test_remote_store_rejects_non_make_tuple_offsets():
+    """Negative: offsets must be a MakeTuple."""
+    span = ir.Span.unknown()
+    tile_var = ir.Var("t", ir.TileType([32], DataType.FP32), span)
+    target = _make_distributed_tensor_var("data", [64], DataType.FP32, span)
+    peer = ir.Var("peer", ir.ScalarType(DataType.INT32), span)
+    bad_offsets = ir.ConstInt(0, DataType.INT64, span)
+
+    with pytest.raises(Exception, match="offsets must be a tuple"):
+        ir.create_op_call(
+            "pld.tile.remote_store",
+            [tile_var, target, peer, bad_offsets],
+            {},
+            span,
+        )
+
+
+def test_remote_store_rejects_non_tile_src():
+    """Negative: src_tile must have TileType (a plain tensor is refused)."""
+    span = ir.Span.unknown()
+    not_a_tile = ir.Var(
+        "x",
+        ir.TensorType([ir.ConstInt(32, DataType.INT64, span)], DataType.FP32),
+        span,
+    )
+    target = _make_distributed_tensor_var("data", [64], DataType.FP32, span)
+    peer = ir.Var("peer", ir.ScalarType(DataType.INT32), span)
+    offsets = _make_shape_tuple([0], span)
+
+    with pytest.raises(Exception, match="src_tile must be a TileType"):
+        ir.create_op_call(
+            "pld.tile.remote_store",
+            [not_a_tile, target, peer, offsets],
+            {},
+            span,
+        )
+
+
+def test_remote_store_rejects_dtype_mismatch():
+    """Negative: src_tile dtype must match target dtype."""
+    span = ir.Span.unknown()
+    tile_var = ir.Var("t", ir.TileType([32], DataType.FP32), span)
+    target = _make_distributed_tensor_var("data", [64], DataType.FP16, span)
+    peer = ir.Var("peer", ir.ScalarType(DataType.INT32), span)
+    offsets = _make_shape_tuple([0], span)
+
+    with pytest.raises(Exception, match="dtype"):
+        ir.create_op_call(
+            "pld.tile.remote_store",
+            [tile_var, target, peer, offsets],
+            {},
+            span,
+        )
+
+
+def test_remote_store_rejects_extra_positional():
+    """Negative: the dead 5-arg shapes form is no longer accepted."""
+    span = ir.Span.unknown()
+    tile_var = ir.Var("t", ir.TileType([32, 16], DataType.FP32), span)
+    target = _make_distributed_tensor_var("data", [64, 32], DataType.FP32, span)
+    peer = ir.Var("peer", ir.ScalarType(DataType.INT32), span)
+    offsets = _make_shape_tuple([0, 0], span)
+    extra_shapes = _make_shape_tuple([32, 16], span)
+
+    with pytest.raises(Exception, match="4 positional argument"):
+        ir.create_op_call(
+            "pld.tile.remote_store",
+            [tile_var, target, peer, offsets, extra_shapes],
+            {},
+            span,
+        )
+
+
+# ---------------------------------------------------------------------------
 # pld.system.get_comm_ctx / pld.system.rank / pld.system.nranks ops (N5)
 # ---------------------------------------------------------------------------
 
@@ -510,6 +662,59 @@ def test_put_returns_unknown_type():
     assert isinstance(call.type, ir.UnknownType)
 
 
+def test_put_subregion_returns_unknown_type():
+    """Positive: offset put writes matching subregions and is side-effect-only."""
+    span = ir.Span.unknown()
+    dst = _make_distributed_tensor_var("dst", [16, 64], DataType.FP16, span)
+    peer = ir.Var("peer", ir.ScalarType(DataType.INT32), span)
+    src = _make_distributed_tensor_var("src", [8, 64], DataType.FP16, span)
+    dst_offsets = _make_shape_tuple([3, 0], span)
+    src_offsets = _make_shape_tuple([1, 0], span)
+    shape = _make_shape_tuple([1, 64], span)
+
+    call = ir.create_op_call(
+        "pld.tensor.put",
+        [dst, peer, src, dst_offsets, src_offsets, shape],
+        {"atomic": ir.AtomicType.None_},
+        span,
+    )
+    assert isinstance(call.type, ir.UnknownType)
+
+
+def test_put_ir_builder_accepts_positional_atomic_compat():
+    """Compatibility: raw IR builder still accepts the old positional atomic arg."""
+    span = ir.Span.unknown()
+    dst = _make_distributed_tensor_var("dst", [16, 64], DataType.FP16, span)
+    peer = ir.Var("peer", ir.ScalarType(DataType.INT32), span)
+    src = _make_distributed_tensor_var("src", [16, 64], DataType.FP16, span)
+
+    call = dist_tensor_ops.put(dst, peer, src, ir.AtomicType.Add, span=span)
+
+    assert isinstance(call.type, ir.UnknownType)
+    assert call.kwargs["atomic"] == int(ir.AtomicType.Add)
+
+
+def test_tile_put_ir_builder_accepts_positional_atomic_compat():
+    """Compatibility: raw tile builder still accepts the old positional atomic arg."""
+    span = ir.Span.unknown()
+    dst = _make_distributed_tensor_var("dst", [16, 64], DataType.FP16, span)
+    peer = ir.Var("peer", ir.ScalarType(DataType.INT32), span)
+    src = _make_distributed_tensor_var("src", [16, 64], DataType.FP16, span)
+    stage = ir.Var(
+        "stage",
+        ir.TileType(
+            [ir.ConstInt(16, DataType.INT64, span), ir.ConstInt(64, DataType.INT64, span)],
+            DataType.FP16,
+        ),
+        span,
+    )
+
+    call = dist_tile_ops.put(dst, peer, src, stage, ir.AtomicType.Add, span=span)
+
+    assert isinstance(call.type, ir.UnknownType)
+    assert call.kwargs["atomic"] == int(ir.AtomicType.Add)
+
+
 def test_put_rejects_plain_tensor_dst():
     """Negative: a plain pl.Tensor dst is refused — must be window-bound."""
     span = ir.Span.unknown()
@@ -570,6 +775,82 @@ def test_put_rejects_shape_mismatch():
             "pld.tensor.put",
             [dst, peer, src],
             {"atomic": ir.AtomicType.Add},
+            span,
+        )
+
+
+def test_put_subregion_rejects_mismatched_offsets_rank():
+    """Negative: subregion offsets and shape must match tensor rank."""
+    span = ir.Span.unknown()
+    dst = _make_distributed_tensor_var("dst", [16, 64], DataType.FP16, span)
+    peer = ir.Var("peer", ir.ScalarType(DataType.INT32), span)
+    src = _make_distributed_tensor_var("src", [16, 64], DataType.FP16, span)
+    bad_dst_offsets = _make_shape_tuple([0], span)
+    src_offsets = _make_shape_tuple([0, 0], span)
+    shape = _make_shape_tuple([1, 64], span)
+
+    with pytest.raises(Exception, match="dst_offsets rank"):
+        ir.create_op_call(
+            "pld.tensor.put",
+            [dst, peer, src, bad_dst_offsets, src_offsets, shape],
+            {"atomic": ir.AtomicType.None_},
+            span,
+        )
+
+
+def test_put_subregion_rejects_negative_offsets():
+    """Negative: static subregion offsets must be non-negative."""
+    span = ir.Span.unknown()
+    dst = _make_distributed_tensor_var("dst", [16, 64], DataType.FP16, span)
+    peer = ir.Var("peer", ir.ScalarType(DataType.INT32), span)
+    src = _make_distributed_tensor_var("src", [16, 64], DataType.FP16, span)
+    dst_offsets = _make_shape_tuple([-1, 0], span)
+    src_offsets = _make_shape_tuple([0, 0], span)
+    shape = _make_shape_tuple([1, 64], span)
+
+    with pytest.raises(Exception, match="dst_offsets dimension 0 must be non-negative"):
+        ir.create_op_call(
+            "pld.tensor.put",
+            [dst, peer, src, dst_offsets, src_offsets, shape],
+            {"atomic": ir.AtomicType.None_},
+            span,
+        )
+
+
+def test_put_subregion_rejects_out_of_bounds_dst():
+    """Negative: static dst offset + shape must stay within dst shape."""
+    span = ir.Span.unknown()
+    dst = _make_distributed_tensor_var("dst", [16, 64], DataType.FP16, span)
+    peer = ir.Var("peer", ir.ScalarType(DataType.INT32), span)
+    src = _make_distributed_tensor_var("src", [16, 64], DataType.FP16, span)
+    dst_offsets = _make_shape_tuple([15, 0], span)
+    src_offsets = _make_shape_tuple([0, 0], span)
+    shape = _make_shape_tuple([2, 64], span)
+
+    with pytest.raises(Exception, match="dst subregion dimension 0 exceeds dst shape"):
+        ir.create_op_call(
+            "pld.tensor.put",
+            [dst, peer, src, dst_offsets, src_offsets, shape],
+            {"atomic": ir.AtomicType.None_},
+            span,
+        )
+
+
+def test_put_subregion_rejects_out_of_bounds_src():
+    """Negative: static src offset + shape must stay within src shape."""
+    span = ir.Span.unknown()
+    dst = _make_distributed_tensor_var("dst", [16, 64], DataType.FP16, span)
+    peer = ir.Var("peer", ir.ScalarType(DataType.INT32), span)
+    src = _make_distributed_tensor_var("src", [16, 64], DataType.FP16, span)
+    dst_offsets = _make_shape_tuple([0, 0], span)
+    src_offsets = _make_shape_tuple([15, 0], span)
+    shape = _make_shape_tuple([2, 64], span)
+
+    with pytest.raises(Exception, match="src subregion dimension 0 exceeds src shape"):
+        ir.create_op_call(
+            "pld.tensor.put",
+            [dst, peer, src, dst_offsets, src_offsets, shape],
+            {"atomic": ir.AtomicType.None_},
             span,
         )
 

@@ -515,6 +515,10 @@ void BindPass(nb::module_& m) {
              "Call.attrs['compiler_manual_dep_edges'] inside manual runtime scopes. "
              "User-provided Call.attrs['manual_dep_edges'] remain separate; orchestration "
              "codegen merges both attrs before emitting Arg::set_dependencies.");
+  passes.def("expand_manual_phase_fence", &pass::ExpandManualPhaseFence,
+             "Insert dependency-only dummy TaskId barriers for profitable manual_scope "
+             "Array[TASK_ID] phase-fence fanout and rewrite covered consumers to depend "
+             "on the barrier TaskId.");
   // Bind DiagnosticSeverity enum
   nb::enum_<DiagnosticSeverity>(passes, "DiagnosticSeverity", "Severity level for diagnostics")
       .value("Error", DiagnosticSeverity::Error, "Error that must be fixed")

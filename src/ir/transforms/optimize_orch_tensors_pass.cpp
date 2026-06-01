@@ -2355,12 +2355,25 @@ class OutWindowExternalizer {
       }
     }
 
+    // A later reader can be a Call OR a Submit (pl.submit in a manual_scope).
+    // Route the Submit through its augmented-Call view so its In/InOut full-root
+    // reads are counted by the later-read safety guard — otherwise a windowed
+    // submit could be externalized even though a subsequent submit reads the
+    // full output (.claude/rules/pass-submit-awareness.md).
+    void AddFullRootReadsFromCallLike(const ExprPtr& value, RootSet& reads) const {
+      if (auto call = As<Call>(value)) {
+        AddFullRootReadsFromCall(call, reads);
+      } else if (auto submit = As<Submit>(value)) {
+        AddFullRootReadsFromCall(SubmitToCallView(submit), reads);
+      }
+    }
+
     void AddFullRootReadsFromStmt(const StmtPtr& stmt, RootSet& reads) const {
       if (!stmt) return;
       if (auto assign = As<AssignStmt>(stmt)) {
-        AddFullRootReadsFromCall(As<Call>(assign->value_), reads);
+        AddFullRootReadsFromCallLike(assign->value_, reads);
       } else if (auto eval = As<EvalStmt>(stmt)) {
-        AddFullRootReadsFromCall(As<Call>(eval->expr_), reads);
+        AddFullRootReadsFromCallLike(eval->expr_, reads);
       } else if (auto seq = As<SeqStmts>(stmt)) {
         for (auto it = seq->stmts_.rbegin(); it != seq->stmts_.rend(); ++it) {
           AddFullRootReadsFromStmt(*it, reads);
@@ -2376,6 +2389,8 @@ class OutWindowExternalizer {
         }
       } else if (auto scope = As<ScopeStmt>(stmt)) {
         AddFullRootReadsFromStmt(scope->body_, reads);
+      } else if (auto rscope = As<RuntimeScopeStmt>(stmt)) {
+        AddFullRootReadsFromStmt(rscope->body_, reads);
       }
     }
 
@@ -2392,7 +2407,14 @@ class OutWindowExternalizer {
     }
 
     std::optional<RewriteBundle> TryRewriteCall(const AssignStmtPtr& call_assign) {
-      auto call = As<Call>(call_assign->value_);
+      // Submit (pl.submit inside pl.manual_scope) is a sibling call-like kind;
+      // run the windowing analysis/rewrite on its augmented-Call view, then
+      // rebuild as a Submit to preserve task-launch semantics + deps_
+      // (.claude/rules/pass-submit-awareness.md). The per-callee analysis and
+      // windowed clone are callee-body-driven (Analyze() over all functions),
+      // so they exist regardless of the call-site kind.
+      auto submit = As<Submit>(call_assign->value_);
+      auto call = submit ? SubmitToCallView(submit) : As<Call>(call_assign->value_);
       if (!call) return std::nullopt;
 
       auto callee_name = GetCallFuncName(call);
@@ -2472,8 +2494,22 @@ class OutWindowExternalizer {
           result_types.size() == 1 ? result_types[0] : std::make_shared<TupleType>(result_types);
 
       auto new_attrs = RewriteCallAttrs(call, analysis, slices_by_out_index);
-      auto new_call = std::make_shared<Call>(cloned_gvar, new_args, call->kwargs_, new_attrs, new_return_type,
-                                             call->span_);
+      ExprPtr new_call;
+      if (submit) {
+        // Preserve Submit-ness and deps_ (the canonical encoding); drop the
+        // view's synthesised manual_dep_edges attr so deps aren't duplicated.
+        // new_return_type already carries the trailing TASK_ID (is_submit_call).
+        std::vector<std::pair<std::string, std::any>> submit_attrs;
+        submit_attrs.reserve(new_attrs.size());
+        for (const auto& [k, v] : new_attrs) {
+          if (k != kAttrManualDepEdges) submit_attrs.emplace_back(k, v);
+        }
+        new_call = std::make_shared<Submit>(cloned_gvar, new_args, submit->deps_, submit->kwargs_,
+                                            std::move(submit_attrs), new_return_type, submit->span_);
+      } else {
+        new_call = std::make_shared<Call>(cloned_gvar, new_args, call->kwargs_, new_attrs, new_return_type,
+                                          call->span_);
+      }
       auto tmp_result_var = std::make_shared<Var>(call_assign->var_->name_hint_ + "__windowed",
                                                   new_return_type, call_assign->var_->span_);
       stmts.push_back(std::make_shared<AssignStmt>(tmp_result_var, new_call, call_assign->span_));

@@ -549,6 +549,9 @@ def auto_derive_task_dependencies() -> Pass:
     remain under ``Call.attrs['manual_dep_edges']``.
     """
 
+def expand_manual_phase_fence() -> Pass:
+    """Create a pass that inserts dummy TaskId barriers for manual phase fences."""
+
 def flatten_call_expr() -> Pass:
     """Create a pass that flattens nested call expressions."""
 
@@ -771,6 +774,7 @@ __all__ = [
     "normalize_stmt_structure",
     "derive_call_directions",
     "auto_derive_task_dependencies",
+    "expand_manual_phase_fence",
     "NestedCallErrorType",
     "UseAfterDefErrorType",
     "DiagnosticSeverity",

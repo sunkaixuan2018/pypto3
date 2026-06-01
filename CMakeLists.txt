@@ -113,6 +113,7 @@ set(PYPTO_SOURCES
     src/ir/op/distributed/memory.cpp
     src/ir/op/distributed/world_size.cpp
     src/ir/op/distributed/remote_load.cpp
+    src/ir/op/distributed/remote_store.cpp
     src/ir/op/distributed/get.cpp
     src/ir/op/distributed/put.cpp
     src/ir/op/distributed/get_comm_ctx.cpp
@@ -155,6 +156,7 @@ set(PYPTO_SOURCES
     src/ir/transforms/optimize_orch_tensors_pass.cpp
     src/ir/transforms/derive_call_directions_pass.cpp
     src/ir/transforms/auto_derive_task_dependencies_pass.cpp
+    src/ir/transforms/expand_manual_phase_fence_pass.cpp
     src/ir/transforms/convert_to_ssa_pass.cpp
     src/ir/transforms/ctrl_flow_transform_pass.cpp
     src/ir/transforms/flatten_call_expr_pass.cpp

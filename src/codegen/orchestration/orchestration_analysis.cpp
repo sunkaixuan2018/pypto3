@@ -228,7 +228,14 @@ void VarLineageCollector::VisitStmt_(const ForStmtPtr& for_stmt) {
     const Var* param = ResolveExpr(iter_arg->initValue_);
     if (param) {
       var_to_param[iter_arg.get()] = param;
-      if (i < for_stmt->return_vars_.size()) {
+      // Only propagate buffer lineage to the return_var for Tensor-type carries.
+      // Scalar carries (e.g. a loop counter ``idx = batch_base + inner``) are
+      // value-typed: the body may overwrite them with a freshly computed value
+      // that has no relationship to the init param.  Propagating param lineage
+      // to a Scalar return_var makes FindReturnedParamIndices incorrectly map
+      // a Scalar return element to a param index, causing EmitTensorAlias to
+      // emit ``const Tensor&`` for an int64_t variable (issue #1580).
+      if (i < for_stmt->return_vars_.size() && AsTensorTypeLike(for_stmt->return_vars_[i]->GetType())) {
         var_to_param[for_stmt->return_vars_[i].get()] = param;
       }
     }
@@ -242,7 +249,8 @@ void VarLineageCollector::VisitStmt_(const WhileStmtPtr& while_stmt) {
     const Var* param = ResolveExpr(iter_arg->initValue_);
     if (param) {
       var_to_param[iter_arg.get()] = param;
-      if (i < while_stmt->return_vars_.size()) {
+      // Same guard as ForStmt: only propagate to Tensor return_vars.
+      if (i < while_stmt->return_vars_.size() && AsTensorTypeLike(while_stmt->return_vars_[i]->GetType())) {
         var_to_param[while_stmt->return_vars_[i].get()] = param;
       }
     }
@@ -456,6 +464,46 @@ std::optional<size_t> FindReturnedParamIndex(const FunctionPtr& callee, const Pr
     if (callee->params_[i].get() == root) return record(i);
   }
   return record(std::nullopt);
+}
+
+std::vector<std::optional<size_t>> FindReturnedParamIndices(const FunctionPtr& callee,
+                                                            const ProgramPtr& program) {
+  // Per-position generalization of FindReturnedParamIndex: trace every element
+  // of the callee's top-level ReturnStmt back to a Param. Returns an empty
+  // vector when there is no traceable top-level ReturnStmt (e.g. Group/Spmd
+  // wrappers whose body ends in the inner kernel call) so callers can fall
+  // back to a direction-based heuristic. Each entry maps a return-tuple
+  // position to its source ``callee->params_`` index, or nullopt when that
+  // position is not a writeback to a param (e.g. an auxiliary scalar).
+  if (!callee || !callee->body_) return {};
+
+  ReturnAndDefCollector collector;
+  collector.VisitStmt(callee->body_);
+  if (!collector.first_return || collector.first_return->value_.empty()) {
+    return {};
+  }
+
+  VarLineageCollector lineage(program);
+  lineage.Initialize(callee->params_);
+  lineage.VisitStmt(callee->body_);
+
+  std::vector<std::optional<size_t>> result;
+  result.reserve(collector.first_return->value_.size());
+  for (const auto& ret_value : collector.first_return->value_) {
+    std::unordered_set<const Var*> visited;
+    const Var* root = TraceReturnedToParam(ret_value, collector, lineage, program, visited);
+    std::optional<size_t> idx;
+    if (root) {
+      for (size_t i = 0; i < callee->params_.size(); ++i) {
+        if (callee->params_[i].get() == root) {
+          idx = i;
+          break;
+        }
+      }
+    }
+    result.push_back(idx);
+  }
+  return result;
 }
 
 // ---------------------------------------------------------------------------

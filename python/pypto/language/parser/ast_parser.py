@@ -40,7 +40,14 @@ from .diagnostics import (
     UnsupportedFeatureError,
     concise_error_message,
 )
-from .enum_utils import LEVEL_MAP, LOOP_ORIGIN_MAP, ROLE_MAP, SPLIT_MODE_MAP, extract_enum_value
+from .enum_utils import (
+    LEVEL_MAP,
+    LOOP_ORIGIN_MAP,
+    ROLE_MAP,
+    SCOPE_MODE_MAP,
+    SPLIT_MODE_MAP,
+    extract_enum_value,
+)
 from .expr_evaluator import ExprEvaluator
 from .scope_manager import ScopeManager
 from .span_tracker import SpanTracker
@@ -168,6 +175,31 @@ def _fold_const_slice_extent(upper: object, lower: object) -> int | None:
     if upper_value is None or lower_value is None:
         return None
     return upper_value - lower_value
+
+
+def _get_source_valid_shape(source_type: ir.Type) -> list[ir.Expr] | None:
+    """Return the source's view ``valid_shape``, or ``None`` when no view metadata.
+
+    Pure accessor — does NOT decide whether the source is actually narrowed
+    (whether ``valid_shape`` differs from ``shape``). Callers that need the
+    narrowing semantics should compare against ``source_type.shape`` themselves
+    (e.g. via :func:`_shape_exprs_match`).
+
+    TensorType reads ``tensor_view.valid_shape``; TileType uses
+    ``get_effective_tile_view()`` so a canonicalized implicit view (stored as
+    ``None``) still surfaces its semantic ``valid_shape``.
+    """
+    if isinstance(source_type, ir.TensorType):
+        view = source_type.tensor_view
+        if view is None or not view.valid_shape:
+            return None
+        return list(view.valid_shape)
+    if isinstance(source_type, ir.TileType):
+        view = source_type.get_effective_tile_view()
+        if not view.valid_shape:
+            return None
+        return list(view.valid_shape)
+    return None
 
 
 def _shape_exprs_match(lhs: Sequence[ir.Expr], rhs: Sequence[ir.Expr]) -> bool:
@@ -460,6 +492,12 @@ class ASTParser:
         # context-scoped op constraints (e.g. pld.system.world_size is host-only).
         self._func_level: ir.Level | None = None
 
+        # Current function's auto_scope flag (set during parse_function). When
+        # True (default) the compiler owns AUTO scope placement, so a hand-placed
+        # AUTO `with pl.scope()` is rejected; set False to take control. MANUAL
+        # scopes are allowed regardless (they are a dependency-semantics choice).
+        self._func_auto_scope: bool = True
+
         # Pending comments keyed by 1-based line number, drained by parse_statement.
         # Each entry is (col_offset, text) so the parser can distinguish
         # tail-of-block comments (inside body indent) from outer-scope comments.
@@ -551,6 +589,8 @@ class ASTParser:
         func_name = func_def.name
         self._func_name = func_name
         self._func_level = func_level
+        # auto_scope rides in func_attrs (key "auto_scope"); absent ⇒ default True.
+        self._func_auto_scope = bool((func_attrs or {}).get("auto_scope", True))
         func_span = self.span_tracker.get_span(func_def)
 
         # Enter function scope
@@ -1556,28 +1596,117 @@ class ASTParser:
         # prepended when the source carries the tile 2D-floor's padding.
         lead_units = src_rank - natural_rank
         expected_extents = [1] * lead_units + [extents[d] for d in kept_dims]
+        # A narrowed source (static_shape padded for ISA alignment, valid_shape
+        # carrying the logical extent — same pattern pl.store accepts on the
+        # tile path) is allowed when its valid_shape matches the window.
+        source_valid_shape = _get_source_valid_shape(source_type)
         for src_axis, want in enumerate(expected_extents):
             requested_const = _fold_const_slice_extent(want, 0)
             source_const = _fold_const_slice_extent(source_type.shape[src_axis], 0)
-            if requested_const is not None and source_const is not None and requested_const != source_const:
-                raise ParserTypeError(
-                    f"Subscript-write shape mismatch on source axis {src_axis}: "
-                    f"window expects {requested_const} elements, source has {source_const}",
-                    span=span,
-                    hint="Make the source's extents match the rank-reduced lhs window, "
-                    "or adjust the slice bounds",
-                )
+            if requested_const is None or source_const is None:
+                continue
+            if requested_const == source_const:
+                continue
+            if source_valid_shape is not None:
+                valid_const = _fold_const_slice_extent(source_valid_shape[src_axis], 0)
+                # Dynamic valid_shape (folds to None) — parser cannot disprove
+                # the match, so trust it, symmetric to dynamic slot / dynamic
+                # static_shape above. Constant valid_shape only accepts on a
+                # match.
+                if valid_const is None or valid_const == requested_const:
+                    continue
+            raise ParserTypeError(
+                f"Subscript-write shape mismatch on source axis {src_axis}: "
+                f"window expects {requested_const} elements, source has {source_const}",
+                span=span,
+                hint="Make the source's static_shape or valid_shape match the "
+                "rank-reduced lhs window, or adjust the slice bounds",
+            )
 
         if src_rank != len(extents):
-            # Lift the rank-reduced source back to the full-rank target window
-            # (unit dims at the dropped positions) so the assemble's source/window
-            # ranks match — mirrors the implicit reshape numpy does on a write.
-            reshape_op = ir_op.tensor.reshape if kind_name == "tensor" else ir_op.tile.reshape
-            source_expr = reshape_op(source_expr, list(extents), span=span)
+            source_expr = self._lift_subscript_write_source_rank(
+                source_expr,
+                source_type,
+                source_valid_shape,
+                drop_dims,
+                extents,
+                lead_units,
+                kind_name,
+                span,
+            )
 
         assemble_call = assemble_op(base_expr, source_expr, offsets, span=span)
         var = self._assign_or_let(var_name, assemble_call, span)
         self.scope_manager.define_var(var_name, var, span=span)
+
+    def _lift_subscript_write_source_rank(
+        self,
+        source_expr: ir.Expr,
+        source_type: ir.TensorType | ir.TileType,
+        source_valid_shape: list[ir.Expr] | None,
+        drop_dims: list[int],
+        extents: list[int | ir.Expr],
+        lead_units: int,
+        kind_name: str,
+        span: ir.Span,
+    ) -> ir.Expr:
+        """Reshape source up to the full-rank target window for rank-reducing writes.
+
+        Inserts unit dims at the ``drop_dims`` positions so the assemble's
+        source/window ranks match — mirrors the implicit reshape numpy does on
+        write. Reshape target always derives from the source's *own* padded
+        ``static_shape`` (minus any tile 2D-floor lead unit axes), so the
+        reshape product check passes whether or not the source carries a
+        narrower ``valid_shape`` (issue #1509).
+
+        When the source carries an explicit narrower ``valid_shape``, that
+        narrowing is carried forward via ``tensor.reshape``'s optional 3rd
+        argument; ``tile.reshape`` has no such parameter, so a narrowed tile
+        + rank-lift combo is rejected here (the user should switch to
+        ``pl.store``).
+        """
+        # "Narrowed" means valid_shape is actually smaller than shape; a view
+        # with valid_shape == shape (e.g. a tile's canonical implicit view) is
+        # semantically equivalent to no view and must NOT be treated as a
+        # narrow source — otherwise canonical 1D-tile rank-lift writes would
+        # hit the issue #1509 path meant for ISA-padded sources.
+        is_narrowed = source_valid_shape is not None and not _shape_exprs_match(
+            source_type.shape, source_valid_shape
+        )
+
+        # tile.reshape has no valid_shape parameter, so a narrowed tile +
+        # rank-lift would silently drop the narrowing. Reject upfront and point
+        # users to pl.store.
+        if is_narrowed and kind_name != "tensor":
+            raise UnsupportedFeatureError(
+                "Subscript-write with rank reduction is not supported when "
+                "the source tile carries an explicit valid_shape — "
+                "tile.reshape cannot carry valid_shape across the rank lift.",
+                span=span,
+                hint="Write the tile via pl.store directly, or use slice "
+                "indices on every axis instead of scalar indices to avoid "
+                "rank reduction.",
+            )
+
+        drop_set = set(drop_dims)
+        unit: ir.Expr = ir.ConstInt(1, DataType.INDEX, span)
+
+        def _lift_shape(seq: Sequence[int | ir.Expr]) -> list[int | ir.Expr]:
+            # Skip the tile 2D-floor lead unit axes — they were padded into seq
+            # only to satisfy the tile ≥2D invariant; the lift reconstructs the
+            # target rank from the kept positions and the drop_dims unit fillers.
+            it = iter(list(seq)[lead_units:])
+            return [unit if d in drop_set else next(it) for d in range(len(extents))]
+
+        reshape_op = ir_op.tensor.reshape if kind_name == "tensor" else ir_op.tile.reshape
+        reshape_args: list[list[int | ir.Expr]] = [_lift_shape(source_type.shape)]
+        if is_narrowed:
+            # Tensor path with a genuinely narrower valid_shape — carry it via
+            # reshape's optional 3rd arg so the narrowing survives the rank
+            # lift (issue #1509). Asserted non-None by the is_narrowed guard.
+            assert source_valid_shape is not None
+            reshape_args.append(_lift_shape(source_valid_shape))
+        return reshape_op(source_expr, *reshape_args, span=span)
 
     def _parse_array_subscript_assignment(
         self,
@@ -3062,53 +3191,81 @@ class ASTParser:
             )
         return name_hint
 
+    def _parse_scope(self, stmt: ast.With, context_expr: ast.Call) -> None:
+        """Parse ``with pl.scope(mode=...):`` into a Runtime scope.
+
+        ``mode`` defaults to ``ScopeMode.AUTO``. AUTO scopes are the explicit IR
+        form of the orchestration ``PTO2_SCOPE()`` block; MANUAL scopes turn off
+        auto dependency tracking (``pl.scope(mode=pl.ScopeMode.MANUAL)`` — the
+        former ``pl.manual_scope()``).
+        """
+        if context_expr.args:
+            raise ParserSyntaxError(
+                "pl.scope() takes only a 'mode=' keyword, not positional arguments",
+                span=self.span_tracker.get_span(stmt),
+                hint="Use 'with pl.scope():' or 'with pl.scope(mode=pl.ScopeMode.MANUAL):'.",
+            )
+        manual = False
+        for kw in context_expr.keywords:
+            if kw.arg == "mode":
+                manual = extract_enum_value(kw.value, SCOPE_MODE_MAP, "ScopeMode", "pl.ScopeMode")
+            else:
+                raise ParserSyntaxError(
+                    f"pl.scope() got an unexpected keyword '{kw.arg}'",
+                    span=self.span_tracker.get_span(stmt),
+                    hint="The only accepted keyword is mode=pl.ScopeMode.AUTO|MANUAL.",
+                )
+        self._emit_runtime_scope(stmt, manual=manual)
+
     def _parse_manual_scope(self, stmt: ast.With, context_expr: ast.Call) -> None:
-        """Parse ``with pl.manual_scope():`` into a Runtime scope with manual=True."""
+        """Parse ``with pl.manual_scope():`` — an alias for ``pl.scope(mode=MANUAL)``."""
         if context_expr.args or context_expr.keywords:
             raise ParserSyntaxError(
                 "pl.manual_scope() does not accept arguments",
                 span=self.span_tracker.get_span(stmt),
-                hint="Use 'with pl.manual_scope():' without arguments",
+                hint="Use 'with pl.manual_scope():' (or 'with pl.scope(mode=pl.ScopeMode.MANUAL):').",
             )
-        if self._manual_scope_depth > 0:
-            # The runtime forbids nesting MANUAL inside MANUAL — codegen would
-            # emit nested ``PTO2_SCOPE(PTO2ScopeMode::MANUAL)`` blocks, which
-            # would fail later. Reject at the source location instead.
-            raise ParserSyntaxError(
-                "pl.manual_scope() may not be nested inside another manual scope",
-                span=self.span_tracker.get_span(stmt),
-                hint="Flatten the nested 'with pl.manual_scope():' into the "
-                "enclosing manual scope, or move it outside.",
-            )
-        span = self.span_tracker.get_span(stmt)
-        self._manual_scope_depth += 1
-        try:
-            self._parse_scope_body(stmt, ir.ScopeKind.Runtime, span, manual=True)
-        finally:
-            self._manual_scope_depth -= 1
+        self._emit_runtime_scope(stmt, manual=True)
 
-    def _parse_auto_scope(self, stmt: ast.With, context_expr: ast.Call) -> None:
-        """Parse ``with pl.auto_scope():`` into a Runtime scope with manual=False.
+    def _emit_runtime_scope(self, stmt: ast.With, manual: bool) -> None:
+        """Build a RuntimeScopeStmt for a ``with pl.scope(...)`` / ``pl.manual_scope()`` block.
 
-        AUTO scopes are the explicit IR form of the orchestration codegen's
-        ``PTO2_SCOPE()`` block (inserted by MaterializeRuntimeScopes). They may
-        nest in one another but not inside a ``manual_scope`` — the runtime
-        forbids AUTO nested in MANUAL.
+        Enforces the scope-placement rules:
+          - MANUAL may not nest inside another MANUAL (runtime forbids).
+          - AUTO may not nest inside a MANUAL (runtime forbids AUTO-in-MANUAL).
+          - A hand-placed AUTO scope requires ``@pl.function(auto_scope=False)``;
+            in the default auto_scope=True the compiler owns AUTO placement, so a
+            stray ``with pl.scope():`` would be a no-op — reject it instead.
         """
-        if context_expr.args or context_expr.keywords:
+        span = self.span_tracker.get_span(stmt)
+        if manual:
+            if self._manual_scope_depth > 0:
+                raise ParserSyntaxError(
+                    "a manual scope may not be nested inside another manual scope",
+                    span=span,
+                    hint="Flatten the nested manual scope into the enclosing one, or move it outside.",
+                )
+            self._manual_scope_depth += 1
+            try:
+                self._parse_scope_body(stmt, ir.ScopeKind.Runtime, span, manual=True)
+            finally:
+                self._manual_scope_depth -= 1
+            return
+
+        # AUTO scope.
+        if self._func_auto_scope:
             raise ParserSyntaxError(
-                "pl.auto_scope() does not accept arguments",
-                span=self.span_tracker.get_span(stmt),
-                hint="Use 'with pl.auto_scope():' without arguments",
+                "a hand-placed AUTO 'with pl.scope()' requires @pl.function(auto_scope=False)",
+                span=span,
+                hint="In the default auto_scope=True mode the compiler places AUTO scopes; set "
+                "auto_scope=False to place them yourself, or use pl.scope(mode=pl.ScopeMode.MANUAL).",
             )
         if self._manual_scope_depth > 0:
             raise ParserSyntaxError(
-                "pl.auto_scope() may not be nested inside a manual scope",
-                span=self.span_tracker.get_span(stmt),
-                hint="The runtime forbids AUTO scope nested in MANUAL scope; "
-                "move the 'with pl.auto_scope():' block outside the manual scope.",
+                "an AUTO scope may not be nested inside a manual scope",
+                span=span,
+                hint="The runtime forbids AUTO scope nested in MANUAL scope; move it outside.",
             )
-        span = self.span_tracker.get_span(stmt)
         self._parse_scope_body(stmt, ir.ScopeKind.Runtime, span, manual=False)
 
     def _parse_legacy_scope(
@@ -3761,14 +3918,14 @@ class ASTParser:
                         "to capture the outlined kernel's producer TaskId.",
                     )
 
-                # Manual scope: with pl.manual_scope(): ...
-                if func.attr == "manual_scope":
-                    self._parse_manual_scope(stmt, context_expr)
+                # Unified runtime scope: with pl.scope(mode=...): ...
+                if func.attr == "scope":
+                    self._parse_scope(stmt, context_expr)
                     return
 
-                # Auto scope: with pl.auto_scope(): ...
-                if func.attr == "auto_scope":
-                    self._parse_auto_scope(stmt, context_expr)
+                # Manual scope alias: with pl.manual_scope(): ...
+                if func.attr == "manual_scope":
+                    self._parse_manual_scope(stmt, context_expr)
                     return
 
                 # Existing scope kinds: pl.incore(), pl.auto_incore(), pl.cluster()
@@ -4434,6 +4591,9 @@ class ASTParser:
 
         attr_metadata = self._extract_call_attrs(method_name, keywords, len(arg_nodes), span)
         arg_directions = attr_metadata.arg_directions or []
+        # Parser/printer round-trip support for post-DeriveCallDirections IR.
+        # User source should spell manual deps with pl.submit(..., deps=[...]).
+        manual_dep_edges = self._extract_manual_dep_edges_from_attrs(method_name, keywords, span)
         # Detect ``pl.no_dep(...)`` wrappers at call-arg positions and collect
         # their indices for the arg_direction_overrides attr.
         unwrapped_args, no_dep_indices = self._strip_no_dep_wrappers(arg_nodes)
@@ -4443,6 +4603,8 @@ class ASTParser:
         user_dep_vars: list[ir.Var] = []
         if as_submit:
             user_dep_vars = self._parse_submit_deps_kwarg(method_name, keywords, span)
+        elif manual_dep_edges is not None:
+            user_dep_vars = manual_dep_edges
         # Orchestration dispatch ``device=`` kwarg: resolves to a ConstInt or
         # an enclosing-loop induction Var.
         device_expr = self._parse_dispatch_device_kwarg(keywords)
@@ -5091,11 +5253,11 @@ class ASTParser:
                 compiler_edges = parsed_edges
                 continue
 
-            if key_node.value not in {"arg_directions", "compiler_manual_dep_edges"}:
+            if key_node.value not in {"arg_directions", "compiler_manual_dep_edges", "manual_dep_edges"}:
                 raise ParserSyntaxError(
                     f"Unsupported attrs key '{key_node.value}' on call to '{method_name}'",
                     span=self.span_tracker.get_span(key_node),
-                    hint="Recognized keys: 'arg_directions', 'compiler_manual_dep_edges'",
+                    hint="Recognized keys: 'arg_directions', 'compiler_manual_dep_edges', 'manual_dep_edges'",
                 )
 
         if directions and len(directions) != arg_count:
@@ -5105,6 +5267,36 @@ class ASTParser:
                 span=span,
             )
         return _CallAttrMetadata(directions, compiler_edges)
+
+    def _extract_manual_dep_edges_from_attrs(
+        self,
+        method_name: str,
+        keywords: list[ast.keyword],
+        span: ir.Span,
+    ) -> list[ir.Var] | None:
+        """Extract ``manual_dep_edges`` from an ``attrs={...}`` kwarg.
+
+        This is intentionally for printed/post-DeriveCallDirections IR shapes.
+        Source user code should continue to spell dependencies as
+        ``pl.submit(..., deps=[...])``.
+        """
+        attrs_kw: ast.keyword | None = next((kw for kw in keywords if kw.arg == "attrs"), None)
+        if attrs_kw is None:
+            return None
+        if not isinstance(attrs_kw.value, ast.Dict):
+            raise ParserTypeError(
+                f"'attrs=' on call to '{method_name}' must be a dict literal",
+                span=self.span_tracker.get_span(attrs_kw.value),
+                hint='e.g. attrs={"manual_dep_edges": [tid, ...]}',
+            )
+        for key_node, value_node in zip(attrs_kw.value.keys, attrs_kw.value.values):
+            if not (isinstance(key_node, ast.Constant) and isinstance(key_node.value, str)):
+                continue
+            if key_node.value != "manual_dep_edges":
+                continue
+            deps_kw = ast.keyword(arg="deps", value=value_node)
+            return self._parse_submit_deps_kwarg(method_name, [deps_kw], span)
+        return None
 
     @staticmethod
     def _validate_call_arg_count(func_name: str, func: ir.Function, got: int, span: ir.Span) -> None:
@@ -5536,7 +5728,38 @@ class ASTParser:
 
     def _parse_system_op(self, op_name: str, call: ast.Call) -> ir.Expr:
         """Parse system operation."""
+        if op_name == "task_dummy":
+            return self._parse_task_dummy(call)
         return self._dispatch_op(_dsl_system, "pl.system", op_name, call)
+
+    def _parse_task_dummy(self, call: ast.Call) -> ir.Expr:
+        """Parse user-written ``pl.system.task_dummy(deps=[...])``."""
+        span = self.span_tracker.get_span(call)
+        if call.args:
+            raise InvalidOperationError(
+                "pl.system.task_dummy must not use positional arguments",
+                span=span,
+            )
+        allowed_kwargs = {"deps"}
+        for kw in call.keywords:
+            if kw.arg not in allowed_kwargs:
+                raise ParserTypeError(
+                    f"pl.system.task_dummy does not accept keyword argument '{kw.arg}'",
+                    span=span,
+                    hint="Use pl.system.task_dummy(deps=[task_id]) where each dep is a TaskId value",
+                )
+        if not any(kw.arg == "deps" for kw in call.keywords):
+            raise ParserTypeError(
+                "pl.system.task_dummy requires keyword argument 'deps'",
+                span=span,
+                hint="Use pl.system.task_dummy(deps=[]) for an empty dummy barrier",
+            )
+        deps = self._parse_submit_deps_kwarg("pl.system.task_dummy", call.keywords, span)
+        base = ir.create_op_call("system.task_dummy", [], {}, span)
+        attrs: list[tuple[str, Any]] = [("dummy_task", True)]
+        if deps:
+            attrs.append(("manual_dep_edges", deps))
+        return ir.Call(base.op, base.args, base.kwargs, attrs, base.type, base.span)
 
     def _parse_array_op(self, op_name: str, call: ast.Call) -> ir.Expr:
         """Parse array operation (create / get_element / update_element)."""
@@ -6260,24 +6483,30 @@ class ASTParser:
             elif isinstance(stmt, ast.If):
                 pass
 
-            # Descend into `with pl.auto_scope():` blocks — they are transparent
-            # to yield association, so a trailing `var = pl.yield_(...)` inside
-            # the scope still defines the enclosing for/if return-var. These are
-            # inserted by the MaterializeRuntimeScopes pass.
-            elif isinstance(stmt, ast.With) and self._is_auto_scope_with(stmt):
+            # Descend into `with pl.scope():` blocks — they are transparent to
+            # yield association, so a trailing `var = pl.yield_(...)` inside the
+            # scope still defines the enclosing for/if return-var. These are
+            # inserted by the MaterializeRuntimeScopes pass (or written by hand).
+            elif isinstance(stmt, ast.With) and self._is_runtime_scope_with(stmt):
                 yield_vars.extend(self._scan_for_yields(stmt.body))
 
         return yield_vars
 
     @staticmethod
-    def _is_auto_scope_with(stmt: ast.With) -> bool:
-        """True if @p stmt is a ``with pl.auto_scope():`` block."""
+    def _is_runtime_scope_with(stmt: ast.With) -> bool:
+        """True if @p stmt is a runtime-scope block (``with pl.scope(...):`` any
+        mode, or the ``with pl.manual_scope():`` alias).
+
+        Must mirror the ``func.attr`` dispatch in ``parse_with_statement`` —
+        both ``scope`` and ``manual_scope`` build a RuntimeScopeStmt, so both
+        must be transparent to yield scanning.
+        """
         for item in stmt.items:
             ce = item.context_expr
             if (
                 isinstance(ce, ast.Call)
                 and isinstance(ce.func, ast.Attribute)
-                and ce.func.attr == "auto_scope"
+                and ce.func.attr in {"scope", "manual_scope"}
             ):
                 return True
         return False

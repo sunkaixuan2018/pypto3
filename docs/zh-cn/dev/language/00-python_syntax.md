@@ -212,6 +212,10 @@ buf = pl.reserve_buffer(name="slot_buf", size=4096, base=pl.AUTO)
 peer = pl.import_peer_buffer(name="slot_buf", peer_func="other_func")
 pl.aic_initialize_pipe(pl.const(0, pl.INT32), buf, dir_mask=2, slot_size=512, id=0)
 pl.aiv_initialize_pipe(pl.const(0, pl.INT32), peer, dir_mask=2, slot_size=512, id=0)
+# 可选：显式指定 GM 环形缓冲区槽数量（默认单向 8 / 双向 4），
+# 以及（仅 a2/a3）本地槽数量 local_slot_num（必须 <= slot_num）。
+# 缓冲区大小需自行设置：a3 -> slot_size * local_slot_num，a5 -> slot_size * slot_num。
+pl.aic_initialize_pipe(pl.const(0, pl.INT32), buf, dir_mask=2, slot_size=512, slot_num=16, local_slot_num=4)
 ```
 
 ## 语句 (Statement)
@@ -325,8 +329,8 @@ for (x,) in pl.while_(init_values=(x_init,)):
 | `pl.cluster()` | `Cluster` | AIC+AIV 协同调度组 |
 | `with pl.spmd(N)` / `for i in pl.spmd(N)` | `Spmd`（for-form 内嵌 `InCore`） | SPMD 多 block 派发——见 [pl.spmd](#plspmd-多-block-派发) |
 | `pl.spmd(N, optimizations=[pl.split(MODE)])` | `Spmd(InCore(split=MODE))` | split 提示作用于内层 InCore（两种形式均适用） |
-| `pl.manual_scope()` | `Runtime(manual=true)` | 由用户管理任务排序的 orchestrator 区域——见[手工依赖原语](#手工依赖原语) |
-| `pl.auto_scope()` | `Runtime(manual=false)` | orchestrator 的 AUTO scope（`PTO2_SCOPE()`）；编译器（MaterializeRuntimeScopes）插入的显式 IR 形式。极少手写，是被插入 scope 的 round-trip 表示 |
+| `pl.scope(mode=pl.ScopeMode.MANUAL)` / `pl.manual_scope()` | `Runtime(manual=true)` | orchestrator 的 MANUAL scope——由用户管理任务排序。两种 `auto_scope` 模式下都可用（它是依赖语义选择）。见[手工依赖原语](#手工依赖原语) |
+| `pl.scope()` | `Runtime(manual=false)` | orchestrator 的 AUTO scope（`PTO2_SCOPE()`）。手写它需要 `@pl.function(auto_scope=False)`（默认 `auto_scope=True` 下由编译器决定 AUTO 放置）。见 [MaterializeRuntimeScopes](../passes/38-materialize_runtime_scopes.md) |
 | `pl.incore()` *(已弃用)* | `InCore` | 请改用 `pl.at(level=pl.Level.CORE_GROUP)` |
 | `pl.auto_incore(split=...)` *(已弃用)* | `AutoInCore` | 请改用 `pl.at(level=pl.Level.CORE_GROUP, optimizations=[pl.auto_chunk, pl.split(...)])` |
 | `pl.at(..., optimization=pl.chunked_loop_optimizer[(split=...)])` *(已弃用)* | `AutoInCore` | 请改用 `pl.at(..., optimizations=[pl.auto_chunk, pl.split(...)])` |
@@ -370,28 +374,28 @@ DSL 暴露**两套正交的机制**，用户可任意组合：
 
 #### 机制 B——显式声明 task 间的边（`deps=`）
 
-两种表面都下沉为相同的 `set_dependencies` codegen。选哪个取决于
-producer 是一个 kernel 调用 (`pl.submit`) 还是一段多语句的 outlined 区域
-(`pl.at`-块)。
+这些表面都会下沉为 `set_dependencies` codegen；按 producer 形态选择：
+单个 kernel 调用、outlined `pl.at` 区域，或 dependency-only fan-in。
 
 | 表层语法 | producer 形态 | 备注 |
 | -------- | ------------- | ---- |
 | `result, tid = pl.submit(kernel, *args, deps=[...])` | 单个 kernel 调用 | 尾部 `tid` 是 producer `pl.Scalar[pl.TASK_ID]`。它是 parser construct（类似 `pl.range`），不是 runtime 函数。 |
 | `with pl.at(level=pl.Level.CORE_GROUP, deps=[...]) as tid:` | outlined `pl.at`-块 | 整块被 outline 成 InCore kernel + Call；`tid` 捕获被合成的 Call 的 TaskId，可作为后续 `pl.submit` / `pl.at` 的 dep。 |
+| `barrier = pl.system.task_dummy(deps=[...])` | dependency-only barrier | 不提交 kernel。返回的 TaskId 是一个紧凑的 fan-in 点，可供后续 `deps=[barrier]` 使用。 |
 | `None`（Python 字面量） | 种子 / dep 条目 | "暂无 producer" 的哨兵。`prev_tid = None` 用作 TaskId 循环 iter_arg 的种子；`deps=[None]` 中的 `None` 被丢弃（不贡献任何边）。下沉为 `system.task_invalid` → `PTO2TaskId::invalid()`。 |
 
-**两个表面都不依赖机制 A 的状态。** 你可以在普通自动跟踪的 orchestration 里
-使用 `pl.submit(..., deps=[tid])`、也可以在 `pl.manual_scope()` 内使用、
-还可以在 `manual_dep=True` 的 tensor 上使用——显式边总是在自动跟踪的结果
-**之上**追加。早期"`deps=` 只在 `pl.manual_scope` 内有效"的限制已经
-解除。
+**这些表面都不依赖机制 A 的状态。** 显式 deps 可用于普通自动跟踪、
+`pl.manual_scope()` 内或 `manual_dep=True` tensor 上，并总是在自动跟踪结果
+**之上**追加；早期"`deps=` 只在 `pl.manual_scope` 内有效"的限制已经解除。
 
 普通的 `out = self.kernel(...)` 是 **fire-and-forget**：它不返回 task id，
 并且在它上面写 `deps=` 会被拒绝（parser 报错，提示 "use `pl.submit`"）。
 每个 `deps=[...]` 条目必须是 TaskId 值：先前 `pl.submit(...)` /
-`pl.at(..., deps=) as tid` 绑定的 `tid`、TaskId 循环 iter_arg carry、
-来自 `pl.array.create(N, pl.TASK_ID)` 的 `Array[N, TASK_ID]`，或字面量
-`None`。`deps=[...]` 不接受 tensor。
+`pl.at(..., deps=) as tid` 绑定的 `tid`、`pl.system.task_dummy(deps=[...])`
+的返回值、TaskId 循环 iter_arg carry、从 TaskId 数组槽读出的
+`Scalar[TASK_ID]`（`prev = tids[k]`）、来自
+`pl.array.create(N, pl.TASK_ID)` 的 `Array[N, TASK_ID]`，或字面量 `None`。
+`deps=[...]` 不接受 tensor。
 
 ```python
 # 示例 1——两套机制同用：scope-wide 退出 + 显式边。
@@ -448,7 +452,11 @@ out, _ = pl.submit(self.consume, scratch, out, deps=[prod_tid])
 把它们一起搬到合成的 Call 上。codegen 填充一个按精确依赖数定长的栈数组，
 并对每个 task 发出一次 `params.set_dependencies(arr, count);` 调用。
 runtime 的 `Arg::set_dependencies(ptr, count)` 直接接收调用者持有的任意
-长度数组，所以单 call 的依赖边数没有硬上限。
+长度数组，所以单 call 的依赖边数没有硬上限。显式 fan-in 可写成
+`barrier = pl.system.task_dummy(deps=[tids])`，再让 consumer `deps=[barrier]`；
+它复用同一套 dependency parser，lowering 成 `rt_submit_dummy_task(...)`，
+在 dep 全 invalid 时返回 invalid 且跳过 dummy submit，并可与自动
+`ExpandManualPhaseFence` barrier 共存。
 
 `pl.no_dep(arg)` 是 auto scope 原语；在 `pl.manual_scope` 内不起作用
 （整个 scope 已经退出自动跟踪了）。

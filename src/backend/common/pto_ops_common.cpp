@@ -973,7 +973,14 @@ static std::string MakeScatterCodegenPTO(const CallPtr& op, codegen::CodegenBase
   std::ostringstream oss;
   oss << "pto.tscatter ins(" << src << ", " << idx;
   // Emit the type clause only when both annotations are present; printing one
-  // alone would produce malformed PTOAS (": , idx" or ": src, ").
+  // alone would produce malformed PTOAS (": , idx" or ": src, "). The two
+  // operands are typed tiles produced by the same lowering, so they should
+  // either both carry an annotation or (in untyped contexts) both lack one — a
+  // one-sided annotation signals a real codegen bug, not a valid input.
+  INTERNAL_CHECK_SPAN(src_type.empty() == idx_type.empty(), op->span_)
+      << "Internal error: tile.scatter src/indexes type annotations must both be present or both "
+         "absent, got src_type='"
+      << src_type << "', idx_type='" << idx_type << "'";
   if (!src_type.empty() && !idx_type.empty()) {
     oss << " : " << src_type << ", " << idx_type;
   }
@@ -988,16 +995,17 @@ static std::string MakeScatterCodegenPTO(const CallPtr& op, codegen::CodegenBase
 }
 
 // Helper for tile.scatter_mask (TSCATTER mask form, DPS):
-//   pto.tscatter ins(%src : src_ty) outs(%dst : dst_ty)
-//                {maskPattern = #pto.mask_pattern<Pxxxx>}
+//   pto.tscatter ins(%src, {maskPattern = #pto.mask_pattern<Pxxxx>} : src_ty)
+//                outs(%dst : dst_ty)
 //
-// Unlike pto.tgather's mask form (which carries maskPattern inside ins()),
-// pto.tscatter only accepts SSA operands in ins() — the maskPattern must be a
-// trailing op attribute dict (same placement as gather_compare's cmpMode).
+// The maskPattern rides *inside* ins() right after the src operand, exactly
+// like pto.tgather's mask form — PTOAS parses ins() as "src, attr-dict :
+// type" and rejects a bare ins(%src ...) ("expected ',' after src operand").
+// The type annotation follows the attr dict, still inside ins().
 //
 // IR surface: 2-input op (dst, src) + mask_pattern attr; dst aliased via
-// set_output_reuses_input(0). Mask form is targeted at A3 / CPU-sim style
-// backends; A5 rejects it on the PTOAS side.
+// set_output_reuses_input(0). Mask form is targeted at A2/A3 backends; A5
+// (Ascend950) rejects it on the PTOAS side.
 static std::string MakeScatterMaskCodegenPTO(const CallPtr& op, codegen::CodegenBase& codegen_base) {
   auto& codegen = dynamic_cast<codegen::PTOCodegen&>(codegen_base);
   CHECK(op->args_.size() == 2) << "tile.scatter_mask requires 2 arguments (dst, src), but got "
@@ -1021,7 +1029,10 @@ static std::string MakeScatterMaskCodegenPTO(const CallPtr& op, codegen::Codegen
       << ", input=" << input_ssa;
 
   std::ostringstream oss;
-  oss << "pto.tscatter ins(" << src;
+  // maskPattern rides inside ins() after src, then the type annotation:
+  //   pto.tscatter ins(%src, {maskPattern = #pto.mask_pattern<Pxxxx>} : src_ty) outs(%dst : dst_ty)
+  oss << "pto.tscatter ins(" << src << ", {maskPattern = #pto.mask_pattern<" << mask_patterns.at(pattern)
+      << ">}";
   if (!src_type.empty()) {
     oss << " : " << src_type;
   }
@@ -1029,7 +1040,7 @@ static std::string MakeScatterMaskCodegenPTO(const CallPtr& op, codegen::Codegen
   if (!dst_type.empty()) {
     oss << " : " << dst_type;
   }
-  oss << ") {maskPattern = #pto.mask_pattern<" << mask_patterns.at(pattern) << ">}";
+  oss << ")";
 
   codegen.Emit(oss.str());
   return "";
@@ -1651,7 +1662,18 @@ static std::shared_ptr<const ir::TileType> GetTpushTileType(const ExprPtr& tile_
 static bool EmitSplitTpushTransportValidShape(const CallPtr& op, codegen::PTOCodegen& codegen,
                                               const std::string& tile_buf, const std::string& tile_type,
                                               int split) {
-  if (split == 0 || tile_buf.empty() || tile_type.empty()) {
+  // split == 0 normally means no cross-core split: the single consumer reads
+  // exactly the producer's (possibly narrowed) valid_shape, so no full-box
+  // transport is needed. BUT the 910B no-split dual-AIV dispatch path
+  // (function attr `dual_aiv_dispatch`) runs the producer on TWO AIV subblocks
+  // that share one FIFO slot while the single cube consumer pops the FULL
+  // slot. If the producer narrowed its valid_shape (e.g. set_validshape on a
+  // partial attention block), the un-narrowed rows/cols of the slot stay stale
+  // and feed garbage into the consumer's matmul. So for that mode we must
+  // still transport the full box, exactly as for split==1/2 — this extends
+  // PR #1454's fix to the split==0 dual-dispatch case.
+  const bool dual_aiv_no_split = (split == 0) && codegen.IsDualAivDispatchFunction();
+  if ((split == 0 && !dual_aiv_no_split) || tile_buf.empty() || tile_type.empty()) {
     return false;
   }
 
@@ -1675,6 +1697,28 @@ static bool EmitSplitTpushTransportValidShape(const CallPtr& op, codegen::PTOCod
   const auto& valid_shape = tile_view.valid_shape;
   ExprPtr transport_row = shape[0];
   ExprPtr transport_col = shape[1];
+
+  // For the 910B no-split dual-AIV path there is NO genuine cross-core row
+  // split: subblock 0 runs the full computation while subblock 1 is a
+  // pipe-balancing replay whose tile carries valid_shape (0, 0). So here we
+  // widen the COLUMNS only -- carrying the producer's fillpad'd cols >=
+  // valid_col, which fixes the stale-col feed into the consumer matmul --
+  // while PRESERVING the producer's row valid_shape. Widening the rows to the
+  // full box would push subblock-1's garbage rows into the shared FIFO slot
+  // and race/overwrite subblock-0's real data. Genuine split==1/2 paths keep
+  // widening both axes because the row split is real there.
+  if (dual_aiv_no_split) {
+    transport_row = valid_shape[0];
+    // A statically-zero-row producer IS the subblock-1 pipe-balancing replay:
+    // it moves no data regardless of the column box, so a col-widening
+    // transport is pure overhead AND (on 910B) perturbs the shared-slot
+    // dual-AIV merge -- emitting it regressed the cross_core_v2c_nosplit
+    // golden. Only the real subblock-0 push (non-zero rows, possibly narrowed
+    // by set_validshape) needs the full-column transport.
+    if (auto row_const = As<ir::ConstInt>(transport_row); row_const && row_const->value_ == 0) {
+      return false;
+    }
+  }
 
   if (IsSameDimExpr(transport_row, valid_shape[0]) && IsSameDimExpr(transport_col, valid_shape[1])) {
     return false;
@@ -1731,7 +1775,19 @@ static std::string FormatInitializePipeAttrs(const CallPtr& op, int dir_mask, in
     CHECK(id >= 0) << "Frontend initialize_pipe 'id' attribute must be non-negative, got " << id;
     oss << "id = " << id << ", ";
   }
-  oss << "dir_mask = " << dir_mask << ", slot_size = " << slot_size << "}";
+  oss << "dir_mask = " << dir_mask << ", slot_size = " << slot_size;
+  if (op->HasKwarg("slot_num")) {
+    const int slot_num = op->GetKwarg<int>("slot_num", 0);
+    CHECK(slot_num > 0) << "Frontend initialize_pipe 'slot_num' attribute must be positive, got " << slot_num;
+    oss << ", slot_num = " << slot_num;
+  }
+  if (op->HasKwarg("local_slot_num")) {
+    const int local_slot_num = op->GetKwarg<int>("local_slot_num", 0);
+    CHECK(local_slot_num > 0) << "Frontend initialize_pipe 'local_slot_num' attribute must be positive, got "
+                              << local_slot_num;
+    oss << ", local_slot_num = " << local_slot_num;
+  }
+  oss << "}";
   return oss.str();
 }
 
@@ -2292,12 +2348,11 @@ static std::string MakeRemoteLoadCodegenPTO(const CallPtr& op, codegen::CodegenB
   auto peer_view = EmitCommRemoteView(binding, op->args_[1], codegen);
 
   const std::string dtype_str = codegen.GetTypeString(binding.type->dtype_);
-  const auto& offset_elems = offsets_tuple->elements_;
   const auto& shape_elems = shapes_tuple->elements_;
   std::string partition_type = MakePartitionTensorViewType(GetDimStrings(shape_elems), dtype_str);
   std::string partition_view = EmitPartitionViewPTO(
       binding.var->name_hint_ + "_peer", peer_view.ssa, peer_view.view_type_str, partition_type,
-      GetExprCodes(offset_elems, codegen), GetSizeCodes(shape_elems, codegen), codegen);
+      LowerTupleToIndexSSA(offsets_tuple, codegen), GetSizeCodes(shape_elems, codegen), codegen);
 
   std::string tile_buf = codegen.GetCurrentResultTarget();
   INTERNAL_CHECK_SPAN(!tile_buf.empty(), op->span_)
@@ -2308,6 +2363,78 @@ static std::string MakeRemoteLoadCodegenPTO(const CallPtr& op, codegen::CodegenB
   tload << "pto.tload ins(" << partition_view << " : " << partition_type << ") outs(" << tile_buf << " : "
         << tile_buf_type << ")";
   codegen.Emit(tload.str());
+  return "";
+}
+
+// pld.tile.remote_store(src_tile, target, peer, offsets) — write a local tile
+// into a peer's slice of a window-bound DistributedTensor. Lowers to:
+//   delems    = func.call @CommRemoteOffset_<dtype>(ctx, peer) : ... -> index
+//   peer_ptr  = pto.addptr local_ptr, delems
+//   peer_view = pto.make_tensor_view peer_ptr, shape=..., strides=...
+//   pto.partition_view peer_view, offsets=..., sizes=<tile.valid_shape padded
+//                                                     with leading 1s>
+//   pto.tstore ins(<tile>) outs(<pview>)
+//
+// The tile's valid_shape is 2-D (height, width); when target_rank > 2 the
+// leading (target_rank - 2) partition dims are size-1 — matching the
+// notify codegen's one_dims(rank, "1") pattern — so a 2-D tile push lands
+// on the inner two dims of an N-D peer slice without forcing the caller to
+// reshape.
+static std::string MakeRemoteStoreCodegenPTO(const CallPtr& op, codegen::CodegenBase& codegen_base) {
+  auto& codegen = dynamic_cast<codegen::PTOCodegen&>(codegen_base);
+  CHECK(op->args_.size() == 4)
+      << "pld.tile.remote_store requires 4 arguments (src_tile, target, peer, offsets), got "
+      << op->args_.size();
+
+  auto src_tile = AsVarLike(op->args_[0]);
+  INTERNAL_CHECK_SPAN(src_tile, op->span_) << "pld.tile.remote_store src_tile must be a Var or IterArg";
+  auto tile_type = As<ir::TileType>(src_tile->GetType());
+  INTERNAL_CHECK_SPAN(tile_type, op->span_) << "pld.tile.remote_store src_tile must have TileType";
+
+  auto binding = ResolveDistTensorBinding(op->args_[1], codegen, "pld.tile.remote_store");
+  auto offsets_tuple = As<ir::MakeTuple>(op->args_[3]);
+  INTERNAL_CHECK_SPAN(offsets_tuple, op->span_) << "pld.tile.remote_store offsets must be MakeTuple";
+
+  auto peer_view = EmitCommRemoteView(binding, op->args_[2], codegen);
+  const std::string dtype_str = codegen.GetTypeString(binding.type->dtype_);
+
+  const auto tile_view = ir::tile_view_semantics::GetEffectiveTileView(*tile_type);
+  const auto& valid_shape = tile_view.valid_shape;
+  INTERNAL_CHECK_SPAN(valid_shape.size() == 2, op->span_)
+      << "pld.tile.remote_store tile valid_shape must be 2D";
+  const size_t target_rank = binding.type->shape_.size();
+  INTERNAL_CHECK_SPAN(target_rank >= 2, op->span_)
+      << "pld.tile.remote_store target rank must be >= 2 to hold a 2-D tile";
+
+  std::vector<std::string> dim_strs(target_rank - 2, "1");
+  std::vector<std::string> size_codes(target_rank - 2,
+                                      codegen.GetOrEmitConstant(static_cast<int64_t>(1), DataType::INDEX));
+  auto append_dim = [&](const ir::ExprPtr& expr) {
+    if (auto c = As<ir::ConstInt>(expr)) {
+      dim_strs.push_back(std::to_string(c->value_));
+    } else {
+      dim_strs.emplace_back("?");
+    }
+    size_codes.push_back(codegen.GetExprAsCode(expr));
+  };
+  append_dim(valid_shape[0]);
+  append_dim(valid_shape[1]);
+  const std::string partition_type = MakePartitionTensorViewType(dim_strs, dtype_str);
+
+  std::string partition_view =
+      EmitPartitionViewPTO(binding.var->name_hint_ + "_peer", peer_view.ssa, peer_view.view_type_str,
+                           partition_type, LowerTupleToIndexSSA(offsets_tuple, codegen), size_codes, codegen);
+
+  std::string tile_buf = codegen.GetVarName(src_tile);
+  std::string tile_buf_type = codegen.GetExprTypeAnnotation(op->args_[0]);
+
+  std::ostringstream tstore_line;
+  tstore_line << "pto.tstore ins(" << tile_buf;
+  if (!tile_buf_type.empty()) {
+    tstore_line << " : " << tile_buf_type;
+  }
+  tstore_line << ") outs(" << partition_view << " : " << partition_type << ")";
+  codegen.Emit(tstore_line.str());
   return "";
 }
 
@@ -2346,7 +2473,7 @@ static std::string MakeNotifyCodegenPTO(const CallPtr& op, codegen::CodegenBase&
   std::string partition_type = MakePartitionTensorViewType(one_dims, dtype_str);
   std::string partition_view = EmitPartitionViewPTO(
       binding.var->name_hint_ + "_peer", peer_view.ssa, peer_view.view_type_str, partition_type,
-      GetExprCodes(offsets_tuple->elements_, codegen), one_size_ssa, codegen);
+      LowerTupleToIndexSSA(offsets_tuple, codegen), one_size_ssa, codegen);
 
   // PTOAS contract: tnotify value's MLIR type must match the signal element
   // type. Emit using the value's own ScalarType — mismatched IR-level dtypes
@@ -2404,7 +2531,7 @@ static std::string MakeWaitCodegenPTO(const CallPtr& op, codegen::CodegenBase& c
   std::string partition_type = MakePartitionTensorViewType(one_dims, dtype_str);
   std::string partition_view =
       EmitPartitionViewPTO(signal_var->name_hint_ + "_local", local_view, local_view_type, partition_type,
-                           GetExprCodes(offsets_tuple->elements_, codegen), one_size_ssa, codegen);
+                           LowerTupleToIndexSSA(offsets_tuple, codegen), one_size_ssa, codegen);
 
   // PTOAS contract: twait expected value's MLIR type must match the signal
   // element type. Emit using the expected value's own ScalarType — see notify
@@ -2421,22 +2548,31 @@ static std::string MakeWaitCodegenPTO(const CallPtr& op, codegen::CodegenBase& c
   return "";
 }
 
-// pld.tile.put(dst, peer, src, stage, *, atomic) — synchronous cross-rank bulk
-// write of the local slice `src` into the peer rank's slice of `dst`. `stage`
-// is a VEC scratch TileType pre-allocated by an IR-level `tile.create` (so the
-// memory allocator gives it a UB address before codegen — --pto-level=level3).
+// pld.tile.put(dst, peer, src, stage[, dst_offsets, src_offsets, shape],
+//              *, atomic) - synchronous cross-rank bulk write of the local
+// slice `src` into the peer rank's slice of `dst`. `stage` is a VEC scratch
+// TileType pre-allocated by an IR-level `tile.create` (so the memory allocator
+// gives it a UB address before codegen at --pto-level=level3).
 // Lowers to:
 //   delems   = func.call @CommRemoteOffset_<dtype>(ctx, peer) : ... -> index
 //   dst_ptr  = pto.addptr <dst_local_ptr>, delems
 //   dst_view = pto.make_tensor_view dst_ptr, shape=..., strides=...
-//   dst_pv   = pto.partition_view dst_view,  offsets=[0,..], sizes=<shape>
-//   src_pv   = pto.partition_view <src_local_view>, offsets=[0,..], sizes=<shape>
+//   dst_pv   = pto.partition_view dst_view, offsets=<dst_offsets>, sizes=<transfer_shape>
+//   src_pv   = pto.partition_view <src_local_view>, offsets=<src_offsets>, sizes=<transfer_shape>
 //   pto.comm.tput(dst_pv, src_pv, buf(%stage)
 //       : <ptype>, <ptype>, <stage_type>) {atomicType = #pto<atomic_type (atomic_none|atomic_add)>}
+//
+// Full-slice tile.put (4 args) uses zero offsets and the full dst/src shape.
+// Subregion tile.put (7 args) uses the explicit offsets and transfer shape that
+// ConvertTensorToTileOps forwarded from user-facing pld.tensor.put. PTOAS
+// validates the stage tile type against the partition views, so the IR verifier
+// also checks that stage elements equal prod(transfer_shape).
 static std::string MakePutCodegenPTO(const CallPtr& op, codegen::CodegenBase& codegen_base) {
   auto& codegen = dynamic_cast<codegen::PTOCodegen&>(codegen_base);
-  CHECK(op->args_.size() == 4) << "pld.tile.put requires 4 arguments (dst, peer, src, stage), got "
-                               << op->args_.size();
+  CHECK(op->args_.size() == 4 || op->args_.size() == 7)
+      << "pld.tile.put requires 4 arguments (dst, peer, src, stage) or 7 arguments "
+         "(dst, peer, src, stage, dst_offsets, src_offsets, shape), got "
+      << op->args_.size();
 
   // dst: remote (peer-addressed) DistributedTensor destination.
   auto dst_binding = ResolveDistTensorBinding(op->args_[0], codegen, "pld.tile.put");
@@ -2460,21 +2596,51 @@ static std::string MakePutCodegenPTO(const CallPtr& op, codegen::CodegenBase& co
   INTERNAL_CHECK_SPAN(rank >= 1, op->span_) << "pld.tile.put requires rank >= 1";
   const std::string dtype_str = codegen.GetTypeString(dst_binding.type->dtype_);
 
-  // Full-slice partition views: offsets all-zero, sizes = full shape. dst and
-  // src share the same partition_tensor_view type (same dtype + static shape).
-  std::string c0 = codegen.GetOrEmitConstant(static_cast<int64_t>(0), DataType::INDEX);
-  std::vector<std::string> zero_offsets(rank, c0);
-  std::vector<std::string> size_ssa = GetSizeCodes(shape, codegen);
-  std::string partition_type = MakePartitionTensorViewType(GetDimStrings(shape), dtype_str);
+  std::vector<std::string> dst_offsets;
+  std::vector<std::string> src_offsets;
+  std::vector<std::string> size_ssa;
+  std::vector<ExprPtr> transfer_shape;
+
+  if (op->args_.size() == 4) {
+    // Full-slice partition views: offsets all-zero, sizes = full shape. dst and
+    // src share the same partition_tensor_view type (same dtype + static shape).
+    std::string c0 = codegen.GetOrEmitConstant(static_cast<int64_t>(0), DataType::INDEX);
+    dst_offsets.assign(rank, c0);
+    src_offsets.assign(rank, c0);
+    transfer_shape = shape;
+    size_ssa = GetSizeCodes(transfer_shape, codegen);
+  } else {
+    // Subregion partition views: user-facing tensor.put supplied the two
+    // offset tuples plus a shared static transfer shape. The explicit stage
+    // tile was sized to this transfer shape by ConvertTensorToTileOps.
+    auto dst_offsets_tuple = As<ir::MakeTuple>(op->args_[4]);
+    auto src_offsets_tuple = As<ir::MakeTuple>(op->args_[5]);
+    auto shape_tuple = As<ir::MakeTuple>(op->args_[6]);
+    INTERNAL_CHECK_SPAN(dst_offsets_tuple, op->span_) << "pld.tile.put dst_offsets must be MakeTuple";
+    INTERNAL_CHECK_SPAN(src_offsets_tuple, op->span_) << "pld.tile.put src_offsets must be MakeTuple";
+    INTERNAL_CHECK_SPAN(shape_tuple, op->span_) << "pld.tile.put shape must be MakeTuple";
+    INTERNAL_CHECK_SPAN(dst_offsets_tuple->elements_.size() == rank, op->span_)
+        << "pld.tile.put dst_offsets rank must match tensor rank";
+    INTERNAL_CHECK_SPAN(src_offsets_tuple->elements_.size() == rank, op->span_)
+        << "pld.tile.put src_offsets rank must match tensor rank";
+    INTERNAL_CHECK_SPAN(shape_tuple->elements_.size() == rank, op->span_)
+        << "pld.tile.put shape rank must match tensor rank";
+    dst_offsets = GetExprCodes(dst_offsets_tuple->elements_, codegen);
+    src_offsets = GetExprCodes(src_offsets_tuple->elements_, codegen);
+    transfer_shape = shape_tuple->elements_;
+    size_ssa = GetSizeCodes(transfer_shape, codegen);
+  }
+
+  std::string partition_type = MakePartitionTensorViewType(GetDimStrings(transfer_shape), dtype_str);
 
   // dst: CommRemoteOffset + addptr + make_tensor_view at the call site, then
-  // a full-slice partition_view.
+  // a full-slice or subregion partition_view.
   auto dst_peer_view = EmitCommRemoteView(dst_binding, op->args_[1], codegen);
   std::string dst_pview =
       EmitPartitionViewPTO(dst_binding.var->name_hint_ + "_peer", dst_peer_view.ssa,
-                           dst_peer_view.view_type_str, partition_type, zero_offsets, size_ssa, codegen);
+                           dst_peer_view.view_type_str, partition_type, dst_offsets, size_ssa, codegen);
 
-  // src: local tensor_view + full-slice partition_view (no peer arithmetic).
+  // src: local tensor_view + full-slice or subregion partition_view (no peer arithmetic).
   // Use the shared helper for the source view type so it matches the dynamic-dim
   // tensor_view SSA that GetOrCreateTensorView emits (mirroring dst's peer view
   // and every other tensor-view op in this file); a hand-rolled static-shape
@@ -2482,12 +2648,22 @@ static std::string MakePutCodegenPTO(const CallPtr& op, codegen::CodegenBase& co
   std::string src_local_view = codegen.GetOrCreateTensorView(src_var);
   std::string src_view_type = codegen.GetTensorViewTypeString(src_dist.get());
   std::string src_pview = EmitPartitionViewPTO(src_var->name_hint_ + "_local", src_local_view, src_view_type,
-                                               partition_type, zero_offsets, size_ssa, codegen);
+                                               partition_type, src_offsets, size_ssa, codegen);
 
   std::string stage = codegen.GetExprAsCode(op->args_[3]);
   std::string stage_type = codegen.GetExprTypeAnnotation(op->args_[3]);
   INTERNAL_CHECK_SPAN(!stage_type.empty(), op->span_)
       << "Internal error: pld.tile.put stage tile " << stage << " has no tile_buf type annotation";
+
+  // The VEC staging tile is not synthesized here: pld.tensor.put has already
+  // been lowered to tile.create + pld.tile.put so the allocator can assign the
+  // stage tile a real UB address before this PTO emission step.
+
+  // TPUT reads the local source GM through MTE2. If the caller populated that
+  // source via an immediately preceding TSTORE, order the store before TPUT's
+  // source read; otherwise one rank can observe stale zeros while another wins
+  // the timing race.
+  codegen.Emit("pto.barrier <PIPE_ALL>");
 
   std::ostringstream tput;
   tput << "pto.comm.tput(" << dst_pview << ", " << src_pview << ", buf(" << stage << ") : " << partition_type
@@ -2893,6 +3069,9 @@ void RegisterPTOOps(Backend& backend, const std::unordered_set<std::string>& exc
   reg("pld.tile.remote_load", [](const ir::CallPtr& op, codegen::CodegenBase& codegen) {
     return MakeRemoteLoadCodegenPTO(op, codegen);
   });
+  reg("pld.tile.remote_store", [](const ir::CallPtr& op, codegen::CodegenBase& codegen) {
+    return MakeRemoteStoreCodegenPTO(op, codegen);
+  });
   reg("pld.system.notify",
       [](const ir::CallPtr& op, codegen::CodegenBase& codegen) { return MakeNotifyCodegenPTO(op, codegen); });
   reg("pld.system.wait",
@@ -3006,9 +3185,16 @@ void RegisterPTOOps(Backend& backend, const std::unordered_set<std::string>& exc
   reg("tile.cmp", [](const ir::CallPtr& op, codegen::CodegenBase& codegen) {
     return MakeTileCmpCodegenPTO("pto.tcmp", op, codegen);
   });
-  reg("tile.cast", [](const ir::CallPtr& op, codegen::CodegenBase& codegen) {
-    return MakeTileCvtCodegenPTO("pto.tcvt", op, codegen);
-  });
+  // tile.cast (TCVT): pto.tcvt mis-orders elements on a col_major source, so per
+  // ISA the input and output must be row_major (see #1549).
+  if (exclude_ops.count("tile.cast") == 0) {
+    backend.RegisterOp("tile.cast")
+        .f_codegen([](const ir::CallPtr& op, codegen::CodegenBase& codegen) {
+          return MakeTileCvtCodegenPTO("pto.tcvt", op, codegen);
+        })
+        .set_input_layout(0, ir::TileLayout::row_major)
+        .set_output_layout(ir::TileLayout::row_major);
+  }
   // tile.rsqrt accepts 1 arg (basic) or 2 args (high-precision with tmp workspace).
   // Both forms emit pto.trsqrt with the appropriate ins() arity. Per ISA, both
   // inputs (when present) and the output must be row_major.

@@ -696,6 +696,82 @@ class TestOrchestration:
         # PTO2_SCOPE wraps all task submissions
         assert "PTO2_SCOPE" in code
 
+    def test_inout_not_returned_three_outputs_alias(self):
+        """Regression for #1573: 3+ tuple outputs + an InOut that is not returned.
+
+        ``kernel`` takes ``inout_t`` (InOut, written in place but NOT part of the
+        return tuple) followed by three ``Out`` params that ARE returned. The
+        legacy tail-alignment heuristic put ``inout_t`` in the Out/InOut index
+        list, so ``tuple_arity (3) < out_indices (4)`` shifted every result alias
+        by one: each tuple element bound to the wrong source tensor
+        (``o1 = ext_inout_t``, ``o2 = ext_ta``, ``o3 = ext_tb``). Downstream that
+        feeds a reshape/consumer the wrong tensor (AICPU ``valid_reshape`` assert
+        / scheduler timeout). Each result must alias to its own arg, recovered
+        precisely from the callee's ReturnStmt.
+        """
+        backend.reset_for_testing()
+        backend.set_backend_type(BackendType.Ascend910B)
+
+        @pl.program
+        class InOutNotReturnedProgram:
+            @pl.function(type=pl.FunctionType.AIV)
+            def kernel(
+                self,
+                inout_t: pl.InOut[pl.Tensor[[16, 16], pl.FP32]],
+                out_a: pl.Out[pl.Tensor[[16, 16], pl.FP32]],
+                out_b: pl.Out[pl.Tensor[[16, 16], pl.FP32]],
+                out_c: pl.Out[pl.Tensor[[16, 16], pl.FP32]],
+            ) -> tuple[
+                pl.Tensor[[16, 16], pl.FP32],
+                pl.Tensor[[16, 16], pl.FP32],
+                pl.Tensor[[16, 16], pl.FP32],
+            ]:
+                it: pl.Tile[[16, 16], pl.FP32] = pl.load(inout_t, [0, 0], [16, 16])
+                _io: pl.Tensor[[16, 16], pl.FP32] = pl.store(it, [0, 0], inout_t)
+                a_out: pl.Tensor[[16, 16], pl.FP32] = pl.store(it, [0, 0], out_a)
+                b_out: pl.Tensor[[16, 16], pl.FP32] = pl.store(it, [0, 0], out_b)
+                c_out: pl.Tensor[[16, 16], pl.FP32] = pl.store(it, [0, 0], out_c)
+                return a_out, b_out, c_out
+
+            @pl.function(type=pl.FunctionType.AIV)
+            def combine(
+                self,
+                a: pl.Tensor[[16, 16], pl.FP32],
+                b: pl.Tensor[[16, 16], pl.FP32],
+                c: pl.Tensor[[16, 16], pl.FP32],
+                out: pl.Out[pl.Tensor[[16, 16], pl.FP32]],
+            ) -> pl.Tensor[[16, 16], pl.FP32]:
+                at: pl.Tile[[16, 16], pl.FP32] = pl.load(a, [0, 0], [16, 16])
+                r: pl.Tensor[[16, 16], pl.FP32] = pl.store(at, [0, 0], out)
+                return r
+
+            @pl.function(type=pl.FunctionType.Orchestration)
+            def orch(
+                self,
+                inout_t: pl.InOut[pl.Tensor[[16, 16], pl.FP32]],
+                ta: pl.Out[pl.Tensor[[16, 16], pl.FP32]],
+                tb: pl.Out[pl.Tensor[[16, 16], pl.FP32]],
+                tc: pl.Out[pl.Tensor[[16, 16], pl.FP32]],
+                final: pl.Out[pl.Tensor[[16, 16], pl.FP32]],
+            ) -> pl.Tensor[[16, 16], pl.FP32]:
+                o1, o2, o3 = self.kernel(inout_t, ta, tb, tc)
+                final = self.combine(o1, o2, o3, final)
+                return final
+
+        code = _generate_orch_code(InOutNotReturnedProgram)
+
+        # inout_t is InOut (written in place) but not part of the return tuple.
+        assert "params_t0.add_inout(ext_inout_t)" in code
+
+        # Each tuple result aliases to its OWN arg — not shifted onto inout_t.
+        assert "const Tensor& o1 = ext_ta;" in code
+        assert "const Tensor& o2 = ext_tb;" in code
+        assert "const Tensor& o3 = ext_tc;" in code
+        # The scrambled (shifted-by-one) bindings must NOT appear.
+        assert "const Tensor& o1 = ext_inout_t;" not in code
+        assert "const Tensor& o2 = ext_ta;" not in code
+        assert "const Tensor& o3 = ext_tb;" not in code
+
     def test_tensor_create(self):
         """Test tensor.create generates TensorCreateInfo with shape/dtype."""
         backend.reset_for_testing()
@@ -3485,7 +3561,111 @@ class TestManualScopeCodegen:
         assert "params_t2_deps[params_t2_deps_count++] = b_tid;" in code
         assert "params_t2.set_dependencies(params_t2_deps, params_t2_deps_count);" in code
 
+    def test_user_written_task_dummy_lowers_to_dummy_submit(self):
+        backend.reset_for_testing()
+        backend.set_backend_type(BackendType.Ascend910B)
+
+        N_BRANCHES = 4
+
+        @pl.program
+        class Prog:
+            @pl.function(type=pl.FunctionType.InCore)
+            def k1(self, x: pl.Tensor[[64], pl.FP32]) -> pl.Tensor[[64], pl.FP32]:
+                return x
+
+            @pl.function(type=pl.FunctionType.InCore)
+            def k2(self, x: pl.Tensor[[64], pl.FP32]) -> pl.Tensor[[64], pl.FP32]:
+                return x
+
+            @pl.function(type=pl.FunctionType.Orchestration)
+            def main(self, x: pl.Tensor[[64], pl.FP32]) -> pl.Tensor[[64], pl.FP32]:
+                with pl.manual_scope():
+                    tids = pl.array.create(N_BRANCHES, pl.TASK_ID)
+                    for j in pl.parallel(N_BRANCHES):
+                        _branch_out, tid = pl.submit(self.k1, x)
+                        tids[j] = tid
+                    barrier = pl.system.task_dummy(deps=[tids])
+                    b, _consumer_tid = pl.submit(self.k2, x, deps=[barrier])
+                return b
+
+        pm = PassManager.get_strategy(OptimizationStrategy.Default)
+        transformed = pm.run_passes(Prog)
+        code = _generate_orch_code(transformed)
+
+        assert "rt_submit_dummy_task(params_phase_fence_barrier_0)" in code, code
+        assert f"PTO2TaskId params_phase_fence_barrier_0_deps[{N_BRANCHES}];" in code, code
+        assert re.search(r"PTO2TaskId params_t\d+_deps\[1\];", code), code
+        assert re.search(
+            r"if \(barrier.*\.is_valid\(\)\) (params_t\d+)_deps\[\1_deps_count\+\+\] = barrier",
+            code,
+        ), code
+
+    def test_user_written_task_dummy_accepts_scalar_dep_codegen(self):
+        backend.reset_for_testing()
+        backend.set_backend_type(BackendType.Ascend910B)
+
+        @pl.program
+        class Prog:
+            @pl.function(type=pl.FunctionType.InCore)
+            def k1(self, x: pl.Tensor[[64], pl.FP32]) -> pl.Tensor[[64], pl.FP32]:
+                return x
+
+            @pl.function(type=pl.FunctionType.InCore)
+            def k2(self, x: pl.Tensor[[64], pl.FP32]) -> pl.Tensor[[64], pl.FP32]:
+                return x
+
+            @pl.function(type=pl.FunctionType.Orchestration)
+            def main(self, x: pl.Tensor[[64], pl.FP32]) -> pl.Tensor[[64], pl.FP32]:
+                with pl.manual_scope():
+                    a, tid = pl.submit(self.k1, x)
+                    barrier = pl.system.task_dummy(deps=[tid])
+                    b, _consumer_tid = pl.submit(self.k2, a, deps=[barrier])
+                return b
+
+        pm = PassManager.get_strategy(OptimizationStrategy.Default)
+        transformed = pm.run_passes(Prog)
+        code = _generate_orch_code(transformed)
+
+        assert "rt_submit_dummy_task(params_phase_fence_barrier_0)" in code, code
+        assert "PTO2TaskId params_phase_fence_barrier_0_deps[1];" in code, code
+        assert re.search(
+            r"if \(tid.*\.is_valid\(\)\) params_phase_fence_barrier_0_deps"
+            r"\[params_phase_fence_barrier_0_deps_count\+\+\] = tid",
+            code,
+        ), code
+        assert re.search(r"PTO2TaskId params_t\d+_deps\[1\];", code), code
+
+    def test_user_written_empty_task_dummy_keeps_invalid_task_id(self):
+        backend.reset_for_testing()
+        backend.set_backend_type(BackendType.Ascend910B)
+
+        @pl.program
+        class Prog:
+            @pl.function(type=pl.FunctionType.InCore)
+            def k1(self, x: pl.Tensor[[64], pl.FP32]) -> pl.Tensor[[64], pl.FP32]:
+                return x
+
+            @pl.function(type=pl.FunctionType.Orchestration)
+            def main(self, x: pl.Tensor[[64], pl.FP32]) -> pl.Tensor[[64], pl.FP32]:
+                with pl.manual_scope():
+                    barrier = pl.system.task_dummy(deps=[])
+                    y, _tid = pl.submit(self.k1, x, deps=[barrier])
+                return y
+
+        pm = PassManager.get_strategy(OptimizationStrategy.Default)
+        transformed = pm.run_passes(Prog)
+        code = _generate_orch_code(transformed)
+
+        assert "uint32_t params_phase_fence_barrier_0_deps_count = 0;" in code, code
+        assert "PTO2TaskId barrier = PTO2TaskId::invalid();" in code, code
+        assert "if (params_phase_fence_barrier_0_deps_count > 0)" in code, code
+        assert re.search(
+            r"if \(barrier.*\.is_valid\(\)\) (params_t\d+)_deps\[\1_deps_count\+\+\] = barrier",
+            code,
+        ), code
+
     def test_manual_scope_merges_user_and_compiler_deps(self):
+        """Auto-deps: compiler deps merge with user deps in manual scope."""
         backend.reset_for_testing()
         backend.set_backend_type(BackendType.Ascend910B)
 
@@ -3696,6 +3876,47 @@ class TestManualScopeCodegen:
         assert "if (a_tid.is_valid()) params_t1_deps[params_t1_deps_count++] = a_tid;" in code, code
         assert "params_t1.set_dependencies(params_t1_deps, params_t1_deps_count);" in code, code
 
+    def test_auto_scope_task_id_array_slot_dep_uses_scalar_snapshot(self):
+        """A TaskId array slot read is a valid explicit dep in auto scope."""
+        backend.reset_for_testing()
+        backend.set_backend_type(BackendType.Ascend910B)
+
+        @pl.program
+        class Prog:
+            @pl.function(type=pl.FunctionType.InCore)
+            def k1(self, x: pl.Tensor[[64], pl.FP32]) -> pl.Tensor[[64], pl.FP32]:
+                return x
+
+            @pl.function(type=pl.FunctionType.InCore)
+            def k2(self, x: pl.Tensor[[64], pl.FP32]) -> pl.Tensor[[64], pl.FP32]:
+                return x
+
+            @pl.function(type=pl.FunctionType.InCore)
+            def k3(self, x: pl.Tensor[[64], pl.FP32]) -> pl.Tensor[[64], pl.FP32]:
+                return x
+
+            @pl.function(type=pl.FunctionType.Orchestration)
+            def main(self, x: pl.Tensor[[64], pl.FP32]) -> pl.Tensor[[64], pl.FP32]:
+                tids = pl.array.create(1, pl.TASK_ID)
+                a, first_tid = pl.submit(self.k1, x)
+                tids[0] = first_tid
+                prev = tids[0]
+                b, second_tid = pl.submit(self.k2, x)
+                tids[0] = second_tid
+                c, _ = pl.submit(self.k3, x, deps=[prev])
+                return c
+
+        pm = PassManager.get_strategy(OptimizationStrategy.Default)
+        transformed = pm.run_passes(Prog)
+        code = _generate_orch_code(transformed)
+
+        assert "PTO2ScopeMode::MANUAL" not in code, code
+        assert re.search(r"PTO2TaskId\s+prev\s*=\s*tids\[0\];", code), code
+        assert "tids[0] = second_tid;" in code, code
+        assert "PTO2TaskId params_t2_deps[1];" in code, code
+        assert "if (prev.is_valid()) params_t2_deps[params_t2_deps_count++] = prev;" in code, code
+        assert "params_t2.set_dependencies(params_t2_deps, params_t2_deps_count);" in code, code
+
     def test_manual_scope_seq_outer_parallel_inner_two_stage_pipeline(self):
         """End-to-end: ``with pl.manual_scope():`` wrapping
         ``for i in pl.range(M): for j in pl.parallel(N): stage1; stage2``.
@@ -3772,12 +3993,13 @@ class TestManualScopeCodegen:
         transformed = pm.run_passes(Prog)
         code = _generate_orch_code(transformed)
 
-        # MANUAL wrapper + both loops survive without extra auto-scope wrappers.
-        assert "PTO2_SCOPE(PTO2ScopeMode::MANUAL)" in code, code
+        # With AutoDeriveTaskDependencies, loop-carried hazards (stage1 in the
+        # inner pl.parallel loop produces dynamic producers) trigger a manual→auto
+        # scope fallback.  The scope survives as AUTO; the intra-iteration user
+        # dep still wires correctly.
+        assert "PTO2_SCOPE(PTO2ScopeMode::MANUAL)" not in code, code
         assert "for (int64_t i = 0; i < 4; i += 1)" in code, code
         assert "for (int64_t j = 0; j < 8; j += 1)" in code, code
-        assert code.count("PTO2_SCOPE() {") == 1, code
-        assert code.count("PTO2_SCOPE(PTO2ScopeMode::MANUAL)") == 1, code
 
         # The producer TaskId is preserved through windowed rewriting and is
         # threaded into the consumer dependency edge.
@@ -3862,11 +4084,11 @@ class TestManualScopeCodegen:
         transformed = pm.run_passes(Prog)
         code = _generate_orch_code(transformed)
 
-        assert "PTO2_SCOPE(PTO2ScopeMode::MANUAL)" in code, code
+        # With AutoDeriveTaskDependencies, loop-carried hazards trigger a
+        # manual→auto scope fallback (same as the seq-outer/parallel-inner case).
+        assert "PTO2_SCOPE(PTO2ScopeMode::MANUAL)" not in code, code
         assert "for (int64_t i = 0; i < 8; i += 1)" in code, code
         assert "for (int64_t j = 0; j < 4; j += 1)" in code, code
-        assert code.count("PTO2_SCOPE() {") == 1, code
-        assert code.count("PTO2_SCOPE(PTO2ScopeMode::MANUAL)") == 1, code
 
         # The producer TaskId is preserved through windowed rewriting and is
         # threaded into the consumer dependency edge.
@@ -3934,14 +4156,15 @@ class TestManualScopeCodegen:
         with pytest.raises(Exception, match="statically-known trip count"):
             _generate_orch_code(transformed)
 
-    def test_manual_scope_parallel_array_carry_above_legacy_16_cap(self):
-        """``pl.parallel(N)`` with ``N > 16`` must succeed and size the deps array.
+    def test_manual_scope_double_buffered_array_carry_above_legacy_16_cap(self):
+        """A stable full-array dep with ``N > 16`` lowers through a dummy barrier.
 
         The runtime's ``Arg::set_dependencies(ptr, count)`` primitive has no
-        upper bound on explicit deps, so codegen sizes the per-task
-        ``PTO2TaskId <task>_deps[K]`` stack array to the exact dep-edge count.
-        A parallel loop carrying a manual_scope dep across N=17 slots produces
-        a downstream task with a ``PTO2TaskId params_t0_deps[17]`` array.
+        upper bound on explicit deps. The phase-fence compression keeps the
+        N-slot dependency fanin on a synthetic dummy barrier, then makes each
+        real downstream task depend on the barrier's single TaskId. The witness
+        uses a double-buffered carrier so the dependency source is read-only
+        inside the parallel body.
         """
         backend.reset_for_testing()
         backend.set_backend_type(BackendType.Ascend910B)
@@ -3972,24 +4195,162 @@ class TestManualScopeCodegen:
                 out: pl.Out[pl.Tensor[[ROWS, COLS], pl.FP32]],
             ) -> pl.Tensor[[ROWS, COLS], pl.FP32]:
                 with pl.manual_scope():
-                    # Per-slot TaskId array (length = parallel trip count).
-                    # ``deps=[tids]`` expands to ABOVE_LEGACY_CAP guarded
-                    # array-slot fills, sizing the stack deps array accordingly.
                     tids = pl.array.create(ABOVE_LEGACY_CAP, pl.TASK_ID)
-                    for i in pl.range(4):
+                    for i, (tids_iter,) in pl.range(4, init_values=(tids,)):
+                        tids_next = pl.array.create(ABOVE_LEGACY_CAP, pl.TASK_ID)
                         row: pl.Scalar[pl.INDEX] = i * TILE_R
                         for j in pl.parallel(ABOVE_LEGACY_CAP):
                             col: pl.Scalar[pl.INDEX] = j * TILE_C
-                            out, tid = pl.submit(self.kern, x, out, row, col, deps=[tids])
-                            tids[j] = tid
+                            out, tid = pl.submit(self.kern, x, out, row, col, deps=[tids_iter])
+                            tids_next[j] = tid
+                        tids = pl.yield_(tids_next)
                 return out
 
         pm = PassManager.get_strategy(OptimizationStrategy.Default)
         transformed = pm.run_passes(Prog)
         code = _generate_orch_code(transformed)
-        # The stack deps array is sized to the exact dep count (17 slots from
-        # the parallel array carry), proving the legacy 16-cap is gone.
-        assert f"PTO2TaskId params_t0_deps[{ABOVE_LEGACY_CAP}];" in code, code
+        assert "rt_submit_dummy_task(params_phase_fence_barrier_0)" in code, code
+        assert f"PTO2TaskId params_phase_fence_barrier_0_deps[{ABOVE_LEGACY_CAP}];" in code, code
+        assert re.search(r"PTO2TaskId params_t\d+_deps\[1\];", code), code
+        assert re.search(
+            r"if \(phase_fence_barrier_0_tid\.is_valid\(\)\) "
+            r"(params_t\d+)_deps\[\1_deps_count\+\+\] = phase_fence_barrier_0_tid;",
+            code,
+        ), code
+        assert not re.search(rf"PTO2TaskId params_t\d+_deps\[{ABOVE_LEGACY_CAP}\];", code), code
+
+    def test_manual_scope_phase_fence_scalar_dep_does_not_emit_dummy_barrier(self):
+        """Scalar TaskId deps remain on the legacy single-edge lowering path."""
+        backend.reset_for_testing()
+        backend.set_backend_type(BackendType.Ascend910B)
+
+        @pl.program
+        class Prog:
+            @pl.function(type=pl.FunctionType.InCore)
+            def k1(self, x: pl.Tensor[[64], pl.FP32]) -> pl.Tensor[[64], pl.FP32]:
+                return x
+
+            @pl.function(type=pl.FunctionType.InCore)
+            def k2(self, x: pl.Tensor[[64], pl.FP32]) -> pl.Tensor[[64], pl.FP32]:
+                return x
+
+            @pl.function(type=pl.FunctionType.Orchestration)
+            def main(self, x: pl.Tensor[[64], pl.FP32]) -> pl.Tensor[[64], pl.FP32]:
+                with pl.manual_scope():
+                    a, tid = pl.submit(self.k1, x)
+                    b, _ = pl.submit(self.k2, a, deps=[tid])
+                return b
+
+        pm = PassManager.get_strategy(OptimizationStrategy.Default)
+        transformed = pm.run_passes(Prog)
+        code = _generate_orch_code(transformed)
+
+        assert "rt_submit_dummy_task" not in code, code
+        assert "PTO2TaskId params_t1_deps[1];" in code, code
+        assert "params_t1.set_dependencies(params_t1_deps, params_t1_deps_count);" in code, code
+
+    def test_manual_scope_phase_fence_mixed_deps_do_not_emit_dummy_barrier(self):
+        """Mixed array + scalar deps are intentionally outside first-version scope."""
+        backend.reset_for_testing()
+        backend.set_backend_type(BackendType.Ascend910B)
+
+        ROWS, COLS = 128, 128
+        TILE_R, TILE_C = 32, 32
+        N_BRANCHES = 4
+
+        @pl.program
+        class Prog:
+            @pl.function(type=pl.FunctionType.InCore)
+            def kern(
+                self,
+                x: pl.Tensor[[ROWS, COLS], pl.FP32],
+                out: pl.Out[pl.Tensor[[ROWS, COLS], pl.FP32]],
+                row: pl.Scalar[pl.INDEX],
+                col: pl.Scalar[pl.INDEX],
+            ) -> pl.Tensor[[ROWS, COLS], pl.FP32]:
+                t: pl.Tile[[TILE_R, TILE_C], pl.FP32] = pl.load(x, [row, col], [TILE_R, TILE_C])
+                r: pl.Tile[[TILE_R, TILE_C], pl.FP32] = pl.add(t, t)
+                ret: pl.Tensor[[ROWS, COLS], pl.FP32] = pl.store(r, [row, col], out)
+                return ret
+
+            @pl.function(type=pl.FunctionType.Orchestration)
+            def main(
+                self,
+                x: pl.Tensor[[ROWS, COLS], pl.FP32],
+                out: pl.Out[pl.Tensor[[ROWS, COLS], pl.FP32]],
+            ) -> pl.Tensor[[ROWS, COLS], pl.FP32]:
+                with pl.manual_scope():
+                    seed_out, seed_tid = pl.submit(self.kern, x, out, 0, 0)
+                    tids = pl.array.create(N_BRANCHES, pl.TASK_ID)
+                    for i in pl.range(2):
+                        row: pl.Scalar[pl.INDEX] = i * TILE_R
+                        for j in pl.parallel(N_BRANCHES):
+                            col: pl.Scalar[pl.INDEX] = j * TILE_C
+                            seed_out, tid = pl.submit(
+                                self.kern,
+                                x,
+                                seed_out,
+                                row,
+                                col,
+                                deps=[tids, seed_tid],
+                            )
+                            tids[j] = tid
+                return seed_out
+
+        pm = PassManager.get_strategy(OptimizationStrategy.Default)
+        transformed = pm.run_passes(Prog)
+        code = _generate_orch_code(transformed)
+
+        assert "rt_submit_dummy_task" not in code, code
+        # 4 user deps (tids[0..3]) + 1 user dep (seed_tid) + 1 compiler dep
+        # (WAW hazard seed_tid → iter tid from prior phase) = 6
+        assert re.search(r"PTO2TaskId params_t\d+_deps\[6\];", code), code
+
+    def test_auto_scope_array_dep_does_not_emit_dummy_barrier(self):
+        """Array deps outside manual_scope keep the existing explicit-deps lowering."""
+        backend.reset_for_testing()
+        backend.set_backend_type(BackendType.Ascend910B)
+
+        ROWS, COLS = 128, 128
+        TILE_R, TILE_C = 32, 32
+        N_BRANCHES = 4
+
+        @pl.program
+        class Prog:
+            @pl.function(type=pl.FunctionType.InCore)
+            def kern(
+                self,
+                x: pl.Tensor[[ROWS, COLS], pl.FP32],
+                out: pl.Out[pl.Tensor[[ROWS, COLS], pl.FP32]],
+                row: pl.Scalar[pl.INDEX],
+                col: pl.Scalar[pl.INDEX],
+            ) -> pl.Tensor[[ROWS, COLS], pl.FP32]:
+                t: pl.Tile[[TILE_R, TILE_C], pl.FP32] = pl.load(x, [row, col], [TILE_R, TILE_C])
+                r: pl.Tile[[TILE_R, TILE_C], pl.FP32] = pl.add(t, t)
+                ret: pl.Tensor[[ROWS, COLS], pl.FP32] = pl.store(r, [row, col], out)
+                return ret
+
+            @pl.function(type=pl.FunctionType.Orchestration)
+            def main(
+                self,
+                x: pl.Tensor[[ROWS, COLS], pl.FP32],
+                out: pl.Out[pl.Tensor[[ROWS, COLS], pl.FP32]],
+            ) -> pl.Tensor[[ROWS, COLS], pl.FP32]:
+                tids = pl.array.create(N_BRANCHES, pl.TASK_ID)
+                for i in pl.range(2):
+                    row: pl.Scalar[pl.INDEX] = i * TILE_R
+                    for j in pl.parallel(N_BRANCHES):
+                        col: pl.Scalar[pl.INDEX] = j * TILE_C
+                        out, tid = pl.submit(self.kern, x, out, row, col, deps=[tids])
+                        tids[j] = tid
+                return out
+
+        pm = PassManager.get_strategy(OptimizationStrategy.Default)
+        transformed = pm.run_passes(Prog)
+        code = _generate_orch_code(transformed)
+
+        assert "rt_submit_dummy_task" not in code, code
+        assert re.search(r"PTO2TaskId params_t\d+_deps\[4\];", code), code
 
     def test_manual_scope_submit_task_id_dep(self):
         """The producer TaskId of a ``pl.submit(...)`` threaded into a later
@@ -4128,6 +4489,78 @@ class TestManualScopeCodegen:
         # ``is_valid()`` guard (first iteration's sentinel is skipped).
         assert ".is_valid())" in code, code
         assert ".set_dependencies(" in code, code
+
+    def test_manual_scope_inner_deps_can_reference_outer_scope_tid(self):
+        """Regression: a kernel inside ``with pl.manual_scope():`` can carry
+        ``deps=[outer_tid]`` referencing a TaskId produced by an *outer*
+        (auto-scope) task.
+
+        Previously ``OrchestrationCodegen::VisitStmt_(RuntimeScopeStmtPtr)``
+        wiped ``manual_task_id_map_`` on manual-scope entry (``std::move``
+        the outer map into ``saved_map`` then ``clear()``), so any
+        ``deps=`` edge pointing to an outer-scope producer was silently
+        dropped in ``CountManualDeps`` (early return on the
+        ``manual_task_id_map_.find(edge) == end()`` miss) and no
+        ``set_dependencies(...)`` call was emitted for that inner task.
+        With no explicit edge and no auto-dep (manual scope disables
+        OverlapMap), the inner kernel could race the outer producer.
+
+        The fix snapshots the outer map by *copy* instead of moving + clearing,
+        so the live map keeps the outer entries visible inside the inner scope.
+        The outer-only snapshot is restored on exit so the inner-scope adds —
+        which name C++ identifiers that die with the inner ``{`` block — do
+        not leak back into the parent scope.
+        """
+        backend.reset_for_testing()
+        backend.set_backend_type(BackendType.Ascend910B)
+
+        @pl.program
+        class Prog:
+            @pl.function(type=pl.FunctionType.InCore)
+            def k_outer(self, x: pl.Tensor[[64], pl.FP32]) -> pl.Tensor[[64], pl.FP32]:
+                return x
+
+            @pl.function(type=pl.FunctionType.InCore)
+            def k_inner(self, x: pl.Tensor[[64], pl.FP32]) -> pl.Tensor[[64], pl.FP32]:
+                return x
+
+            @pl.function(type=pl.FunctionType.Orchestration)
+            def main(self, x: pl.Tensor[[64], pl.FP32]) -> pl.Tensor[[64], pl.FP32]:
+                # Outer producer in auto scope — captures TaskId for the
+                # cross-scope fence. ``outer_a`` is bound but unused; the
+                # only edge from outer to inner is the explicit TaskId dep.
+                outer_a, outer_tid = pl.submit(self.k_outer, x)
+                with pl.manual_scope():
+                    # Inner consumer in manual scope. The two kernels share
+                    # no data input (both read ``x``), so the ``deps=`` edge
+                    # is the *only* thing fencing inner behind outer.
+                    inner_b, _ = pl.submit(self.k_inner, x, deps=[outer_tid])
+                return inner_b
+
+        pm = PassManager.get_strategy(OptimizationStrategy.Default)
+        transformed = pm.run_passes(Prog)
+        code = _generate_orch_code(transformed)
+
+        # Outer producer (Task 0, in auto scope) captures its TaskId. Use the
+        # same regex-discovery idiom as nearby tests (lines 3730, 3819, 4010)
+        # so the assertion is not brittle to any future SSA renaming /
+        # suffixing the codegen may apply to the producer TaskId emit name.
+        assert "TaskOutputTensors task_0_outs = rt_submit_aiv_task(" in code, code
+        producer_tid = re.search(r"PTO2TaskId (\w+) = task_0_outs\.task_id\(\);", code)
+        assert producer_tid, code
+        # Inner kernel runs inside a MANUAL scope.
+        assert "PTO2_SCOPE(PTO2ScopeMode::MANUAL)" in code, code
+        # The inner kernel's deps array MUST include the producer TaskId edge —
+        # this is what the bug used to silently drop. Without these lines the
+        # inner ``rt_submit_*_task`` would have no explicit fence on the outer
+        # task and the regression would re-emerge.
+        assert "Arg params_t1;" in code, code
+        assert "PTO2TaskId params_t1_deps[1];" in code, code
+        assert (
+            f"if ({producer_tid.group(1)}.is_valid()) params_t1_deps[params_t1_deps_count++] = {producer_tid.group(1)};"
+            in code
+        ), code
+        assert "params_t1.set_dependencies(params_t1_deps, params_t1_deps_count);" in code, code
 
 
 class TestTupleReturnNoDepAliasing:
@@ -4400,6 +4833,256 @@ class TestTupleReturnNameHintCollision:
         assert not duplicate_declarations, (
             f"generated C++ redeclared tensor names {sorted(duplicate_declarations)}:\n{code}"
         )
+
+
+class TestScalarCarryPhiCodegen:
+    """Regression tests for scalar loop carries in orchestration codegen."""
+
+    def test_scalar_carry_phi_not_emitted_as_tensor(self):
+        """Regression for #1580: Scalar loop carry must not be aliased as const Tensor&.
+
+        When a Scalar variable is defined before a pl.parallel loop and then
+        reused (reassigned) inside it, alongside Tensor carries, ConvertToSSA
+        promotes the scalar into the parallel-loop carry tuple.  The orchestration
+        codegen must emit the Scalar carry phi as ``int64_t = 0`` (untraced scalar
+        default), NOT as ``const Tensor& = <carry_var>`` (type mismatch that causes
+        a C++ compile error).
+        """
+        backend.reset_for_testing()
+        backend.set_backend_type(BackendType.Ascend910B)
+
+        N, TILE = 16, 4
+
+        @pl.program
+        class ScalarCarryProg:
+            @pl.function(type=pl.FunctionType.AIV)
+            def scope_b_kernel(
+                self,
+                x: pl.Tensor[[N, N], pl.FP32],
+                out_b: pl.Out[pl.Tensor[[N, N], pl.FP32]],
+                out_c: pl.Out[pl.Tensor[[N, N], pl.FP32]],
+            ) -> tuple[pl.Tensor[[N, N], pl.FP32], pl.Tensor[[N, N], pl.FP32]]:
+                t: pl.Tile[[N, N], pl.FP32] = pl.load(x, [0, 0], [N, N])
+                out_b = pl.store(t, [0, 0], out_b)
+                out_c = pl.store(t, [0, 0], out_c)
+                return out_b, out_c
+
+            @pl.function(type=pl.FunctionType.Orchestration)
+            def orch(
+                self,
+                x: pl.Tensor[[N, N], pl.FP32],
+                out_b: pl.Out[pl.Tensor[[N, N], pl.FP32]],
+                out_c: pl.Out[pl.Tensor[[N, N], pl.FP32]],
+                row_start: pl.Scalar[pl.INDEX],
+            ) -> tuple[pl.Tensor[[N, N], pl.FP32], pl.Tensor[[N, N], pl.FP32]]:
+                # global_c_idx is assigned from a scalar param before the
+                # parallel loop — ConvertToSSA sees it in 'before' and adds it
+                # as a carry when it is reassigned inside the loop body.
+                global_c_idx = row_start
+
+                # The parallel loop carries global_c_idx (Scalar) mixed with
+                # Tensor carries out_b, out_c.  Before the fix, the Scalar carry
+                # phi was emitted as ``const Tensor&`` causing a C++ compile error.
+                for batch_idx in pl.parallel(0, N // TILE):
+                    with pl.at(level=pl.Level.CORE_GROUP, name_hint="scope_b"):
+                        for inner in pl.range(TILE):
+                            global_c_idx = batch_idx + inner
+                            out_b, out_c = self.scope_b_kernel(x, out_b, out_c)
+
+                return out_b, out_c
+
+        pm = PassManager.get_strategy(OptimizationStrategy.Default)
+        transformed = pm.run_passes(ScalarCarryProg)
+        code = _generate_orch_code(transformed)
+
+        # The Scalar carry phi must be emitted as int64_t = 0 (untraced scalar
+        # default), never as const Tensor& = <carry> (type mismatch / #1580).
+        assert "int64_t global_c_idx__rv" in code, (
+            "global_c_idx carry phi should be emitted as int64_t, not const Tensor&\n" + code
+        )
+        assert "const Tensor& global_c_idx" not in code, (
+            "global_c_idx must not be aliased as const Tensor& (scalar/tensor type mismatch)\n" + code
+        )
+
+        # out_b and out_c Tensor carries must each alias to their own carry.
+        # The scrambled (shifted-by-one) bindings must NOT appear.
+        for line in code.splitlines():
+            stripped = line.strip()
+            if "=" not in stripped:
+                continue
+            lhs, _, rhs = stripped.partition("=")
+            # out_c phi must not be initialized from out_b's carry value
+            if "out_c" in lhs and "out_b" in rhs and "out_c" not in rhs:
+                raise AssertionError(f"Wrong phi: out_c assigned from out_b value (scrambled):\n  {stripped}")
+            # out_b phi must not be initialized from out_c's carry value
+            if "out_b" in lhs and "out_c" in rhs and "out_b" not in rhs:
+                raise AssertionError(f"Wrong phi: out_b assigned from out_c value (scrambled):\n  {stripped}")
+
+
+def _generate_orch_full_pipeline(program_cls) -> str:
+    """Run the Default pass pipeline + orchestration codegen on the orch func.
+
+    The issue #1577 witnesses use ``pl.submit`` against ``@pl.function(InCore)``
+    kernels, which only reach orchestration form after the full Default pipeline
+    (inline / outline / SSA / materialize scopes). Mirrors
+    ``test_array_codegen._generate_pto`` but targets the Orchestration function.
+    """
+    backend.reset_for_testing()
+    backend.set_backend_type(BackendType.Ascend910B)
+    pm = PassManager.get_strategy(OptimizationStrategy.Default)
+    # Scope to BASIC (property) verification, overriding conftest's default
+    # roundtrip instrument. ``pl.submit(..., deps=[...])`` in an auto
+    # orchestration does not survive a print->parse roundtrip after
+    # DeriveCallDirections (a separate printer/parser bug, unrelated to the
+    # orchestration codegen behaviour under test here). Property verification
+    # still runs so real IR invariant violations are caught.
+    with passes.PassContext([passes.VerificationInstrument(passes.VerificationMode.BEFORE_AND_AFTER)]):
+        optimized = pm.run_passes(program_cls)
+    for func in optimized.functions.values():
+        if func.func_type == ir.FunctionType.Orchestration:
+            return codegen.generate_orchestration(optimized, func).code
+    raise AssertionError("no Orchestration function found in program")
+
+
+def test_array_slot_task_id_usable_as_submit_dep():
+    """Regression for issue #1577.
+
+    ``prev = tids[k]`` reads one slot of a ``pl.array.create(N, pl.TASK_ID)``
+    into a ``Scalar[TASK_ID]``. Using ``prev`` as a ``pl.submit(..., deps=[prev])``
+    source must wire the consumer's ``set_dependencies`` array from that snapshot
+    local. Before the fix, orchestration codegen aborted with "manual_dep_edge
+    var '...' has no producer task in current manual scope".
+    """
+
+    @pl.program
+    class P:
+        @pl.function(type=pl.FunctionType.InCore)
+        def k1(self, x: pl.Tensor[[64], pl.FP32]) -> pl.Tensor[[64], pl.FP32]:
+            return x
+
+        @pl.function(type=pl.FunctionType.InCore)
+        def k2(self, x: pl.Tensor[[64], pl.FP32]) -> pl.Tensor[[64], pl.FP32]:
+            return x
+
+        @pl.function(type=pl.FunctionType.InCore)
+        def k3(self, x: pl.Tensor[[64], pl.FP32]) -> pl.Tensor[[64], pl.FP32]:
+            return x
+
+        @pl.function(type=pl.FunctionType.Orchestration)
+        def main(
+            self,
+            x: pl.Tensor[[64], pl.FP32],
+            out: pl.Out[pl.Tensor[[64], pl.FP32]],
+        ) -> pl.Tensor[[64], pl.FP32]:
+            tids = pl.array.create(1, pl.TASK_ID)
+            _seed, seed_tid = pl.submit(self.k1, x)
+            _a, tid = pl.submit(self.k2, x)
+            tids[0] = tid
+            prev = tids[0]
+            b, _ = pl.submit(self.k3, x, deps=[seed_tid, prev])
+            return b
+
+    code = _generate_orch_full_pipeline(P)
+
+    # ``prev = tids[0]`` lowers to a scalar PTO2TaskId snapshot local read from
+    # the array slot (the dep site references the snapshot, not a slot re-read).
+    assert re.search(r"PTO2TaskId\s+prev\w*\s*=\s*tids\w*\[0\];", code), code
+    # The consumer gets exactly one dependency array, filled from BOTH the direct
+    # producer tid (seed_tid) and the array-slot snapshot (prev), each guarded.
+    assert code.count("set_dependencies(") == 1, code
+    assert re.search(r"if \(seed_tid\w*\.is_valid\(\)\)", code), code
+    assert re.search(r"if \(prev\w*\.is_valid\(\)\)", code), code
+
+
+def test_task_id_binding_does_not_leak_past_pl_scope():
+    """Regression for the issue #1577 lifetime hazard.
+
+    A producer TaskId declared inside a nested AUTO ``pl.scope()`` names a
+    ``PTO2TaskId`` C++ local that dies at the block's closing brace. Codegen must
+    not reference it after the block — before the fix it emitted a
+    ``set_dependencies`` fill from the out-of-scope local (uncompilable C++).
+    The TaskId binding is now scoped to the ``PTO2_SCOPE`` it is produced in, so
+    its identifier appears exactly once (its declaration) in the generated code.
+    """
+
+    @pl.program
+    class P:
+        @pl.function(type=pl.FunctionType.InCore)
+        def k1(self, x: pl.Tensor[[64], pl.FP32]) -> pl.Tensor[[64], pl.FP32]:
+            return x
+
+        @pl.function(type=pl.FunctionType.InCore)
+        def k2(self, x: pl.Tensor[[64], pl.FP32]) -> pl.Tensor[[64], pl.FP32]:
+            return x
+
+        @pl.function(type=pl.FunctionType.Orchestration, auto_scope=False)
+        def main(
+            self,
+            x: pl.Tensor[[64], pl.FP32],
+            out: pl.Out[pl.Tensor[[64], pl.FP32]],
+        ) -> pl.Tensor[[64], pl.FP32]:
+            with pl.scope():
+                _a, scoped_tid = pl.submit(self.k1, x)
+            b, _ = pl.submit(self.k2, x, deps=[scoped_tid])
+            return b
+
+    code = _generate_orch_full_pipeline(P)
+
+    # The producer tid is declared inside the inner PTO2_SCOPE block.
+    m = re.search(r"PTO2TaskId\s+(\w+)\s*=\s*task_0_outs\.task_id\(\);", code)
+    assert m, code
+    tid_name = m.group(1)
+    # It must NOT be referenced after its block closes — the binding is scoped
+    # out, so the only occurrence is its declaration (no dangling dep fill).
+    assert code.count(tid_name) == 1, f"TaskId local '{tid_name}' leaked past its pl.scope():\n{code}"
+
+
+def test_mixed_in_and_out_of_scope_deps_does_not_crash_codegen():
+    """A deps= list mixing an in-scope TaskId with one scoped out of a closed
+    ``pl.scope()`` must not abort codegen.
+
+    ``CountManualDeps`` skips the out-of-scope edge when sizing the dep stack
+    array, so the count is non-zero (the in-scope edge). ``EmitManualDeps`` must
+    skip the same out-of-scope edge rather than asserting on it — otherwise the
+    mixed case trips an INTERNAL_CHECK and crashes the compiler. The in-scope
+    edge is still wired; the out-of-scope edge is dropped.
+    """
+
+    @pl.program
+    class P:
+        @pl.function(type=pl.FunctionType.InCore)
+        def k1(self, x: pl.Tensor[[64], pl.FP32]) -> pl.Tensor[[64], pl.FP32]:
+            return x
+
+        @pl.function(type=pl.FunctionType.InCore)
+        def k2(self, x: pl.Tensor[[64], pl.FP32]) -> pl.Tensor[[64], pl.FP32]:
+            return x
+
+        @pl.function(type=pl.FunctionType.InCore)
+        def k3(self, x: pl.Tensor[[64], pl.FP32]) -> pl.Tensor[[64], pl.FP32]:
+            return x
+
+        @pl.function(type=pl.FunctionType.Orchestration, auto_scope=False)
+        def main(
+            self,
+            x: pl.Tensor[[64], pl.FP32],
+            out: pl.Out[pl.Tensor[[64], pl.FP32]],
+        ) -> pl.Tensor[[64], pl.FP32]:
+            with pl.scope():
+                _a, scoped_tid = pl.submit(self.k1, x)
+            _seed, seed_tid = pl.submit(self.k2, x)
+            b, _ = pl.submit(self.k3, x, deps=[seed_tid, scoped_tid])
+            return b
+
+    # Must not raise (regression: EmitManualDeps used to INTERNAL_CHECK here).
+    code = _generate_orch_full_pipeline(P)
+
+    # The in-scope edge is wired; the out-of-scope ``scoped_tid`` is dropped.
+    assert code.count("set_dependencies(") == 1, code
+    assert re.search(r"if \(seed_tid\w*\.is_valid\(\)\)", code), code
+    m = re.search(r"PTO2TaskId\s+(\w+)\s*=\s*task_0_outs\.task_id\(\);", code)
+    assert m, code
+    assert code.count(m.group(1)) == 1, code
 
 
 if __name__ == "__main__":
