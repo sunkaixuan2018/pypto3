@@ -18,6 +18,7 @@ them immediately before emitting `Arg::set_dependencies(...)`.
 ```text
 ... -> DeriveCallDirections
     -> AutoDeriveTaskDependencies
+    -> ExpandManualPhaseFence
     -> CollectCommGroups
     -> Simplify (final)
 ```
