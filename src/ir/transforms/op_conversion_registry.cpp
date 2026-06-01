@@ -1061,6 +1061,11 @@ void OpConversionRegistry::RegisterSortOps() {
 // ============================================================================
 
 void OpConversionRegistry::RegisterGatherOps() {
+  // tensor.gather (index form) — accepts TensorType or TileType for input/index.
+  // Upstream conversions may already have lowered an argument to a tile, so we
+  // emit tile.load when the source is still a tensor and tile.slice when it is
+  // already a tile (the latter only safe for 2D; FlattenTileNdTo2D rejects >2D
+  // tile.slice).
   RegisterCustom(
       "tensor.gather",
       [](const std::vector<ExprPtr>& args, const std::vector<std::pair<std::string, std::any>>& kwargs,
@@ -1072,15 +1077,19 @@ void OpConversionRegistry::RegisterGatherOps() {
         const auto& input = args[0];
         const auto& index = args[1];
 
-        auto input_tensor_type = As<TensorType>(input->GetType());
-        CHECK(input_tensor_type) << "tensor.gather conversion: input must be TensorType, got "
-                                 << input->GetType()->TypeName();
-        auto index_tensor_type = As<TensorType>(index->GetType());
-        CHECK(index_tensor_type) << "tensor.gather conversion: index must be TensorType, got "
-                                 << index->GetType()->TypeName();
-
-        const auto& input_shape = input_tensor_type->shape_;
-        const auto& index_shape = index_tensor_type->shape_;
+        auto get_shape_dtype = [&](const ExprPtr& e,
+                                   const char* role) -> std::pair<std::vector<ExprPtr>, DataType> {
+          if (auto t = As<TensorType>(e->GetType())) return {t->shape_, t->dtype_};
+          if (auto t = As<TileType>(e->GetType())) return {t->shape_, t->dtype_};
+          CHECK(false) << "tensor.gather conversion: " << role << " must be TensorType or TileType, got "
+                       << e->GetType()->TypeName();
+          return {};
+        };
+        auto input_info = get_shape_dtype(input, "input");
+        auto index_info = get_shape_dtype(index, "index");
+        const auto& input_shape = input_info.first;
+        const DataType input_dtype = input_info.second;
+        const auto& index_shape = index_info.first;
         const int64_t rank = static_cast<int64_t>(input_shape.size());
         CHECK(rank >= 2) << "tensor.gather conversion: rank must be >= 2, got " << rank;
 
@@ -1088,8 +1097,6 @@ void OpConversionRegistry::RegisterGatherOps() {
         int norm_dim = dim_val < 0 ? dim_val + static_cast<int>(rank) : dim_val;
         CHECK(norm_dim >= 0 && norm_dim < static_cast<int>(rank))
             << "tensor.gather conversion: dim out of range, got " << dim_val;
-
-        DataType input_dtype = input_tensor_type->dtype_;
 
         auto make_idx = [&](int64_t value) -> ExprPtr {
           return std::make_shared<ConstInt>(value, DataType::INDEX, span);
@@ -1130,6 +1137,14 @@ void OpConversionRegistry::RegisterGatherOps() {
         auto reshape_to = [&](std::vector<StmtPtr>& stmts, const ExprPtr& src,
                               const std::vector<ExprPtr>& new_shape, const std::string& name) -> VarPtr {
           return emit_to(stmts, "tile.reshape", {src, MakeShapeTuple(new_shape, span)}, {}, name);
+        };
+
+        auto emit_load_or_slice = [&](std::vector<StmtPtr>& stmts, const ExprPtr& src, const ExprPtr& offsets,
+                                      const ExprPtr& shape, const std::string& name) -> VarPtr {
+          if (As<TileType>(src->GetType())) {
+            return emit_to(stmts, "tile.slice", {src, shape, offsets, shape}, {}, name);
+          }
+          return emit_to(stmts, "tile.load", {src, offsets, shape, shape}, load_kwargs, name);
         };
 
         // Emit single-row tile.gather (with scratch tile); src_row and idx_row must be 2D.
@@ -1184,18 +1199,16 @@ void OpConversionRegistry::RegisterGatherOps() {
           int64_t S1 = get_const(input_shape[1], "input.shape[1]");
           int64_t K = get_const(index_shape[1], "index.shape[1]");
 
-          auto result = make_loop(
-              prologue, "gather", index_shape[0], I0, K, input_dtype,
-              [&](const VarPtr& lv, const IterArgPtr& /*ia*/, std::vector<StmtPtr>& bs) -> VarPtr {
-                auto row_ofs = std::make_shared<MakeTuple>(std::vector<ExprPtr>{lv, zero}, span);
-                auto inp_sh = MakeShapeTuple({one, make_idx(S1)}, span);
-                auto inp_row =
-                    emit_to(bs, "tile.load", {input, row_ofs, inp_sh, inp_sh}, load_kwargs, "gather_inp_row");
-                auto idx_sh = MakeShapeTuple({one, make_idx(K)}, span);
-                auto idx_row =
-                    emit_to(bs, "tile.load", {index, row_ofs, idx_sh, idx_sh}, load_kwargs, "gather_idx_row");
-                return single_row_gather(bs, inp_row, idx_row, K, "gather_row");
-              });
+          auto result =
+              make_loop(prologue, "gather", index_shape[0], I0, K, input_dtype,
+                        [&](const VarPtr& lv, const IterArgPtr& /*ia*/, std::vector<StmtPtr>& bs) -> VarPtr {
+                          auto row_ofs = std::make_shared<MakeTuple>(std::vector<ExprPtr>{lv, zero}, span);
+                          auto inp_sh = MakeShapeTuple({one, make_idx(S1)}, span);
+                          auto inp_row = emit_load_or_slice(bs, input, row_ofs, inp_sh, "gather_inp_row");
+                          auto idx_sh = MakeShapeTuple({one, make_idx(K)}, span);
+                          auto idx_row = emit_load_or_slice(bs, index, row_ofs, idx_sh, "gather_idx_row");
+                          return single_row_gather(bs, inp_row, idx_row, K, "gather_row");
+                        });
           return ConversionResult{std::move(prologue), result};
         }
 
@@ -1225,12 +1238,10 @@ void OpConversionRegistry::RegisterGatherOps() {
                                     std::vector<ExprPtr>{outer_lv, inner_lv, zero}, span);
                                 // Load with 3D shape → 3D tile type; immediately reshape to 2D.
                                 auto inp_sh = MakeShapeTuple({one, one, make_idx(S2)}, span);
-                                auto inp_raw = emit_to(bs, "tile.load", {input, ofs, inp_sh, inp_sh},
-                                                       load_kwargs, "gather_inp_raw");
+                                auto inp_raw = emit_load_or_slice(bs, input, ofs, inp_sh, "gather_inp_raw");
                                 auto inp_row = reshape_to(bs, inp_raw, {one, make_idx(S2)}, "gather_inp_row");
                                 auto idx_sh = MakeShapeTuple({one, one, make_idx(K)}, span);
-                                auto idx_raw = emit_to(bs, "tile.load", {index, ofs, idx_sh, idx_sh},
-                                                       load_kwargs, "gather_idx_raw");
+                                auto idx_raw = emit_load_or_slice(bs, index, ofs, idx_sh, "gather_idx_raw");
                                 auto idx_row = reshape_to(bs, idx_raw, {one, make_idx(K)}, "gather_idx_row");
                                 return single_row_gather(bs, inp_row, idx_row, K, "gather_row");
                               });
@@ -1280,8 +1291,7 @@ void OpConversionRegistry::RegisterGatherOps() {
                 // Load inp[:, i1, :] → [S0, 1, I2] → [S0, I2] → [1, S0*I2].
                 auto inp_ofs = std::make_shared<MakeTuple>(std::vector<ExprPtr>{zero, i1_expr, zero}, span);
                 auto inp_sh = MakeShapeTuple({input_shape[0], one, input_shape[2]}, span);
-                auto inp_raw =
-                    emit_to(bs, "tile.load", {input, inp_ofs, inp_sh, inp_sh}, load_kwargs, "gather_inp_raw");
+                auto inp_raw = emit_load_or_slice(bs, input, inp_ofs, inp_sh, "gather_inp_raw");
                 auto inp_2d = reshape_to(bs, inp_raw, {input_shape[0], input_shape[2]}, "gather_inp_2d");
                 auto inp_flat = reshape_to(bs, inp_2d, {one, make_idx(S0S2)}, "gather_inp_flat");
 
@@ -1289,8 +1299,7 @@ void OpConversionRegistry::RegisterGatherOps() {
                 auto idx_ofs =
                     std::make_shared<MakeTuple>(std::vector<ExprPtr>{i0_expr, i1_expr, zero}, span);
                 auto idx_sh = MakeShapeTuple({one, one, index_shape[2]}, span);
-                auto idx_raw =
-                    emit_to(bs, "tile.load", {index, idx_ofs, idx_sh, idx_sh}, load_kwargs, "gather_idx_raw");
+                auto idx_raw = emit_load_or_slice(bs, index, idx_ofs, idx_sh, "gather_idx_raw");
                 auto idx_row = reshape_to(bs, idx_raw, {one, index_shape[2]}, "gather_idx_row");
 
                 // flat_idx[k] = idx_row[k] * S2 + k  →  selects inp_flat[flat_idx[k]].
@@ -1344,8 +1353,7 @@ void OpConversionRegistry::RegisterGatherOps() {
                 // Load inp[i0, :, :] → [1, S1, I2] → [S1, I2] → [1, S1*I2].
                 auto inp_ofs = std::make_shared<MakeTuple>(std::vector<ExprPtr>{i0_expr, zero, zero}, span);
                 auto inp_sh = MakeShapeTuple({one, input_shape[1], input_shape[2]}, span);
-                auto inp_raw =
-                    emit_to(bs, "tile.load", {input, inp_ofs, inp_sh, inp_sh}, load_kwargs, "gather_inp_raw");
+                auto inp_raw = emit_load_or_slice(bs, input, inp_ofs, inp_sh, "gather_inp_raw");
                 auto inp_2d = reshape_to(bs, inp_raw, {input_shape[1], input_shape[2]}, "gather_inp_2d");
                 auto inp_flat = reshape_to(bs, inp_2d, {one, make_idx(S1S2)}, "gather_inp_flat");
 
@@ -1353,8 +1361,7 @@ void OpConversionRegistry::RegisterGatherOps() {
                 auto idx_ofs =
                     std::make_shared<MakeTuple>(std::vector<ExprPtr>{i0_expr, i1_expr, zero}, span);
                 auto idx_sh = MakeShapeTuple({one, one, index_shape[2]}, span);
-                auto idx_raw =
-                    emit_to(bs, "tile.load", {index, idx_ofs, idx_sh, idx_sh}, load_kwargs, "gather_idx_raw");
+                auto idx_raw = emit_load_or_slice(bs, index, idx_ofs, idx_sh, "gather_idx_raw");
                 auto idx_row = reshape_to(bs, idx_raw, {one, index_shape[2]}, "gather_idx_row");
 
                 // flat_idx[k] = idx_row[k] * S2 + k  →  selects inp_flat[flat_idx[k]].
