@@ -173,7 +173,7 @@ class TestAutoDeriveTaskDependencies:
         assert len(edges) == 1
         assert edges[0].name_hint == "reader_tid"
 
-    def test_auto_scope_is_unchanged(self):
+    def test_default_auto_scope_raw_hazard_adds_compiler_edge(self):
         @pl.program
         class Prog:
             @pl.function(type=pl.FunctionType.InCore)
@@ -195,7 +195,9 @@ class TestAutoDeriveTaskDependencies:
 
         out = _run_auto_deps(Prog)
         consume_call = _user_calls(out, "consume")[0]
-        assert "compiler_manual_dep_edges" not in consume_call.attrs
+        edges = _compiler_edges(consume_call)
+        assert len(edges) == 1
+        assert edges[0].name_hint == "producer_tid"
 
     def test_auto_runtime_scope_raw_hazard_adds_compiler_edge_and_stays_auto(self):
         @pl.program

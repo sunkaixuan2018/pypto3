@@ -23,10 +23,14 @@ them immediately before emitting `Arg::set_dependencies(...)`.
     -> Simplify (final)
 ```
 
-The pass analyzes both MANUAL and AUTO `RuntimeScopeStmt` regions. AUTO scopes
-keep `manual=false` in the output IR, so codegen still emits `PTO2_SCOPE()` and
-runtime OverlapMap/TensorMap tracking remains enabled. Compiler-derived edges,
-when statically encodable, are emitted on top through `Arg::set_dependencies(...)`.
+The pass analyzes both MANUAL and AUTO regions. Hand-placed AUTO
+`RuntimeScopeStmt` nodes keep `manual=false` in the output IR. For default
+`auto_scope=True` orchestration functions, this pass runs before
+`MaterializeRuntimeScopes`, so it uses an analysis-only virtual AUTO region
+around the function body and does not insert or move scope wrappers. Codegen
+still emits `PTO2_SCOPE()` from `MaterializeRuntimeScopes`, and runtime
+OverlapMap/TensorMap tracking remains enabled. Compiler-derived edges, when
+statically encodable, are emitted on top through `Arg::set_dependencies(...)`.
 
 ## Algorithm
 
@@ -49,7 +53,9 @@ For each function body:
    the same base allocation with overlapping or symbolic byte ranges.
 6. Collect statically bound producer TaskIds from `pl.submit` tuple tails.
 7. Walk each `RuntimeScopeStmt` in source order, maintaining prior accesses for
-   that scope only. For AUTO scopes this is analysis-only; the final scope mode
+   that scope only. For default `auto_scope=True` orchestration functions with
+   no materialized scope yet, use the whole function body as a virtual AUTO
+   analysis region. For AUTO scopes this is analysis-only; the final scope mode
    remains AUTO.
 8. For every non-builtin call with resolved `arg_directions`, classify tensor
    arguments as read, write, or read-write. Accesses to the same storage root,

@@ -748,11 +748,24 @@ class AutoDepMutator : public IRMutator {
  public:
   AutoDepMutator(ProgramPtr program, const StorageRootAnalysis* storage,
                  const std::unordered_map<const Call*, VarPtr>* task_id_by_call,
-                 const std::unordered_map<uint64_t, VarPtr>* task_id_by_var_id)
+                 const std::unordered_map<uint64_t, VarPtr>* task_id_by_var_id,
+                 bool analyze_whole_body_as_auto_scope)
       : program_(std::move(program)),
         storage_(storage),
         task_id_by_call_(task_id_by_call),
-        task_id_by_var_id_(task_id_by_var_id) {}
+        task_id_by_var_id_(task_id_by_var_id),
+        analyze_whole_body_as_auto_scope_(analyze_whole_body_as_auto_scope) {}
+
+  StmtPtr AnalyzeBody(const StmtPtr& body) {
+    INTERNAL_CHECK(body != nullptr) << "Internal error: AutoDepMutator received null function body";
+    if (!analyze_whole_body_as_auto_scope_ || As<RuntimeScopeStmt>(body)) {
+      return VisitStmt(body);
+    }
+    return AnalyzeRuntimeScopeBody(body, /*manual=*/false, /*name_hint=*/"", body->span_,
+                                   /*is_virtual_whole_body=*/true, /*original_scope=*/nullptr,
+                                   std::vector<std::string>{},
+                                   std::vector<std::pair<std::string, std::any>>{});
+  }
 
  protected:
   StmtPtr VisitStmt_(const ForStmtPtr& op) override {
@@ -772,30 +785,42 @@ class AutoDepMutator : public IRMutator {
   }
 
   StmtPtr VisitStmt_(const RuntimeScopeStmtPtr& op) override {
-    DebugLog("enter_runtime_scope name_hint=" + op->name_hint_ +
-             " manual=" + (op->manual_ ? std::string("true") : std::string("false")) +
+    return AnalyzeRuntimeScopeBody(op->body_, op->manual_, op->name_hint_, op->span_,
+                                   /*is_virtual_whole_body=*/false, op, op->leading_comments_, op->attrs_);
+  }
+
+  StmtPtr AnalyzeRuntimeScopeBody(const StmtPtr& body, bool manual, const std::string& name_hint,
+                                  const Span& span, bool is_virtual_whole_body,
+                                  const RuntimeScopeStmtPtr& original_scope,
+                                  std::vector<std::string> leading_comments,
+                                  std::vector<std::pair<std::string, std::any>> attrs) {
+    DebugLog("enter_runtime_scope name_hint=" + name_hint +
+             " manual=" + (manual ? std::string("true") : std::string("false")) +
+             " virtual_whole_body=" + (is_virtual_whole_body ? std::string("true") : std::string("false")) +
              " loop_depth=" + std::to_string(loop_depth_));
     prior_stack_.emplace_back();
     fallback_stack_.push_back(false);
-    INTERNAL_CHECK_SPAN(op->body_, op->span_) << "RuntimeScopeStmt has null body";
-    auto new_body = VisitStmt(op->body_);
-    INTERNAL_CHECK_SPAN(new_body, op->span_) << "RuntimeScopeStmt body mutated to null";
+    INTERNAL_CHECK_SPAN(body, span) << "RuntimeScopeStmt has null body";
+    auto new_body = VisitStmt(body);
+    INTERNAL_CHECK_SPAN(new_body, span) << "RuntimeScopeStmt body mutated to null";
     const bool fallback = fallback_stack_.back();
     fallback_stack_.pop_back();
     prior_stack_.pop_back();
     if (fallback) {
-      DebugLog("fallback_runtime_scope name_hint=" + op->name_hint_);
+      DebugLog("fallback_runtime_scope name_hint=" + name_hint);
       auto stripped_body = StripCompilerDeps(new_body);
-      return std::make_shared<const RuntimeScopeStmt>(false, op->name_hint_, std::move(stripped_body),
-                                                      op->span_, op->leading_comments_, op->attrs_);
+      if (is_virtual_whole_body) return stripped_body;
+      return std::make_shared<const RuntimeScopeStmt>(false, name_hint, std::move(stripped_body), span,
+                                                      std::move(leading_comments), std::move(attrs));
     }
-    DebugLog("keep_runtime_scope name_hint=" + op->name_hint_ +
-             " manual=" + (op->manual_ ? std::string("true") : std::string("false")));
-    if (new_body.get() != op->body_.get()) {
-      return std::make_shared<const RuntimeScopeStmt>(op->manual_, op->name_hint_, std::move(new_body),
-                                                      op->span_, op->leading_comments_, op->attrs_);
+    DebugLog("keep_runtime_scope name_hint=" + name_hint +
+             " manual=" + (manual ? std::string("true") : std::string("false")));
+    if (is_virtual_whole_body) return new_body;
+    if (new_body.get() != body.get()) {
+      return std::make_shared<const RuntimeScopeStmt>(manual, name_hint, std::move(new_body), span,
+                                                      std::move(leading_comments), std::move(attrs));
     }
-    return op;
+    return original_scope ? original_scope : body;
   }
 
   ExprPtr VisitExpr_(const CallPtr& op) override {
@@ -989,6 +1014,7 @@ class AutoDepMutator : public IRMutator {
   const StorageRootAnalysis* storage_;
   const std::unordered_map<const Call*, VarPtr>* task_id_by_call_;
   const std::unordered_map<uint64_t, VarPtr>* task_id_by_var_id_;
+  bool analyze_whole_body_as_auto_scope_ = false;
   std::vector<std::vector<StorageAccess>> prior_stack_;
   std::vector<bool> fallback_stack_;
   size_t loop_depth_ = 0;
@@ -1016,8 +1042,11 @@ Pass AutoDeriveTaskDependencies() {
       SubmitTaskIdCollector task_ids;
       task_ids.VisitStmt(func->body_);
 
-      AutoDepMutator mutator(program, &storage, &task_ids.task_id_by_call(), &task_ids.task_id_by_var_id());
-      auto new_body = mutator.VisitStmt(func->body_);
+      const bool analyze_whole_body_as_auto_scope =
+          func->func_type_ == FunctionType::Orchestration && func->GetAttr<bool>("auto_scope", true);
+      AutoDepMutator mutator(program, &storage, &task_ids.task_id_by_call(), &task_ids.task_id_by_var_id(),
+                             analyze_whole_body_as_auto_scope);
+      auto new_body = mutator.AnalyzeBody(func->body_);
       if (new_body.get() == func->body_.get()) continue;
 
       changed = true;
