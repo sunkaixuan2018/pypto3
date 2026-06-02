@@ -3952,6 +3952,41 @@ class TestManualScopeCodegen:
         assert "params_t1_deps[params_t1_deps_count++] = producer_tid;" in code, code
         assert "params_t1.set_dependencies(params_t1_deps, params_t1_deps_count);" in code, code
 
+    def test_compiler_derived_deps_for_plain_auto_call_capture_task_id(self):
+        """pl.at-style ordinary calls can be captured only when deps need them."""
+        backend.reset_for_testing()
+        backend.set_backend_type(BackendType.Ascend910B)
+
+        @pl.program
+        class Prog:
+            @pl.function(type=pl.FunctionType.InCore)
+            def fill(
+                self,
+                out: pl.Out[pl.Tensor[[64], pl.FP32]],
+            ) -> pl.Tensor[[64], pl.FP32]:
+                return out
+
+            @pl.function(type=pl.FunctionType.InCore)
+            def consume(self, x: pl.Tensor[[64], pl.FP32]) -> pl.Tensor[[64], pl.FP32]:
+                return x
+
+            @pl.function(type=pl.FunctionType.Orchestration)
+            def main(self, scratch: pl.Tensor[[64], pl.FP32]) -> pl.Tensor[[64], pl.FP32]:
+                produced = self.fill(scratch)
+                out = self.consume(produced)
+                return out
+
+        pm = PassManager.get_strategy(OptimizationStrategy.Default)
+        transformed = pm.run_passes(Prog)
+        code = _generate_orch_code(transformed)
+
+        assert "PTO2_SCOPE(PTO2ScopeMode::MANUAL)" not in code, code
+        assert "TaskOutputTensors task_0_outs = rt_submit_aiv_task(" in code, code
+        producer_tid = re.search(r"PTO2TaskId (\w+_tid) = task_0_outs\.task_id\(\);", code)
+        assert producer_tid, code
+        assert f"params_t1_deps[params_t1_deps_count++] = {producer_tid.group(1)};" in code, code
+        assert "params_t1.set_dependencies(params_t1_deps, params_t1_deps_count);" in code, code
+
     def test_auto_scope_task_id_array_slot_dep_uses_scalar_snapshot(self):
         """A TaskId array slot read is a valid explicit dep in auto scope."""
         backend.reset_for_testing()

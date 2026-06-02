@@ -789,6 +789,14 @@ class AutoDepMutator : public IRMutator {
                                    /*is_virtual_whole_body=*/false, op, op->leading_comments_, op->attrs_);
   }
 
+  StmtPtr VisitStmt_(const AssignStmtPtr& op) override {
+    auto saved_lhs = current_assign_lhs_;
+    current_assign_lhs_ = op->var_;
+    auto result = IRMutator::VisitStmt_(op);
+    current_assign_lhs_ = std::move(saved_lhs);
+    return result;
+  }
+
   StmtPtr AnalyzeRuntimeScopeBody(const StmtPtr& body, bool manual, const std::string& name_hint,
                                   const Span& span, bool is_virtual_whole_body,
                                   const RuntimeScopeStmtPtr& original_scope,
@@ -830,6 +838,9 @@ class AutoDepMutator : public IRMutator {
     if (IsBuiltinOp(call->op_->name_)) return call;
 
     VarPtr task_id = LookupTaskId(op.get());
+    if (!task_id) {
+      task_id = current_assign_lhs_;
+    }
     bool needs_fallback = false;
     auto user_edges = CanonicalizeTaskIds(GetDepAttr(call, kAttrManualDepEdges));
     const bool debug_loop_carry = AutoDepsLoopCarryDebugEnabled();
@@ -864,13 +875,12 @@ class AutoDepMutator : public IRMutator {
                    " current_task_id=" + DebugVar(task_id));
         }
         if (covered_by_user_edge) continue;
-        if (prior.dynamic_producer || !prior.task_id_var) {
+        if (!prior.task_id_var) {
           if (debug_loop_carry) {
-            DebugLog(
-                "fallback_reason=" +
-                std::string(prior.dynamic_producer ? "dynamic_prior_producer" : "missing_prior_task_id") +
-                " call=" + call->op_->name_ + " user_edges=" + DebugVarList(user_edges) +
-                " prior_task_id=" + DebugVar(prior.task_id_var));
+            DebugLog("fallback_reason=" +
+                     std::string(prior.dynamic_producer ? "dynamic_prior_producer_missing_task_id"
+                                                        : "missing_prior_task_id") +
+                     " call=" + call->op_->name_ + " user_edges=" + DebugVarList(user_edges));
           }
           fallback_stack_.back() = true;
           return call;
@@ -1017,6 +1027,7 @@ class AutoDepMutator : public IRMutator {
   bool analyze_whole_body_as_auto_scope_ = false;
   std::vector<std::vector<StorageAccess>> prior_stack_;
   std::vector<bool> fallback_stack_;
+  VarPtr current_assign_lhs_;
   size_t loop_depth_ = 0;
 };
 

@@ -278,6 +278,7 @@ class OrchestrationStmtCodegen : public CodegenBase {
         param_name_set_(std::move(param_name_set)),
         param_name_to_orch_index_(std::move(param_name_to_orch_index)) {
     declared_var_names_ = param_name_set_;
+    CollectCompilerDepTaskIds(program_);
   }
 
   void SetCallTupleElements(const std::map<std::string, std::vector<TupleElement>>& elements) {
@@ -1000,9 +1001,15 @@ class OrchestrationStmtCodegen : public CodegenBase {
           result_key = var_name;
         }
         int task_idx_before = task_counter_;
-        GenerateFunctionCallCode(call, result_key);
+        const bool capture_plain_task_id = compiler_dep_task_id_vars_.count(assign->var_.get()) > 0;
+        GenerateFunctionCallCode(call, result_key, capture_plain_task_id);
 
-        if (in_manual_scope_depth_ > 0 && task_counter_ > task_idx_before) {
+        if (task_counter_ > task_idx_before && capture_plain_task_id) {
+          std::string tid_name = ReserveSyntheticEmitName(GetSSABaseName(var_name) + "_tid");
+          code_ << Indent() << "PTO2TaskId " << tid_name << " = task_" << task_idx_before
+                << "_outs.task_id();\n";
+          manual_task_id_map_[assign->var_.get()] = tid_name;
+        } else if (in_manual_scope_depth_ > 0 && task_counter_ > task_idx_before) {
           // Bind the LHS Var to the just-emitted ``task_<n>`` so a downstream
           // sibling call inside the same manual scope can ``add_dep`` on it.
           manual_task_id_map_[assign->var_.get()] = task_idx_before;
@@ -1611,6 +1618,34 @@ class OrchestrationStmtCodegen : public CodegenBase {
     return merged;
   }
 
+  void CollectCompilerDepTaskIds(const ProgramPtr& program) {
+    class Collector : public IRVisitor {
+     public:
+      std::unordered_set<const Var*> vars;
+
+     protected:
+      void VisitExpr_(const CallPtr& call) override {
+        for (const auto& [key, value] : call->attrs_) {
+          if (key != kAttrCompilerManualDepEdges) continue;
+          const auto* edges = std::any_cast<std::vector<VarPtr>>(&value);
+          if (!edges) continue;
+          for (const auto& edge : *edges) {
+            if (edge) vars.insert(edge.get());
+          }
+        }
+        IRVisitor::VisitExpr_(call);
+      }
+    };
+
+    Collector collector;
+    collector.VisitProgram(program);
+    compiler_dep_task_id_vars_ = std::move(collector.vars);
+  }
+
+  static bool ShouldCaptureTaskOutputs(const CallPtr& call, bool capture_plain_task_id) {
+    return IsSubmitCall(call) || capture_plain_task_id;
+  }
+
   size_t CountManualDeps(const std::vector<VarPtr>& edges) const {
     size_t total = 0;
     for (const auto& edge : edges) {
@@ -1938,7 +1973,8 @@ class OrchestrationStmtCodegen : public CodegenBase {
     }
   }
 
-  void GenerateFunctionCallCode(const CallPtr& call, const std::string& result_var) {
+  void GenerateFunctionCallCode(const CallPtr& call, const std::string& result_var,
+                                bool capture_plain_task_id = false) {
     const std::string& callee_name = call->op_->name_;
 
     FunctionPtr callee_func = program_->GetFunction(callee_name);
@@ -1946,12 +1982,12 @@ class OrchestrationStmtCodegen : public CodegenBase {
         << "Internal error: function '" << callee_name << "' not found after validation.";
 
     if (callee_func->func_type_ == FunctionType::Spmd) {
-      GenerateSpmdCallCode(call, callee_func);
+      GenerateSpmdCallCode(call, callee_func, capture_plain_task_id);
       return;
     }
 
     if (callee_func->func_type_ == FunctionType::Group) {
-      GenerateGroupCallCode(call, callee_func, callee_func);
+      GenerateGroupCallCode(call, callee_func, callee_func, capture_plain_task_id);
       return;
     }
 
@@ -1980,16 +2016,16 @@ class OrchestrationStmtCodegen : public CodegenBase {
 
     std::string submit_expr =
         CoreTypeToSubmitPrefix(core_type) + std::to_string(func_id) + ", " + task_var + ")";
-    EmitTaskSubmitAndBind(submit_expr, IsSubmitCall(call));
+    EmitTaskSubmitAndBind(submit_expr, ShouldCaptureTaskOutputs(call, capture_plain_task_id));
   }
 
-  void GenerateSpmdCallCode(const CallPtr& call, const FunctionPtr& spmd_func) {
+  void GenerateSpmdCallCode(const CallPtr& call, const FunctionPtr& spmd_func, bool capture_plain_task_id) {
     auto info = FindWrapperInnerCall(spmd_func);
     INTERNAL_CHECK(info.inner_call != nullptr && info.inner_callee != nullptr)
         << "Internal error: no inner call found in Spmd function '" << spmd_func->name_ << "'";
 
     if (info.inner_callee->func_type_ == FunctionType::Group) {
-      GenerateGroupCallCode(call, info.inner_callee, spmd_func);
+      GenerateGroupCallCode(call, info.inner_callee, spmd_func, capture_plain_task_id);
       return;
     }
 
@@ -2013,11 +2049,11 @@ class OrchestrationStmtCodegen : public CodegenBase {
 
     std::string submit_expr =
         CoreTypeToSubmitPrefix(core_type) + std::to_string(func_id) + ", " + task_var + ")";
-    EmitTaskSubmitAndBind(submit_expr, IsSubmitCall(call));
+    EmitTaskSubmitAndBind(submit_expr, ShouldCaptureTaskOutputs(call, capture_plain_task_id));
   }
 
   void GenerateGroupCallCode(const CallPtr& call, const FunctionPtr& group_func,
-                             const FunctionPtr& launch_func) {
+                             const FunctionPtr& launch_func, bool capture_plain_task_id) {
     std::string group_name = group_func->name_;
 
     auto info = FindGroupCallees(group_func);
@@ -2053,7 +2089,7 @@ class OrchestrationStmtCodegen : public CodegenBase {
 
       std::string submit_expr =
           CoreTypeToSubmitPrefix(CoreType::VECTOR) + std::to_string(aiv_id) + ", " + task_var + ")";
-      EmitTaskSubmitAndBind(submit_expr, IsSubmitCall(call));
+      EmitTaskSubmitAndBind(submit_expr, ShouldCaptureTaskOutputs(call, capture_plain_task_id));
       return;
     }
 
@@ -2099,7 +2135,7 @@ class OrchestrationStmtCodegen : public CodegenBase {
     EmitManualDeps(call, task_var);
 
     std::string submit_expr = "rt_submit_task(mixed_" + std::to_string(task_counter_) + ", " + task_var + ")";
-    EmitTaskSubmitAndBind(submit_expr, IsSubmitCall(call));
+    EmitTaskSubmitAndBind(submit_expr, ShouldCaptureTaskOutputs(call, capture_plain_task_id));
   }
 
   // --- Alias generation helpers ---
@@ -2687,6 +2723,7 @@ class OrchestrationStmtCodegen : public CodegenBase {
   std::map<std::string, std::vector<TupleElement>> tuple_var_to_elements_;
   std::map<const Call*, std::string> call_to_tuple_key_;
   std::map<const Var*, std::string> tuple_var_to_key_;
+  std::unordered_set<const Var*> compiler_dep_task_id_vars_;
   std::unordered_set<const Var*> declared_var_ptrs_;
   std::unordered_set<const Stmt*> batched_create_stmts_;
   std::unordered_set<const Var*> effective_uses_;

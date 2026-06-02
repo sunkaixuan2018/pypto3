@@ -841,6 +841,32 @@ class TestAutoDeriveTaskDependencies:
         for call in _user_calls(out, "consume"):
             assert _compiler_edges(call) == []
 
+    def test_default_auto_scope_plain_call_raw_hazard_adds_synthetic_task_id_edge(self):
+        @pl.program
+        class Prog:
+            @pl.function(type=pl.FunctionType.InCore)
+            def fill(
+                self,
+                out: pl.Out[pl.Tensor[[64], pl.FP32]],
+            ) -> pl.Tensor[[64], pl.FP32]:
+                return out
+
+            @pl.function(type=pl.FunctionType.InCore)
+            def consume(self, x: pl.Tensor[[64], pl.FP32]) -> pl.Tensor[[64], pl.FP32]:
+                return x
+
+            @pl.function(type=pl.FunctionType.Orchestration)
+            def main(self, scratch: pl.Tensor[[64], pl.FP32]) -> pl.Tensor[[64], pl.FP32]:
+                produced = self.fill(scratch)
+                out = self.consume(produced)
+                return out
+
+        out = _run_auto_deps(Prog)
+        consume_call = _user_calls(out, "consume")[0]
+        edges = _compiler_edges(consume_call)
+        assert len(edges) == 1
+        assert edges[0].name_hint == "produced"
+
     def test_large_control_flow_root_set_falls_back_to_auto_scope(self):
         @pl.program
         class Prog:
