@@ -3433,25 +3433,17 @@ void RegisterPTOOps(Backend& backend, const std::unordered_set<std::string>& exc
     std::string result_target = codegen.GetCurrentResultTarget();
     std::string result_type = codegen.GetCurrentResultTileBufTypeStringFromTileType();
 
-    // With per-var alloc model, the result variable already has a pre-declared
-    // alloc_tile with the correct reshaped type and shared addr. If the types
-    // match, the reshape is a no-op at the PTO level.
-    auto existing_type = codegen.GetSSATileBufType(result_target);
-    if (!existing_type.empty() && existing_type == result_type) {
+    std::string src = codegen.GetExprAsCode(op->args_[0]);
+    std::string src_type = codegen.GetExprTypeAnnotation(op->args_[0]);
+
+    // Only exact same-type reshapes are no-ops. A predeclared result alloc has
+    // the desired result type by construction, so it must not be used to prove
+    // that the source and result layouts are identical.
+    if (!src_type.empty() && !result_type.empty() && src_type == result_type) {
       return std::string("");
     }
 
     // Fallback: emit pto.treshape for cases without pre-declared alloc
-    std::string src = codegen.GetExprAsCode(op->args_[0]);
-    std::string src_type;
-    if (auto src_var = AsVarLike(op->args_[0])) {
-      if (auto tile_type = ir::As<ir::TileType>(src_var->GetType())) {
-        if (tile_type->memref_.has_value()) {
-          src_type = codegen.GetTileBufTypeStringFromTileType(tile_type);
-        }
-      }
-    }
-
     if (!result_type.empty()) {
       result_target = codegen.NewNamedTemp("reshape_buf");
       codegen.SetCurrentResultBuf(result_target);

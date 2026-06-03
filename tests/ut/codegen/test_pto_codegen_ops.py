@@ -915,6 +915,30 @@ class TestBroadcastOpsCodegen:
         else:
             raise AssertionError("no pto.trowexpand ins(...) line in MLIR")
 
+    def test_row_vector_reshape_feeding_row_expand_mul_materializes(self):
+        """A [1, K] row vector reshaped to [K, 1] must materialize before row_expand_mul."""
+
+        @pl.program
+        class Prog:
+            @pl.function(type=pl.FunctionType.InCore)
+            def kernel(
+                self,
+                src: pl.Tensor[[16, 16], pl.FP32],
+                row_vec_tensor: pl.Tensor[[1, 16], pl.FP32],
+                dst: pl.Tensor[[16, 16], pl.FP32],
+            ) -> pl.Tensor[[16, 16], pl.FP32]:
+                src_tile: pl.Tile[[16, 16], pl.FP32] = pl.load(src, [0, 0], [16, 16])
+                row_1x16: pl.Tile[[1, 16], pl.FP32] = pl.load(row_vec_tensor, [0, 0], [1, 16])
+                row_16x1: pl.Tile[[16, 1], pl.FP32] = pl.tile.reshape(row_1x16, [16, 1])
+                result: pl.Tile[[16, 16], pl.FP32] = pl.tile.row_expand_mul(src_tile, row_16x1)
+                return pl.store(result, [0, 0], dst)
+
+        mlir = self._generate_mlir(Prog)
+        assert "pto.treshape" in mlir, (
+            f"tile.reshape([1,K] -> [K,1]) feeding row_expand_mul must materialize; got:\n{mlir}"
+        )
+        assert "pto.trowexpandmul" in mlir, f"row_expand_mul should generate pto.trowexpandmul, got:\n{mlir}"
+
 
 class TestTileSliceCodegen:
     """Tests for tile.slice PTO code generation (pto.subview).
