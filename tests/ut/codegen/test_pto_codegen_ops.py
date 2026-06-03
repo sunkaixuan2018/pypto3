@@ -916,7 +916,7 @@ class TestBroadcastOpsCodegen:
             raise AssertionError("no pto.trowexpand ins(...) line in MLIR")
 
     def test_row_vector_reshape_feeding_row_expand_mul_materializes(self):
-        """A tensor [1, K] -> [K, 1] vector reshape must lower to a materialized transpose."""
+        """A tensor [1, K] -> [K, 1] vector reshape must pack through scalar-ND layout."""
 
         @pl.program
         class Prog:
@@ -930,14 +930,20 @@ class TestBroadcastOpsCodegen:
                 return pl.row_expand_mul(src, row_16x1)
 
         mlir = self._generate_mlir(Prog)
-        ttrans_lines = [line for line in mlir.splitlines() if "pto.ttrans" in line]
-        assert ttrans_lines, (
-            "tensor reshape [1,K] -> [K,1] feeding row_expand_mul must materialize with pto.ttrans; got:\n"
+        assert "pto.ttrans" not in mlir, (
+            f"tensor reshape [1,K] -> [K,1] feeding row_expand_mul is not a matrix transpose; got:\n{mlir}"
+        )
+        treshape_lines = [line for line in mlir.splitlines() if "pto.treshape" in line]
+        assert len(treshape_lines) >= 2, (
+            "tensor reshape [1,K] -> [K,1] feeding row_expand_mul must first pack [1,K] into "
+            "32-byte scalar-ND rows, then reshape to DN [K,1]; got:\n"
             f"{mlir}"
         )
-        assert "rows=16, cols=1" in ttrans_lines[0] and "blayout=col_major" in ttrans_lines[0], (
-            "transpose-materialized reshape result must carry a [K,1] column-vector output type; got:\n"
-            f"{ttrans_lines[0]}"
+        assert any("rows=2, cols=8" in line and "blayout=row_major" in line for line in treshape_lines), (
+            f"FP32 K=16 row vector should first reshape to packed scalar-ND [2,8]; got:\n{mlir}"
+        )
+        assert any("rows=16, cols=1" in line and "blayout=col_major" in line for line in treshape_lines), (
+            f"final reshape result must carry a [K,1] column-vector output type; got:\n{mlir}"
         )
         assert "pto.trowexpandmul" in mlir, f"row_expand_mul should generate pto.trowexpandmul, got:\n{mlir}"
 

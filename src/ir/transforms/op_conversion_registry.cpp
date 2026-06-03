@@ -66,14 +66,21 @@ std::optional<std::vector<int64_t>> ExtractStaticShapeTuple(const ExprPtr& expr)
   return ExtractStaticShape(tuple->elements_);
 }
 
-bool IsOneDimVectorTransposeReshape(const std::vector<int64_t>& src_shape,
-                                    const std::vector<int64_t>& dst_shape) {
+bool IsRowToColVectorReshape(const std::vector<int64_t>& src_shape, const std::vector<int64_t>& dst_shape) {
   if (src_shape.size() != 2 || dst_shape.size() != 2) return false;
-  const bool row_to_col =
-      src_shape[0] == 1 && src_shape[1] > 1 && dst_shape[0] == src_shape[1] && dst_shape[1] == 1;
-  const bool col_to_row =
-      src_shape[0] > 1 && src_shape[1] == 1 && dst_shape[0] == 1 && dst_shape[1] == src_shape[0];
-  return row_to_col || col_to_row;
+  return src_shape[0] == 1 && src_shape[1] > 1 && dst_shape[0] == src_shape[1] && dst_shape[1] == 1;
+}
+
+std::optional<std::vector<ExprPtr>> MakePackedScalarNDShape(const TileType& input_type, int64_t vector_len,
+                                                            const Span& span) {
+  const int64_t dtype_bytes = static_cast<int64_t>(input_type.dtype_.GetBit()) / 8;
+  if (dtype_bytes <= 0 || 32 % dtype_bytes != 0) return std::nullopt;
+  const int64_t lane_elems = 32 / dtype_bytes;
+  if (lane_elems <= 1 || vector_len % lane_elems != 0) return std::nullopt;
+  const int64_t rows = vector_len / lane_elems;
+  if (rows <= 1) return std::nullopt;
+  return std::vector<ExprPtr>{std::make_shared<ConstInt>(rows, DataType::INDEX, span),
+                              std::make_shared<ConstInt>(lane_elems, DataType::INDEX, span)};
 }
 
 // Detect row-broadcast pattern: [M, N] op [M, 1] or [M, 1] op [M, N]
@@ -198,28 +205,25 @@ void OpConversionRegistry::RegisterBroadcastAndTransformOps() {
       [](const std::vector<ExprPtr>& args, const std::vector<std::pair<std::string, std::any>>& kwargs,
          const Span& span) -> ConversionResult {
         CHECK(args.size() == 2 || args.size() == 3)
-            << "tensor.reshape conversion expects 2 or 3 args (input, shape[, valid_shape]), got " << args.size();
+            << "tensor.reshape conversion expects 2 or 3 args (input, shape[, valid_shape]), got "
+            << args.size();
         auto& op_reg = OpRegistry::GetInstance();
 
         auto input_tile_type = As<TileType>(args[0]->GetType());
         auto src_shape = input_tile_type ? ExtractStaticShape(input_tile_type->shape_) : std::nullopt;
         auto dst_shape = ExtractStaticShapeTuple(args[1]);
-        if (args.size() == 2 && src_shape && dst_shape && IsOneDimVectorTransposeReshape(*src_shape, *dst_shape)) {
-          auto shape_tuple = std::make_shared<MakeTuple>(input_tile_type->shape_, span);
-          MemorySpace tmp_mem =
-              input_tile_type->memory_space_.has_value() ? *input_tile_type->memory_space_ : MemorySpace::Vec;
-          std::vector<std::pair<std::string, std::any>> create_kwargs = {{"dtype", input_tile_type->dtype_},
-                                                                         {"target_memory", tmp_mem}};
-          auto create_call = op_reg.Create("tile.create", {shape_tuple}, create_kwargs, span);
+        if (args.size() == 2 && src_shape && dst_shape && IsRowToColVectorReshape(*src_shape, *dst_shape)) {
+          auto scalar_nd_shape = MakePackedScalarNDShape(*input_tile_type, (*src_shape)[1], span);
+          if (scalar_nd_shape) {
+            std::vector<StmtPtr> prologue;
+            auto scalar_nd_call =
+                op_reg.Create("tile.reshape", {args[0], MakeShapeTuple(*scalar_nd_shape, span)}, {}, span);
+            auto scalar_nd_var = std::make_shared<Var>("reshape_scalar_nd", scalar_nd_call->GetType(), span);
+            prologue.push_back(std::make_shared<AssignStmt>(scalar_nd_var, scalar_nd_call, span));
 
-          auto tmp_var = std::make_shared<Var>("reshape_transpose_tmp", create_call->GetType(), span);
-          std::vector<StmtPtr> prologue;
-          prologue.push_back(std::make_shared<AssignStmt>(tmp_var, create_call, span));
-
-          auto axis0 = std::make_shared<ConstInt>(0, DataType::INDEX, span);
-          auto axis1 = std::make_shared<ConstInt>(1, DataType::INDEX, span);
-          auto transpose_call = op_reg.Create("tile.transpose", {args[0], axis0, axis1, tmp_var}, span);
-          return ConversionResult{std::move(prologue), transpose_call};
+            auto reshape_call = op_reg.Create("tile.reshape", {scalar_nd_var, args[1]}, kwargs, span);
+            return ConversionResult{std::move(prologue), reshape_call};
+          }
         }
 
         return ConversionResult{op_reg.Create("tile.reshape", {args[0], args[1]}, kwargs, span)};
