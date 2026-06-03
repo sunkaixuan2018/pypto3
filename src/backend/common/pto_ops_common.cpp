@@ -118,8 +118,8 @@ static const std::vector<std::string> round_modes = {"NONE", "RINT",  "ROUND", "
 static const std::vector<std::string> mask_patterns = {"",      "P0101", "P1010", "P0001",
                                                        "P0010", "P0100", "P1000", "P1111"};
 
-static std::string GetStaticValidTileBufTypeString(
-    const std::shared_ptr<const ir::TileType>& tile_type, const codegen::PTOCodegen& codegen) {
+static std::string GetStaticValidTileBufTypeString(const std::shared_ptr<const ir::TileType>& tile_type,
+                                                   const codegen::PTOCodegen& codegen) {
   if (!tile_type) return "";
   auto memory_space = tile_type->GetMemorySpace();
   if (!memory_space.has_value()) return "";
@@ -130,9 +130,58 @@ static std::string GetStaticValidTileBufTypeString(
   c.v_col = c.cols;
   c.v_row_dynamic = false;
   c.v_col_dynamic = false;
-  return codegen::FormatTileBufTypeString(codegen::MemorySpaceToMLIR(*memory_space), c.dtype_str, c.rows, c.cols,
-                                          c.blayout, c.slayout, c.fractal, c.pad, c.v_row, c.v_col,
+  return codegen::FormatTileBufTypeString(codegen::MemorySpaceToMLIR(*memory_space), c.dtype_str, c.rows,
+                                          c.cols, c.blayout, c.slayout, c.fractal, c.pad, c.v_row, c.v_col,
                                           c.v_row_dynamic, c.v_col_dynamic);
+}
+
+static std::optional<int64_t> StaticColVectorRows(const std::shared_ptr<const ir::TileType>& tile_type) {
+  if (!tile_type || tile_type->shape_.size() != 2) return std::nullopt;
+  auto rows = ir::As<ir::ConstInt>(tile_type->shape_[0]);
+  auto cols = ir::As<ir::ConstInt>(tile_type->shape_[1]);
+  if (!rows || !cols || rows->value_ <= 1 || cols->value_ != 1) return std::nullopt;
+  auto view = ir::tile_view_semantics::GetEffectiveTileView(*tile_type);
+  if (view.blayout != ir::TileLayout::col_major) return std::nullopt;
+  return rows->value_;
+}
+
+static std::string MakeRowVectorTileBufType(const ir::TileType& base_type, DataType dtype, int64_t cols,
+                                            bool dynamic_valid_shape, const codegen::PTOCodegen& codegen) {
+  auto memory_space = base_type.GetMemorySpace();
+  CHECK(memory_space.has_value()) << "row-vector tile_buf type requires a resolved memory space";
+  auto c = codegen::ExtractTileTypeInfo(base_type, codegen.GetTypeString(dtype));
+  c.rows = 1;
+  c.cols = cols;
+  c.v_row = 1;
+  c.v_col = cols;
+  c.v_row_dynamic = dynamic_valid_shape;
+  c.v_col_dynamic = dynamic_valid_shape;
+  c.blayout = ir::TileLayout::row_major;
+  c.slayout = ir::TileLayout::none_box;
+  return codegen::FormatTileBufTypeString(codegen::MemorySpaceToMLIR(*memory_space), c.dtype_str, c.rows,
+                                          c.cols, c.blayout, c.slayout, c.fractal, c.pad, c.v_row, c.v_col,
+                                          c.v_row_dynamic, c.v_col_dynamic);
+}
+
+static std::string EmitRowVectorTileAllocAtMemRef(const std::shared_ptr<const ir::TileType>& storage_type,
+                                                  const std::string& tile_buf_type, int64_t cols,
+                                                  const std::string& name_hint,
+                                                  codegen::PTOCodegen& codegen) {
+  if (!storage_type || !storage_type->memref_.has_value()) {
+    return "";
+  }
+  auto memref = *storage_type->memref_;
+  auto const_offset = ir::As<ir::ConstInt>(memref->byte_offset_);
+  CHECK(const_offset) << "row-vector tile allocation requires a static MemRef byte offset";
+
+  std::string tile = codegen.NewNamedTemp(name_hint);
+  std::string addr = codegen.GetOrEmitConstant(const_offset->value_, const_offset->dtype());
+  std::string valid_row = codegen.GetOrEmitConstant(static_cast<int64_t>(1), DataType::INDEX);
+  std::string valid_col = codegen.GetOrEmitConstant(cols, DataType::INDEX);
+  codegen.Emit(tile + " = pto.alloc_tile addr = " + addr + " valid_row = " + valid_row +
+               " valid_col = " + valid_col + " : " + tile_buf_type);
+  codegen.RegisterTileBufType(tile, tile_buf_type);
+  return tile;
 }
 
 // Build a partition_tensor_view type string from dimension strings and element dtype.
@@ -604,6 +653,61 @@ static std::string MakeTileCvtCodegenPTO(const std::string& pto_op_name, const C
   int mode = op->GetKwarg<int>("mode");
   CHECK(mode >= 0 && mode < static_cast<int>(round_modes.size())) << "Round mode out of range: " << mode;
   std::string config_attr = "{rmode = #pto<round_mode " + round_modes.at(mode) + ">}";
+
+  auto src_tile_type = ir::As<ir::TileType>(op->args_[0]->GetType());
+  auto dst_tile_type = ir::As<ir::TileType>(op->GetType());
+  auto col_rows = StaticColVectorRows(src_tile_type);
+  if (col_rows && StaticColVectorRows(dst_tile_type) == col_rows) {
+    std::string src = codegen.GetExprAsCode(op->args_[0]);
+    std::string src_type = codegen.GetExprTypeAnnotation(op->args_[0]);
+    std::string dst_type = GetStaticValidTileBufTypeString(dst_tile_type, codegen);
+    CHECK(!src.empty() && !src_type.empty() && !dst_type.empty())
+        << "tile.cast col-vector lowering requires source and destination tile_buf types";
+
+    // TCVT on a [K,1] col-major vector can leave rows after the first one
+    // untouched on A2/A3. Convert in the [1,K] row-major physical view, then
+    // reshape the converted row vector back to [K,1] for row_expand consumers.
+    std::string src_row_type =
+        MakeRowVectorTileBufType(*src_tile_type, src_tile_type->dtype_, *col_rows, false, codegen);
+    std::string dst_row_type =
+        MakeRowVectorTileBufType(*dst_tile_type, dst_tile_type->dtype_, *col_rows, false, codegen);
+    std::string dst_row_alloc_type =
+        MakeRowVectorTileBufType(*dst_tile_type, dst_tile_type->dtype_, *col_rows, true, codegen);
+
+    std::string src_row = codegen.NewNamedTemp("cast_src_row");
+    codegen.Emit(src_row + " = pto.treshape " + src + " : " + src_type + " -> " + src_row_type);
+    codegen.RegisterTileBufType(src_row, src_row_type);
+
+    std::string dst_row =
+        EmitRowVectorTileAllocAtMemRef(dst_tile_type, dst_row_alloc_type, *col_rows, "cast_row", codegen);
+    std::string dst_row_op_type = dst_row_alloc_type;
+    if (dst_row.empty()) {
+      std::string dst_storage = codegen.GetCurrentResultTarget();
+      std::string dst_storage_type = codegen.GetSSATileBufType(dst_storage);
+      if (dst_storage_type.empty()) {
+        dst_storage_type = codegen.GetCurrentResultTileBufTypeString();
+      }
+      CHECK(!dst_storage.empty() && !dst_storage_type.empty())
+          << "tile.cast col-vector lowering requires a preallocated destination tile";
+      dst_row = codegen.NewNamedTemp("cast_row");
+      codegen.Emit(dst_row + " = pto.treshape " + dst_storage + " : " + dst_storage_type + " -> " +
+                   dst_row_type);
+      codegen.RegisterTileBufType(dst_row, dst_row_type);
+      dst_row_op_type = dst_row_type;
+    }
+
+    std::ostringstream cvt;
+    cvt << pto_op_name << " ins(" << src_row << " " << config_attr << " : " << src_row_type << ") outs("
+        << dst_row << " : " << dst_row_op_type << ")";
+    codegen.Emit(cvt.str());
+
+    std::string dst = codegen.NewNamedTemp("cast_col");
+    codegen.Emit(dst + " = pto.treshape " + dst_row + " : " + dst_row_op_type + " -> " + dst_type);
+    codegen.SetCurrentResultBuf(dst);
+    codegen.RegisterTileBufType(dst, dst_type);
+    return "";
+  }
+
   codegen.Emit(pto_op_name + " " + GenerateInsOutsClause(op, codegen, config_attr));
   return "";
 }

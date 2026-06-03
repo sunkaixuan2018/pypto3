@@ -947,6 +947,32 @@ class TestBroadcastOpsCodegen:
         )
         assert "pto.trowexpandmul" in mlir, f"row_expand_mul should generate pto.trowexpandmul, got:\n{mlir}"
 
+    def test_row_vector_reshape_cast_feeding_row_expand_mul_casts_row_major(self):
+        """Casting a reshaped [K, 1] vector must not run pto.tcvt directly on col-major rows."""
+
+        @pl.program
+        class Prog:
+            @pl.function(type=pl.FunctionType.InCore)
+            def kernel(self, src: pl.Tensor[[16, 16], pl.FP32]) -> pl.Tensor[[16, 16], pl.FP32]:
+                idx: pl.Tensor[[1, 16], pl.INT32] = pl.tensor.ci(0, [1, 16], dtype=pl.INT32)
+                idx_col: pl.Tensor[[16, 1], pl.INT32] = pl.tensor.reshape(idx, [16, 1])
+                row_16x1: pl.Tensor[[16, 1], pl.FP32] = pl.tensor.cast(idx_col, target_type=pl.FP32)
+                return pl.row_expand_mul(src, row_16x1)
+
+        mlir = self._generate_mlir(Prog)
+        tcvt_lines = [line for line in mlir.splitlines() if "pto.tcvt" in line]
+        assert tcvt_lines, f"expected pto.tcvt in arange cast lowering, got:\n{mlir}"
+        assert any("rows=1, cols=16" in line and "blayout=row_major" in line for line in tcvt_lines), (
+            f"col-vector cast should first convert through a [1,K] row-major view; got:\n{mlir}"
+        )
+        assert not any("rows=16, cols=1" in line and "pto.tcvt" in line for line in tcvt_lines), (
+            f"pto.tcvt must not directly consume or produce [K,1] col-major vectors; got:\n{mlir}"
+        )
+        assert not any("pto.alloc_tile :" in line for line in mlir.splitlines()), (
+            f"level-3 alloc_tile operations must carry addr and valid shape operands; got:\n{mlir}"
+        )
+        assert "pto.trowexpandmul" in mlir, f"row_expand_mul should generate pto.trowexpandmul, got:\n{mlir}"
+
 
 class TestTileSliceCodegen:
     """Tests for tile.slice PTO code generation (pto.subview).
