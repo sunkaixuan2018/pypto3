@@ -49,6 +49,33 @@ namespace {
 
 bool IsConstOne(const ExprPtr& expr) { return IsConstValue(expr, 1); }
 
+std::optional<std::vector<int64_t>> ExtractStaticShape(const std::vector<ExprPtr>& dims) {
+  std::vector<int64_t> shape;
+  shape.reserve(dims.size());
+  for (const auto& dim : dims) {
+    auto const_dim = As<ConstInt>(dim);
+    if (!const_dim) return std::nullopt;
+    shape.push_back(const_dim->value_);
+  }
+  return shape;
+}
+
+std::optional<std::vector<int64_t>> ExtractStaticShapeTuple(const ExprPtr& expr) {
+  auto tuple = As<MakeTuple>(expr);
+  if (!tuple) return std::nullopt;
+  return ExtractStaticShape(tuple->elements_);
+}
+
+bool IsOneDimVectorTransposeReshape(const std::vector<int64_t>& src_shape,
+                                    const std::vector<int64_t>& dst_shape) {
+  if (src_shape.size() != 2 || dst_shape.size() != 2) return false;
+  const bool row_to_col =
+      src_shape[0] == 1 && src_shape[1] > 1 && dst_shape[0] == src_shape[1] && dst_shape[1] == 1;
+  const bool col_to_row =
+      src_shape[0] > 1 && src_shape[1] == 1 && dst_shape[0] == 1 && dst_shape[1] == src_shape[0];
+  return row_to_col || col_to_row;
+}
+
 // Detect row-broadcast pattern: [M, N] op [M, 1] or [M, 1] op [M, N]
 // Returns {wider_arg_idx, narrower_arg_idx} if broadcast detected, empty otherwise
 std::pair<int, int> DetectRowBroadcast(const std::vector<ExprPtr>& args) {
@@ -166,7 +193,37 @@ void OpConversionRegistry::RegisterBroadcastAndTransformOps() {
   RegisterSimple("tensor.col_expand_div", "tile.col_expand_div");
   RegisterSimple("tensor.expands", "tile.expands");
 
-  RegisterSimple("tensor.reshape", "tile.reshape");
+  RegisterCustom(
+      "tensor.reshape",
+      [](const std::vector<ExprPtr>& args, const std::vector<std::pair<std::string, std::any>>& kwargs,
+         const Span& span) -> ConversionResult {
+        CHECK(args.size() == 2 || args.size() == 3)
+            << "tensor.reshape conversion expects 2 or 3 args (input, shape[, valid_shape]), got " << args.size();
+        auto& op_reg = OpRegistry::GetInstance();
+
+        auto input_tile_type = As<TileType>(args[0]->GetType());
+        auto src_shape = input_tile_type ? ExtractStaticShape(input_tile_type->shape_) : std::nullopt;
+        auto dst_shape = ExtractStaticShapeTuple(args[1]);
+        if (args.size() == 2 && src_shape && dst_shape && IsOneDimVectorTransposeReshape(*src_shape, *dst_shape)) {
+          auto shape_tuple = std::make_shared<MakeTuple>(input_tile_type->shape_, span);
+          MemorySpace tmp_mem =
+              input_tile_type->memory_space_.has_value() ? *input_tile_type->memory_space_ : MemorySpace::Vec;
+          std::vector<std::pair<std::string, std::any>> create_kwargs = {{"dtype", input_tile_type->dtype_},
+                                                                         {"target_memory", tmp_mem}};
+          auto create_call = op_reg.Create("tile.create", {shape_tuple}, create_kwargs, span);
+
+          auto tmp_var = std::make_shared<Var>("reshape_transpose_tmp", create_call->GetType(), span);
+          std::vector<StmtPtr> prologue;
+          prologue.push_back(std::make_shared<AssignStmt>(tmp_var, create_call, span));
+
+          auto axis0 = std::make_shared<ConstInt>(0, DataType::INDEX, span);
+          auto axis1 = std::make_shared<ConstInt>(1, DataType::INDEX, span);
+          auto transpose_call = op_reg.Create("tile.transpose", {args[0], axis0, axis1, tmp_var}, span);
+          return ConversionResult{std::move(prologue), transpose_call};
+        }
+
+        return ConversionResult{op_reg.Create("tile.reshape", {args[0], args[1]}, kwargs, span)};
+      });
 
   // tensor.transpose → tile.create + tile.transpose(input, axis1, axis2, tmp). tmp is required
   // by pto.ttrans; emitting it as a separate tile.create gives the memory allocator a chance

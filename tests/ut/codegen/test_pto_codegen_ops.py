@@ -916,7 +916,7 @@ class TestBroadcastOpsCodegen:
             raise AssertionError("no pto.trowexpand ins(...) line in MLIR")
 
     def test_row_vector_reshape_feeding_row_expand_mul_materializes(self):
-        """A [1, K] row vector reshaped to [K, 1] must materialize before row_expand_mul."""
+        """A tensor [1, K] -> [K, 1] vector reshape must lower to a materialized transpose."""
 
         @pl.program
         class Prog:
@@ -925,18 +925,14 @@ class TestBroadcastOpsCodegen:
                 self,
                 src: pl.Tensor[[16, 16], pl.FP32],
                 row_vec_tensor: pl.Tensor[[1, 16], pl.FP32],
-                dst: pl.Tensor[[16, 16], pl.FP32],
             ) -> pl.Tensor[[16, 16], pl.FP32]:
-                src_tile: pl.Tile[[16, 16], pl.FP32] = pl.load(src, [0, 0], [16, 16])
-                row_1x16: pl.Tile[[1, 16], pl.FP32] = pl.load(row_vec_tensor, [0, 0], [1, 16])
-                row_16x1: pl.Tile[[16, 1], pl.FP32] = pl.tile.reshape(row_1x16, [16, 1])
-                result: pl.Tile[[16, 16], pl.FP32] = pl.tile.row_expand_mul(src_tile, row_16x1)
-                return pl.store(result, [0, 0], dst)
+                row_16x1: pl.Tensor[[16, 1], pl.FP32] = pl.reshape(row_vec_tensor, [16, 1])
+                return pl.row_expand_mul(src, row_16x1)
 
         mlir = self._generate_mlir(Prog)
         ttrans_lines = [line for line in mlir.splitlines() if "pto.ttrans" in line]
         assert ttrans_lines, (
-            "tile.reshape([1,K] -> [K,1]) feeding row_expand_mul must materialize with pto.ttrans; got:\n"
+            "tensor reshape [1,K] -> [K,1] feeding row_expand_mul must materialize with pto.ttrans; got:\n"
             f"{mlir}"
         )
         assert "rows=16, cols=1" in ttrans_lines[0], (

@@ -135,15 +135,6 @@ static std::string GetStaticValidTileBufTypeString(
                                           c.v_row_dynamic, c.v_col_dynamic);
 }
 
-static bool IsOneDimVectorTransposeReshape(const codegen::TileTypeComponents& src,
-                                           const codegen::TileTypeComponents& dst) {
-  const bool row_to_col = src.rows == 1 && src.cols > 1 && dst.rows == src.cols && dst.cols == 1 &&
-                          src.blayout == ir::TileLayout::row_major && dst.blayout == ir::TileLayout::col_major;
-  const bool col_to_row = src.rows > 1 && src.cols == 1 && dst.rows == 1 && dst.cols == src.rows &&
-                          src.blayout == ir::TileLayout::col_major && dst.blayout == ir::TileLayout::row_major;
-  return row_to_col || col_to_row;
-}
-
 // Build a partition_tensor_view type string from dimension strings and element dtype.
 static std::string MakePartitionTensorViewType(const std::vector<std::string>& dims,
                                                const std::string& dtype_str) {
@@ -3472,42 +3463,12 @@ void RegisterPTOOps(Backend& backend, const std::unordered_set<std::string>& exc
 
     std::string src = codegen.GetExprAsCode(op->args_[0]);
     std::string src_type = codegen.GetExprTypeAnnotation(op->args_[0]);
-    std::shared_ptr<const ir::TileType> src_tile_type;
-    if (auto src_var = AsVarLike(op->args_[0])) {
-      src_tile_type = ir::As<ir::TileType>(src_var->GetType());
-    }
 
     // Only exact same-type reshapes are no-ops. A predeclared result alloc has
     // the desired result type by construction, so it must not be used to prove
     // that the source and result layouts are identical.
     if (!src_type.empty() && !result_type.empty() && src_type == result_type) {
       return std::string("");
-    }
-
-    if (src_tile_type && result_tile_type && !src_type.empty() && !result_type.empty()) {
-      auto src_info = codegen::ExtractTileTypeInfo(*src_tile_type, codegen.GetTypeString(src_tile_type->dtype_));
-      auto result_info =
-          codegen::ExtractTileTypeInfo(*result_tile_type, codegen.GetTypeString(result_tile_type->dtype_));
-      if (IsOneDimVectorTransposeReshape(src_info, result_info)) {
-        std::string src_valid_row = codegen.GetOrEmitConstant(src_info.rows, DataType::INDEX);
-        std::string src_valid_col = codegen.GetOrEmitConstant(src_info.cols, DataType::INDEX);
-        std::string result_valid_row = codegen.GetOrEmitConstant(result_info.rows, DataType::INDEX);
-        std::string result_valid_col = codegen.GetOrEmitConstant(result_info.cols, DataType::INDEX);
-        std::string transpose_result_type = emitted_result_type.empty() ? result_type : emitted_result_type;
-        std::string tmp_target =
-            codegen.AllocNewTileBuf(src_type, "reshape_trans_tmp", "", src_valid_row, src_valid_col);
-        const bool result_valid_shape_is_static = transpose_result_type != result_type;
-        result_target = codegen.AllocNewTileBuf(transpose_result_type, "reshape_trans_buf", "",
-                                                result_valid_shape_is_static ? "" : result_valid_row,
-                                                result_valid_shape_is_static ? "" : result_valid_col);
-        codegen.SetCurrentResultBuf(result_target);
-
-        std::ostringstream oss;
-        oss << "pto.ttrans ins(" << src << ", " << tmp_target << " : " << src_type << ", " << src_type
-            << ") outs(" << result_target << " : " << transpose_result_type << ")";
-        codegen.Emit(oss.str());
-        return std::string("");
-      }
     }
 
     // Fallback: emit pto.treshape for cases without pre-declared alloc
