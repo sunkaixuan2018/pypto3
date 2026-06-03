@@ -937,6 +937,11 @@ class TestBroadcastOpsCodegen:
         assert "pto.treshape" in mlir, (
             f"tile.reshape([1,K] -> [K,1]) feeding row_expand_mul must materialize; got:\n{mlir}"
         )
+        treshape_lines = [line for line in mlir.splitlines() if "pto.treshape" in line]
+        assert treshape_lines and "v_row=16, v_col=1" in treshape_lines[0], (
+            "static reshape result must carry static valid shape for PTOAS lowering; got:\n"
+            f"{treshape_lines[0] if treshape_lines else mlir}"
+        )
         assert "pto.trowexpandmul" in mlir, f"row_expand_mul should generate pto.trowexpandmul, got:\n{mlir}"
 
 

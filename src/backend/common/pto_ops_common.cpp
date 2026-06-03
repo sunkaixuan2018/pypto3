@@ -118,6 +118,23 @@ static const std::vector<std::string> round_modes = {"NONE", "RINT",  "ROUND", "
 static const std::vector<std::string> mask_patterns = {"",      "P0101", "P1010", "P0001",
                                                        "P0010", "P0100", "P1000", "P1111"};
 
+static std::string GetStaticValidTileBufTypeString(
+    const std::shared_ptr<const ir::TileType>& tile_type, const codegen::PTOCodegen& codegen) {
+  if (!tile_type) return "";
+  auto memory_space = tile_type->GetMemorySpace();
+  if (!memory_space.has_value()) return "";
+
+  auto c = codegen::ExtractTileTypeInfo(*tile_type, codegen.GetTypeString(tile_type->dtype_));
+  if (c.rows <= 0 || c.cols <= 0) return "";
+  c.v_row = c.rows;
+  c.v_col = c.cols;
+  c.v_row_dynamic = false;
+  c.v_col_dynamic = false;
+  return codegen::FormatTileBufTypeString(codegen::MemorySpaceToMLIR(*memory_space), c.dtype_str, c.rows, c.cols,
+                                          c.blayout, c.slayout, c.fractal, c.pad, c.v_row, c.v_col,
+                                          c.v_row_dynamic, c.v_col_dynamic);
+}
+
 // Build a partition_tensor_view type string from dimension strings and element dtype.
 static std::string MakePartitionTensorViewType(const std::vector<std::string>& dims,
                                                const std::string& dtype_str) {
@@ -3432,6 +3449,15 @@ void RegisterPTOOps(Backend& backend, const std::unordered_set<std::string>& exc
                                  << op->args_.size();
     std::string result_target = codegen.GetCurrentResultTarget();
     std::string result_type = codegen.GetCurrentResultTileBufTypeStringFromTileType();
+    std::string emitted_result_type = result_type;
+    if (auto result_var = codegen.GetCurrentResultVar()) {
+      if (auto result_tile_type = ir::As<ir::TileType>(result_var->GetType())) {
+        std::string static_valid_type = GetStaticValidTileBufTypeString(result_tile_type, codegen);
+        if (!static_valid_type.empty()) {
+          emitted_result_type = static_valid_type;
+        }
+      }
+    }
 
     std::string src = codegen.GetExprAsCode(op->args_[0]);
     std::string src_type = codegen.GetExprTypeAnnotation(op->args_[0]);
@@ -3444,15 +3470,15 @@ void RegisterPTOOps(Backend& backend, const std::unordered_set<std::string>& exc
     }
 
     // Fallback: emit pto.treshape for cases without pre-declared alloc
-    if (!result_type.empty()) {
+    if (!emitted_result_type.empty()) {
       result_target = codegen.NewNamedTemp("reshape_buf");
       codegen.SetCurrentResultBuf(result_target);
-      codegen.RegisterTileBufType(result_target, result_type);
+      codegen.RegisterTileBufType(result_target, emitted_result_type);
     }
     std::ostringstream oss;
     oss << result_target << " = pto.treshape " << src;
-    if (!src_type.empty() && !result_type.empty()) {
-      oss << " : " << src_type << " -> " << result_type;
+    if (!src_type.empty() && !emitted_result_type.empty()) {
+      oss << " : " << src_type << " -> " << emitted_result_type;
     }
     codegen.Emit(oss.str());
     return std::string("");
