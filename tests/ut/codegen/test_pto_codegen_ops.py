@@ -935,8 +935,8 @@ class TestBroadcastOpsCodegen:
             "tensor reshape [1,K] -> [K,1] feeding row_expand_mul must materialize with pto.ttrans; got:\n"
             f"{mlir}"
         )
-        assert "rows=16, cols=1" in ttrans_lines[0], (
-            "transpose-materialized reshape result must carry [K,1] output type; got:\n"
+        assert "rows=16, cols=1" in ttrans_lines[0] and "blayout=col_major" in ttrans_lines[0], (
+            "transpose-materialized reshape result must carry a [K,1] column-vector output type; got:\n"
             f"{ttrans_lines[0]}"
         )
         assert "pto.trowexpandmul" in mlir, f"row_expand_mul should generate pto.trowexpandmul, got:\n{mlir}"

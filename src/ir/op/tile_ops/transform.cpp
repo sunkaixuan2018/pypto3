@@ -358,6 +358,7 @@ TypePtr DeduceTileTransposeType(const std::vector<ExprPtr>& args,
 
   TileView tile_view;
   tile_view.valid_shape = new_shape;
+  tile_view.blayout = InferTileLayoutFromShape(new_shape);
   return std::make_shared<TileType>(new_shape, input_type->dtype_, std::nullopt, tile_view);
 }
 
