@@ -3496,8 +3496,10 @@ void RegisterPTOOps(Backend& backend, const std::unordered_set<std::string>& exc
         std::string transpose_result_type = emitted_result_type.empty() ? result_type : emitted_result_type;
         std::string tmp_target =
             codegen.AllocNewTileBuf(src_type, "reshape_trans_tmp", "", src_valid_row, src_valid_col);
-        result_target = codegen.AllocNewTileBuf(transpose_result_type, "reshape_trans_buf", "", result_valid_row,
-                                                result_valid_col);
+        const bool result_valid_shape_is_static = transpose_result_type != result_type;
+        result_target = codegen.AllocNewTileBuf(transpose_result_type, "reshape_trans_buf", "",
+                                                result_valid_shape_is_static ? "" : result_valid_row,
+                                                result_valid_shape_is_static ? "" : result_valid_col);
         codegen.SetCurrentResultBuf(result_target);
 
         std::ostringstream oss;
