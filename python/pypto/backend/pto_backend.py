@@ -252,7 +252,45 @@ def _preprocess_ptoas_output(content: str) -> str:
     result = re.sub(r"(?:__global__\s+)?AICORE\s+void", "static __aicore__ void", result)
     # Mixed-kernel sub-functions and helpers: normalize remaining AICORE qualifiers.
     result = re.sub(r"\bAICORE\b", "__aicore__", result)
+    result = _insert_dependent_vector_barriers(result)
     return result
+
+
+_VECTOR_RESULT_RE = re.compile(
+    r"^\s*(?:T(?:ABS|ADD|ADDS|AND|CMP|COL|COLEXPAND|DIV|DIVS|EXP|FLOOR|LOG|MAX|MIN|MUL|MULS|NEG|NOT|OR|RECIP|"
+    r"RELU|ROWEXPAND|RSQRT|SEL|SELS|SQRT|SUB|SUBS|TRANS|XOR|CVT)\w*)\s*\(\s*([A-Za-z_]\w*)\s*,"
+)
+
+
+def _vector_op_result(line: str) -> str | None:
+    match = _VECTOR_RESULT_RE.match(line)
+    if match is None:
+        return None
+    return match.group(1)
+
+
+def _insert_dependent_vector_barriers(content: str) -> str:
+    """Insert C++ vector-pipe barriers after vector instructions.
+
+    PTOAS can emit generated setup lines between a vector producer and its next
+    vector consumer, so local dependency inference from adjacent lines is not
+    reliable. A2/A3 examples use ``pipe_barrier(PIPE_V);`` after vector steps;
+    keep the PTO MLIR unchanged and patch the generated C++ body after ptoas has
+    produced legal code.
+    """
+    lines = content.splitlines(keepends=True)
+    result: list[str] = []
+
+    for idx, line in enumerate(lines):
+        result.append(line)
+        produced = _vector_op_result(line)
+        if produced is not None:
+            next_line = lines[idx + 1].strip() if idx + 1 < len(lines) else ""
+            if "pipe_barrier(PIPE_V)" not in next_line:
+                indent = line[: len(line) - len(line.lstrip())]
+                result.append(f"{indent}pipe_barrier(PIPE_V);\n")
+
+    return "".join(result)
 
 
 def _const_int_from_shape_expr(expr: object) -> int | None:

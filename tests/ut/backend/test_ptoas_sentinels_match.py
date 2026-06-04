@@ -70,6 +70,37 @@ def test_preprocess_matches_pto_backend() -> None:
     )
 
 
+def test_preprocess_inserts_barrier_after_vector_ops() -> None:
+    ptoas = """AICORE void build_w(__gm__ int64_t* args) {
+    TROWEXPANDMUL(v38, v22, v37);
+    Tile<TileType::Vec, uint8_t, 64, 32> v40;
+    TASSIGN(v40, v41);
+    TCMP(v40, v28, v38, v3);
+    TSEL(v48, v47, v45, v46, v44);
+    TCVT(v50, v48, RoundMode::CAST_ROUND);
+    TSTORE(gm, v50);
+}
+"""
+
+    actual = pto_backend._preprocess_ptoas_output(ptoas)
+    lines = actual.splitlines()
+    assert lines[lines.index("    TROWEXPANDMUL(v38, v22, v37);") + 1] == "    pipe_barrier(PIPE_V);"
+    assert lines[lines.index("    TCMP(v40, v28, v38, v3);") + 1] == "    pipe_barrier(PIPE_V);"
+    assert lines[lines.index("    TSEL(v48, v47, v45, v46, v44);") + 1] == "    pipe_barrier(PIPE_V);"
+    assert lines[lines.index("    TCVT(v50, v48, RoundMode::CAST_ROUND);") + 1] == "    pipe_barrier(PIPE_V);"
+
+
+def test_preprocess_does_not_duplicate_existing_vector_barrier() -> None:
+    ptoas = """AICORE void build_w(__gm__ int64_t* args) {
+    TSEL(v48, v47, v45, v46, v44);
+    pipe_barrier(PIPE_V);
+}
+"""
+
+    actual = pto_backend._preprocess_ptoas_output(ptoas)
+    assert actual.count("pipe_barrier(PIPE_V);") == 1
+
+
 def test_base_ptoas_flags_subset_of_backend_flags() -> None:
     """The rebuild path uses base flags only (no backend-handler extras).
     Each base flag must still appear in ``_get_ptoas_flags``'s source so the
