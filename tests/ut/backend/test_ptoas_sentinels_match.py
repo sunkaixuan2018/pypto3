@@ -70,6 +70,32 @@ def test_preprocess_matches_pto_backend() -> None:
     )
 
 
+def test_preprocess_inserts_barrier_between_dependent_vector_ops() -> None:
+    ptoas = """AICORE void build_w(__gm__ int64_t* args) {
+    TSEL(v48, v47, v45, v46, v44);
+    TCVT(v50, v48, RoundMode::CAST_ROUND);
+    TSTORE(gm, v50);
+}
+"""
+
+    actual = pto_backend._preprocess_ptoas_output(ptoas)
+    tsel_idx = actual.index("TSEL(v48")
+    barrier_idx = actual.index("pipe_barrier(PIPE_V);")
+    tcvt_idx = actual.index("TCVT(v50")
+    assert tsel_idx < barrier_idx < tcvt_idx
+
+
+def test_preprocess_does_not_insert_barrier_between_independent_vector_ops() -> None:
+    ptoas = """AICORE void build_w(__gm__ int64_t* args) {
+    TSEL(v48, v47, v45, v46, v44);
+    TCVT(v50, v49, RoundMode::CAST_ROUND);
+}
+"""
+
+    actual = pto_backend._preprocess_ptoas_output(ptoas)
+    assert "pipe_barrier(PIPE_V);" not in actual
+
+
 def test_base_ptoas_flags_subset_of_backend_flags() -> None:
     """The rebuild path uses base flags only (no backend-handler extras).
     Each base flag must still appear in ``_get_ptoas_flags``'s source so the

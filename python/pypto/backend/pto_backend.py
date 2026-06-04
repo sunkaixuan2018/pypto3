@@ -252,7 +252,86 @@ def _preprocess_ptoas_output(content: str) -> str:
     result = re.sub(r"(?:__global__\s+)?AICORE\s+void", "static __aicore__ void", result)
     # Mixed-kernel sub-functions and helpers: normalize remaining AICORE qualifiers.
     result = re.sub(r"\bAICORE\b", "__aicore__", result)
+    result = _insert_dependent_vector_barriers(result)
     return result
+
+
+_VECTOR_RESULT_RE = re.compile(
+    r"^\s*(?:T(?:ABS|ADD|ADDS|AND|CMP|COL|COLEXPAND|DIV|DIVS|EXP|FLOOR|LOG|MAX|MIN|MUL|MULS|NEG|NOT|OR|RECIP|"
+    r"RELU|ROWEXPAND|RSQRT|SEL|SELS|SQRT|SUB|SUBS|TRANS|XOR|CVT)\w*)\s*\(\s*([A-Za-z_]\w*)\s*,"
+)
+_VECTOR_ARG_RE = re.compile(r"\b([A-Za-z_]\w*)\b")
+_VECTOR_PIPE_OP_RE = re.compile(
+    r"^\s*T(?:ABS|ADD|ADDS|AND|CMP|COL|COLEXPAND|DIV|DIVS|EXP|FLOOR|LOG|MAX|MIN|MUL|MULS|NEG|NOT|OR|RECIP|"
+    r"RELU|ROWEXPAND|RSQRT|SEL|SELS|SQRT|SUB|SUBS|TRANS|XOR|CVT)\w*\s*\("
+)
+_NON_TILE_ARG_NAMES = {
+    "EVENT_ID0",
+    "EVENT_ID1",
+    "RoundMode",
+    "CAST_ROUND",
+    "PIPE_V",
+    "PIPE_MTE2",
+    "PIPE_MTE3",
+    "PIPE_M",
+    "PIPE_ALL",
+}
+
+
+def _vector_op_result(line: str) -> str | None:
+    match = _VECTOR_RESULT_RE.match(line)
+    if match is None:
+        return None
+    return match.group(1)
+
+
+def _vector_op_args(line: str) -> set[str]:
+    return {
+        name
+        for name in _VECTOR_ARG_RE.findall(line)
+        if name not in _NON_TILE_ARG_NAMES and not name.startswith("T")
+    }
+
+
+def _insert_dependent_vector_barriers(content: str) -> str:
+    """Insert C++ vector-pipe barriers between dependent vector instructions.
+
+    PTOAS can emit adjacent vector intrinsics where the second reads a tile just
+    produced by the first. A2/A3 examples use ``pipe_barrier(PIPE_V);`` between
+    such dependent vector steps; keep the PTO MLIR unchanged and patch the
+    generated C++ body after ptoas has produced legal code.
+    """
+    lines = content.splitlines(keepends=True)
+    result: list[str] = []
+    pending_vec_result: str | None = None
+    pending_indent = ""
+
+    for line in lines:
+        stripped = line.strip()
+        if (
+            pending_vec_result
+            and _VECTOR_PIPE_OP_RE.match(line)
+            and pending_vec_result in _vector_op_args(line)
+        ):
+            result.append(f"{pending_indent}pipe_barrier(PIPE_V);\n")
+            pending_vec_result = None
+
+        result.append(line)
+
+        if not stripped or stripped.startswith("//"):
+            continue
+        if "pipe_barrier(" in stripped:
+            pending_vec_result = None
+            continue
+
+        produced = _vector_op_result(line)
+        if produced is not None:
+            pending_vec_result = produced
+            pending_indent = line[: len(line) - len(line.lstrip())]
+        else:
+            pending_vec_result = None
+
+    return "".join(result)
 
 
 def _const_int_from_shape_expr(expr: object) -> int | None:

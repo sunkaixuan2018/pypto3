@@ -112,7 +112,10 @@ def _preprocess_ptoas_body(content: str) -> str:
         filtered.append(line)
     result = "".join(filtered)
     result = re.sub(r"(?:__global__\s+)?AICORE\s+void", "static __aicore__ void", result)
-    return re.sub(r"\bAICORE\b", "__aicore__", result)
+    result = re.sub(r"\bAICORE\b", "__aicore__", result)
+    from pypto.backend.pto_backend import _insert_dependent_vector_barriers  # noqa: PLC0415
+
+    return _insert_dependent_vector_barriers(result)
 
 
 def _extract_func_names(ptoas_cpp: str) -> list[str]:
