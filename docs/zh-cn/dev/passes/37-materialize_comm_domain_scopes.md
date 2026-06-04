@@ -21,7 +21,11 @@
 ## 流水线位置
 
 ```text
+<<<<<<<< HEAD:docs/zh-cn/dev/passes/36-materialize_comm_domain_scopes.md
 …  →  DeriveCallDirections  →  MaterializeCommDomainScopes  →  Simplify（最末）
+========
+... -> DeriveCallDirections -> AutoDeriveTaskDependencies -> ExpandManualPhaseFence -> CollectCommGroups -> Simplify（最末）
+>>>>>>>> 8f3050f4 (chore: rebase auto deps onto upstream main):docs/zh-cn/dev/passes/37-collect_comm_groups.md
 ```
 
 本 pass 跑在默认 pipeline 的最末尾、最后一次 `Simplify` 之前。从

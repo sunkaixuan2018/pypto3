@@ -341,7 +341,7 @@ class SSAConverter {
     std::vector<std::pair<std::string, std::any>> out;
     out.reserve(attrs.size());
     for (const auto& [k, v] : attrs) {
-      if (k == kAttrManualDepEdges || k == kAttrDumpVars) {
+      if (k == kAttrManualDepEdges || k == kAttrCompilerManualDepEdges || k == kAttrDumpVars) {
         const auto* edges = std::any_cast<std::vector<VarPtr>>(&v);
         if (edges) {
           std::vector<VarPtr> new_edges;
@@ -983,7 +983,8 @@ class SSAConverter {
     std::vector<std::pair<std::string, std::any>> out;
     out.reserve(attrs.size());
     for (const auto& [k, v] : attrs) {
-      if (k == kAttrManualDepEdges || k == kAttrArgDirOverrideVars || k == kAttrDumpVars) {
+      if (k == kAttrManualDepEdges || k == kAttrCompilerManualDepEdges || k == kAttrArgDirOverrideVars ||
+          k == kAttrDumpVars) {
         const auto* edges = std::any_cast<std::vector<VarPtr>>(&v);
         if (edges) {
           std::vector<VarPtr> new_edges;

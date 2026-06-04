@@ -22,7 +22,11 @@ the IR types so downstream codegen has O(1) access.
 ## Position in the pipeline
 
 ```text
+<<<<<<<< HEAD:docs/en/dev/passes/36-materialize_comm_domain_scopes.md
 …  →  DeriveCallDirections  →  MaterializeCommDomainScopes  →  Simplify (final)
+========
+... -> DeriveCallDirections -> AutoDeriveTaskDependencies -> ExpandManualPhaseFence -> CollectCommGroups -> Simplify (final)
+>>>>>>>> 8f3050f4 (chore: rebase auto deps onto upstream main):docs/en/dev/passes/37-collect_comm_groups.md
 ```
 
 The pass runs at the very end of the default pipeline, immediately before the

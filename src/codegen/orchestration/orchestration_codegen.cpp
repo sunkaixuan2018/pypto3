@@ -281,6 +281,7 @@ class OrchestrationStmtCodegen : public CodegenBase {
         param_name_set_(std::move(param_name_set)),
         param_name_to_orch_index_(std::move(param_name_to_orch_index)) {
     declared_var_names_ = param_name_set_;
+    CollectCompilerDepTaskIds(program_);
   }
 
   void SetCallTupleElements(const std::map<std::string, std::vector<TupleElement>>& elements) {
@@ -1057,9 +1058,15 @@ class OrchestrationStmtCodegen : public CodegenBase {
           result_key = var_name;
         }
         int task_idx_before = task_counter_;
-        GenerateFunctionCallCode(call, result_key);
+        const bool capture_plain_task_id = compiler_dep_task_id_vars_.count(assign->var_.get()) > 0;
+        GenerateFunctionCallCode(call, result_key, capture_plain_task_id);
 
-        if (in_manual_scope_depth_ > 0 && task_counter_ > task_idx_before) {
+        if (task_counter_ > task_idx_before && capture_plain_task_id) {
+          std::string tid_name = ReserveSyntheticEmitName(GetSSABaseName(var_name) + "_tid");
+          code_ << Indent() << "PTO2TaskId " << tid_name << " = task_" << task_idx_before
+                << "_outs.task_id();\n";
+          manual_task_id_map_[assign->var_.get()] = tid_name;
+        } else if (in_manual_scope_depth_ > 0 && task_counter_ > task_idx_before) {
           // Bind the LHS Var to the just-emitted ``task_<n>`` so a downstream
           // sibling call inside the same manual scope can ``add_dep`` on it.
           manual_task_id_map_[assign->var_.get()] = task_idx_before;
@@ -1877,26 +1884,69 @@ class OrchestrationStmtCodegen : public CodegenBase {
   /// runtime adds these on top of any auto-tracked deps in auto scope (final
   /// fanin = auto ∪ explicit), so this count fires whenever the parser
   /// attached ``deps=[...]`` to the Call.
-  size_t CountManualDeps(const CallPtr& call) const {
-    for (const auto& [k, v] : call->attrs_) {
-      if (k != kAttrManualDepEdges) continue;
-      const auto* edges = std::any_cast<std::vector<VarPtr>>(&v);
-      if (edges == nullptr) return 0;
-      size_t total = 0;
-      for (const auto& edge : *edges) {
-        if (!edge) continue;
-        auto it = manual_task_id_map_.find(edge.get());
-        if (it == manual_task_id_map_.end()) continue;
-        if (std::get_if<int>(&it->second)) continue;
-        if (auto* names = std::get_if<std::vector<std::string>>(&it->second)) {
-          total += names->size();
-        } else {
-          total += 1;
+  std::vector<VarPtr> GetDependencyEdges(const CallPtr& call) const {
+    std::vector<VarPtr> merged;
+    std::unordered_set<uint64_t> seen;
+    auto append_edges = [&](const char* key) {
+      for (const auto& [k, v] : call->attrs_) {
+        if (k != key) continue;
+        const auto* edges = std::any_cast<std::vector<VarPtr>>(&v);
+        if (edges == nullptr) return;
+        for (const auto& edge : *edges) {
+          if (!edge) continue;
+          if (!seen.insert(edge->UniqueId()).second) continue;
+          merged.push_back(edge);
         }
+        return;
       }
-      return total;
+    };
+    append_edges(kAttrManualDepEdges);
+    append_edges(kAttrCompilerManualDepEdges);
+    return merged;
+  }
+
+  void CollectCompilerDepTaskIds(const ProgramPtr& program) {
+    class Collector : public IRVisitor {
+     public:
+      std::unordered_set<const Var*> vars;
+
+     protected:
+      void VisitExpr_(const CallPtr& call) override {
+        for (const auto& [key, value] : call->attrs_) {
+          if (key != kAttrCompilerManualDepEdges) continue;
+          const auto* edges = std::any_cast<std::vector<VarPtr>>(&value);
+          if (!edges) continue;
+          for (const auto& edge : *edges) {
+            if (edge) vars.insert(edge.get());
+          }
+        }
+        IRVisitor::VisitExpr_(call);
+      }
+    };
+
+    Collector collector;
+    collector.VisitProgram(program);
+    compiler_dep_task_id_vars_ = std::move(collector.vars);
+  }
+
+  static bool ShouldCaptureTaskOutputs(const CallPtr& call, bool capture_plain_task_id) {
+    return IsSubmitCall(call) || capture_plain_task_id;
+  }
+
+  size_t CountManualDeps(const std::vector<VarPtr>& edges) const {
+    size_t total = 0;
+    for (const auto& edge : edges) {
+      if (!edge) continue;
+      auto it = manual_task_id_map_.find(edge.get());
+      if (it == manual_task_id_map_.end()) continue;
+      if (std::get_if<int>(&it->second)) continue;
+      if (auto* names = std::get_if<std::vector<std::string>>(&it->second)) {
+        total += names->size();
+      } else {
+        total += 1;
+      }
     }
-    return 0;
+    return total;
   }
 
   /// Emit the per-task ``Arg`` declaration. Dependency edges (if any) are
@@ -1942,57 +1992,50 @@ class OrchestrationStmtCodegen : public CodegenBase {
   /// fanin = auto ∪ explicit), so this fires in both auto and manual scopes.
   /// No-op when there are no edges attached.
   void EmitManualDeps(const CallPtr& call, const std::string& task_var) {
-    const size_t dep_capacity = CountManualDeps(call);
+    const auto edges = GetDependencyEdges(call);
+    const size_t dep_capacity = CountManualDeps(edges);
     if (dep_capacity == 0) return;
-    for (const auto& [k, v] : call->attrs_) {
-      if (k != kAttrManualDepEdges) continue;
-      const auto* edges = std::any_cast<std::vector<VarPtr>>(&v);
-      INTERNAL_CHECK_SPAN(edges != nullptr, call->span_)
-          << "Internal error: " << kAttrManualDepEdges << " attr must hold std::vector<VarPtr>";
-      const std::string deps_arr = task_var + "_deps";
-      const std::string deps_cnt = task_var + "_deps_count";
-      code_ << Indent() << "PTO2TaskId " << deps_arr << "[" << dep_capacity << "];\n";
-      code_ << Indent() << "uint32_t " << deps_cnt << " = 0;\n";
-      for (const auto& edge : *edges) {
-        if (!edge) continue;
-        auto it = manual_task_id_map_.find(edge.get());
-        // Skip edges whose producer TaskId is not visible in the current C++
-        // scope. With per-PTO2_SCOPE lexical scoping, a dep that references a
-        // TaskId declared inside an already-closed scope is legitimately absent
-        // from the map; emitting it would name an out-of-scope identifier. Skip
-        // it — matching ``CountManualDeps``, which sizes the stack array the
-        // same way — so a mixed in-scope / out-of-scope deps list does not abort.
-        if (it == manual_task_id_map_.end()) continue;
-        if (std::get_if<int>(&it->second)) {
-          // Invariant: a ``manual_dep_edges`` entry should never resolve
-          // directly to a kernel-Call LHS (int-variant entry). The parser
-          // enforces that ``deps=[...]`` only accepts ``Scalar[TASK_ID]``
-          // Vars, so dep edges should always resolve to a TaskId binding
-          // (string variant) or a TaskId iter_arg array (vector variant).
-          INTERNAL_CHECK_SPAN(false, call->span_)
-              << "Internal error: manual_dep_edge var '" << edge->name_hint_
-              << "' resolves to a kernel-Call LHS (int variant). Expected "
-              << "a Scalar[TASK_ID] Var (string variant).";
-        } else if (auto* names = std::get_if<std::vector<std::string>>(&it->second)) {
-          // Array-carry iter_arg: include every valid slot.
-          for (const auto& name : *names) {
-            code_ << Indent() << "if (" << name << ".is_valid()) " << deps_arr << "[" << deps_cnt
-                  << "++] = " << name << ";\n";
-          }
-        } else {
-          const auto& name = std::get<std::string>(it->second);
-          // Any scalar TaskId may hold the ``PTO2TaskId::invalid()`` sentinel
-          // — an iter_arg carry on the first loop iteration, or a ``None``
-          // (``system.task_invalid``) loop-carry seed. Guard every entry with
-          // ``is_valid()``; the branch is a harmless always-true test for ids
-          // already known valid.
+    const std::string deps_arr = task_var + "_deps";
+    const std::string deps_cnt = task_var + "_deps_count";
+    code_ << Indent() << "PTO2TaskId " << deps_arr << "[" << dep_capacity << "];\n";
+    code_ << Indent() << "uint32_t " << deps_cnt << " = 0;\n";
+    for (const auto& edge : edges) {
+      if (!edge) continue;
+      auto it = manual_task_id_map_.find(edge.get());
+      if (it == manual_task_id_map_.end()) {
+        // Compiler-derived edges may reference TaskIds produced inside a
+        // closed ``pl.scope()`` that is no longer visible at this point in
+        // the manual scope.  ``CountManualDeps`` already skips these, so
+        // emit must be consistent: silently drop the out-of-scope edge.
+        continue;
+      }
+      if (std::get_if<int>(&it->second)) {
+        // Invariant: a ``manual_dep_edges`` entry should never resolve
+        // directly to a kernel-Call LHS (int-variant entry). The parser
+        // enforces that ``deps=[...]`` only accepts ``Scalar[TASK_ID]``
+        // Vars, so dep edges should always resolve to a TaskId binding
+        // (string variant) or a TaskId iter_arg array (vector variant).
+        INTERNAL_CHECK_SPAN(false, call->span_) << "Internal error: manual_dep_edge var '" << edge->name_hint_
+                                                << "' resolves to a kernel-Call LHS (int variant). Expected "
+                                                << "a Scalar[TASK_ID] Var (string variant).";
+      } else if (auto* names = std::get_if<std::vector<std::string>>(&it->second)) {
+        // Array-carry iter_arg: include every valid slot.
+        for (const auto& name : *names) {
           code_ << Indent() << "if (" << name << ".is_valid()) " << deps_arr << "[" << deps_cnt
                 << "++] = " << name << ";\n";
         }
+      } else {
+        const auto& name = std::get<std::string>(it->second);
+        // Any scalar TaskId may hold the ``PTO2TaskId::invalid()`` sentinel
+        // — an iter_arg carry on the first loop iteration, or a ``None``
+        // (``system.task_invalid``) loop-carry seed. Guard every entry with
+        // ``is_valid()``; the branch is a harmless always-true test for ids
+        // already known valid.
+        code_ << Indent() << "if (" << name << ".is_valid()) " << deps_arr << "[" << deps_cnt
+              << "++] = " << name << ";\n";
       }
-      code_ << Indent() << task_var << ".set_dependencies(" << deps_arr << ", " << deps_cnt << ");\n";
-      break;
     }
+    code_ << Indent() << task_var << ".set_dependencies(" << deps_arr << ", " << deps_cnt << ");\n";
   }
 
   void EmitDummyTask(const CallPtr& call, const std::string& tid_name) {
@@ -2000,7 +2043,7 @@ class OrchestrationStmtCodegen : public CodegenBase {
     const std::string task_var = "params_phase_fence_barrier_" + std::to_string(barrier_idx);
     const std::string deps_cnt = task_var + "_deps_count";
     const std::string outs_var = "phase_fence_barrier_" + std::to_string(barrier_idx) + "_outs";
-    const size_t dep_capacity = CountManualDeps(call);
+    const size_t dep_capacity = CountManualDeps(GetDependencyEdges(call));
     code_ << "\n";
     code_ << Indent() << "// Phase-fence barrier " << barrier_idx << ": dependency-only dummy task\n";
     EmitTaskParamsDecl(Indent(), task_var);
@@ -2265,7 +2308,8 @@ class OrchestrationStmtCodegen : public CodegenBase {
     }
   }
 
-  void GenerateFunctionCallCode(const CallPtr& call, const std::string& result_var) {
+  void GenerateFunctionCallCode(const CallPtr& call, const std::string& result_var,
+                                bool capture_plain_task_id = false) {
     const std::string& callee_name = call->op_->name_;
 
     FunctionPtr callee_func = program_->GetFunction(callee_name);
@@ -2273,12 +2317,12 @@ class OrchestrationStmtCodegen : public CodegenBase {
         << "Internal error: function '" << callee_name << "' not found after validation.";
 
     if (callee_func->func_type_ == FunctionType::Spmd) {
-      GenerateSpmdCallCode(call, callee_func);
+      GenerateSpmdCallCode(call, callee_func, capture_plain_task_id);
       return;
     }
 
     if (callee_func->func_type_ == FunctionType::Group) {
-      GenerateGroupCallCode(call, callee_func, callee_func);
+      GenerateGroupCallCode(call, callee_func, callee_func, capture_plain_task_id);
       return;
     }
 
@@ -2315,10 +2359,10 @@ class OrchestrationStmtCodegen : public CodegenBase {
 
     std::string submit_expr =
         CoreTypeToSubmitPrefix(core_type) + std::to_string(func_id) + ", " + task_var + ")";
-    EmitTaskSubmitAndBind(submit_expr, IsSubmitCall(call));
+    EmitTaskSubmitAndBind(submit_expr, ShouldCaptureTaskOutputs(call, capture_plain_task_id));
   }
 
-  void GenerateSpmdCallCode(const CallPtr& call, const FunctionPtr& spmd_func) {
+  void GenerateSpmdCallCode(const CallPtr& call, const FunctionPtr& spmd_func, bool capture_plain_task_id) {
     auto info = FindWrapperInnerCall(spmd_func);
     INTERNAL_CHECK(info.inner_call != nullptr && info.inner_callee != nullptr)
         << "Internal error: no inner call found in Spmd function '" << spmd_func->name_ << "'";
@@ -2331,7 +2375,8 @@ class OrchestrationStmtCodegen : public CodegenBase {
       // constant) — so BuildWrapperReorderedParams can map Group params ->
       // Spmd-wrapper params -> outer args even when an aliased-arg dedup shrank
       // the wrapper's param count below the Group's.
-      GenerateGroupCallCode(call, info.inner_callee, spmd_func, WrapperBridge{info.inner_call, spmd_func});
+      GenerateGroupCallCode(call, info.inner_callee, spmd_func, capture_plain_task_id,
+                            WrapperBridge{info.inner_call, spmd_func});
       return;
     }
 
@@ -2358,11 +2403,12 @@ class OrchestrationStmtCodegen : public CodegenBase {
 
     std::string submit_expr =
         CoreTypeToSubmitPrefix(core_type) + std::to_string(func_id) + ", " + task_var + ")";
-    EmitTaskSubmitAndBind(submit_expr, IsSubmitCall(call));
+    EmitTaskSubmitAndBind(submit_expr, ShouldCaptureTaskOutputs(call, capture_plain_task_id));
   }
 
   void GenerateGroupCallCode(const CallPtr& call, const FunctionPtr& group_func,
-                             const FunctionPtr& launch_func, const WrapperBridge& bridge = {}) {
+                             const FunctionPtr& launch_func, bool capture_plain_task_id,
+                             const WrapperBridge& bridge = {}) {
     std::string group_name = group_func->name_;
 
     auto info = FindGroupCallees(group_func);
@@ -2401,7 +2447,7 @@ class OrchestrationStmtCodegen : public CodegenBase {
 
       std::string submit_expr =
           CoreTypeToSubmitPrefix(CoreType::VECTOR) + std::to_string(aiv_id) + ", " + task_var + ")";
-      EmitTaskSubmitAndBind(submit_expr, IsSubmitCall(call));
+      EmitTaskSubmitAndBind(submit_expr, ShouldCaptureTaskOutputs(call, capture_plain_task_id));
       return;
     }
 
@@ -2451,7 +2497,7 @@ class OrchestrationStmtCodegen : public CodegenBase {
     EmitManualDeps(call, task_var);
 
     std::string submit_expr = "rt_submit_task(mixed_" + std::to_string(task_counter_) + ", " + task_var + ")";
-    EmitTaskSubmitAndBind(submit_expr, IsSubmitCall(call));
+    EmitTaskSubmitAndBind(submit_expr, ShouldCaptureTaskOutputs(call, capture_plain_task_id));
   }
 
   // --- Alias generation helpers ---
@@ -3115,6 +3161,7 @@ class OrchestrationStmtCodegen : public CodegenBase {
   std::vector<std::string> current_loop_slot_exprs_;
   std::map<std::string, std::vector<TupleElement>> tuple_var_to_elements_;
   std::map<const Var*, std::string> tuple_var_to_key_;
+  std::unordered_set<const Var*> compiler_dep_task_id_vars_;
   std::unordered_set<const Var*> declared_var_ptrs_;
   std::unordered_set<const Stmt*> batched_create_stmts_;
   std::unordered_set<const Var*> effective_uses_;

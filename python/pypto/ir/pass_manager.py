@@ -168,6 +168,7 @@ class PassManager:
             ("FoldNoOpReshape", lambda: passes.fold_no_op_reshape()),
             ("FuseCreateAssembleToSlice", lambda: passes.fuse_create_assemble_to_slice()),
             ("DeriveCallDirections", lambda: passes.derive_call_directions()),
+            ("AutoDeriveTaskDependencies", lambda: passes.auto_derive_task_dependencies()),
             ("ExpandManualPhaseFence", lambda: passes.expand_manual_phase_fence()),
             # Trace pld.tensor.alloc_window_buffer → pld.tensor.window → dispatch(device=r)
             # in each host_orch, materialise WindowBuffer back-references on

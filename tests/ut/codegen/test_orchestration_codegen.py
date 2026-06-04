@@ -4306,6 +4306,49 @@ class TestManualScopeCodegen:
             code,
         ), code
 
+    def test_manual_scope_merges_user_and_compiler_deps(self):
+        """Auto-deps: compiler deps merge with user deps in manual scope."""
+        backend.reset_for_testing()
+        backend.set_backend_type(BackendType.Ascend910B)
+
+        @pl.program
+        class Prog:
+            @pl.function(type=pl.FunctionType.InCore)
+            def fill(
+                self,
+                out: pl.Out[pl.Tensor[[64], pl.FP32]],
+            ) -> pl.Tensor[[64], pl.FP32]:
+                return out
+
+            @pl.function(type=pl.FunctionType.InCore)
+            def unrelated(self, x: pl.Tensor[[64], pl.FP32]) -> pl.Tensor[[64], pl.FP32]:
+                return x
+
+            @pl.function(type=pl.FunctionType.InCore)
+            def consume(self, x: pl.Tensor[[64], pl.FP32]) -> pl.Tensor[[64], pl.FP32]:
+                return x
+
+            @pl.function(type=pl.FunctionType.Orchestration)
+            def main(
+                self,
+                scratch: pl.Tensor[[64], pl.FP32],
+                other: pl.Tensor[[64], pl.FP32],
+            ) -> pl.Tensor[[64], pl.FP32]:
+                with pl.manual_scope():
+                    produced, producer_tid = pl.submit(self.fill, scratch)
+                    _unused, user_tid = pl.submit(self.unrelated, other)
+                    out, _ = pl.submit(self.consume, produced, deps=[user_tid])
+                return out
+
+        pm = PassManager.get_strategy(OptimizationStrategy.Default)
+        transformed = pm.run_passes(Prog)
+        code = _generate_orch_code(transformed)
+
+        assert "PTO2TaskId params_t2_deps[2];" in code
+        assert "params_t2_deps[params_t2_deps_count++] = user_tid;" in code
+        assert "params_t2_deps[params_t2_deps_count++] = producer_tid;" in code
+        assert code.count("params_t2.set_dependencies(") == 1
+
     def test_auto_scope_does_not_emit_task_id_capture(self):
         """Sanity: plain ``self.kernel(...)`` in auto scope stays fire-and-forget."""
         backend.reset_for_testing()
@@ -4475,6 +4518,117 @@ class TestManualScopeCodegen:
         assert "if (a_tid.is_valid()) params_t1_deps[params_t1_deps_count++] = a_tid;" in code, code
         assert "params_t1.set_dependencies(params_t1_deps, params_t1_deps_count);" in code, code
 
+    def test_compiler_derived_deps_in_auto_scope_emit_set_dependencies_without_manual_scope(self):
+        """AutoDeriveTaskDependencies may add explicit deps inside AUTO scopes.
+
+        The scope must stay AUTO (``PTO2_SCOPE()`` / OverlapMap still enabled),
+        while compiler-derived edges use the same ``set_dependencies`` codegen
+        path as user-written deps.
+        """
+        backend.reset_for_testing()
+        backend.set_backend_type(BackendType.Ascend910B)
+
+        @pl.program
+        class Prog:
+            @pl.function(type=pl.FunctionType.InCore)
+            def fill(
+                self,
+                out: pl.Out[pl.Tensor[[64], pl.FP32]],
+            ) -> pl.Tensor[[64], pl.FP32]:
+                return out
+
+            @pl.function(type=pl.FunctionType.InCore)
+            def consume(self, x: pl.Tensor[[64], pl.FP32]) -> pl.Tensor[[64], pl.FP32]:
+                return x
+
+            @pl.function(type=pl.FunctionType.Orchestration, auto_scope=False)
+            def main(self, scratch: pl.Tensor[[64], pl.FP32]) -> pl.Tensor[[64], pl.FP32]:
+                with pl.scope(mode=pl.ScopeMode.AUTO):
+                    produced, producer_tid = pl.submit(self.fill, scratch)
+                    out, _ = pl.submit(self.consume, produced)
+                return out
+
+        pm = PassManager.get_strategy(OptimizationStrategy.Default)
+        transformed = pm.run_passes(Prog)
+        code = _generate_orch_code(transformed)
+
+        assert "PTO2_SCOPE(PTO2ScopeMode::MANUAL)" not in code, code
+        assert "PTO2_SCOPE() {" in code, code
+        assert "PTO2TaskId producer_tid = task_0_outs.task_id();" in code, code
+        assert "PTO2TaskId params_t1_deps[1];" in code, code
+        assert "params_t1_deps[params_t1_deps_count++] = producer_tid;" in code, code
+        assert "params_t1.set_dependencies(params_t1_deps, params_t1_deps_count);" in code, code
+
+    def test_compiler_derived_deps_in_default_auto_scope_emit_set_dependencies(self):
+        """Default auto_scope=True gets analysis-only deps before materialization."""
+        backend.reset_for_testing()
+        backend.set_backend_type(BackendType.Ascend910B)
+
+        @pl.program
+        class Prog:
+            @pl.function(type=pl.FunctionType.InCore)
+            def fill(
+                self,
+                out: pl.Out[pl.Tensor[[64], pl.FP32]],
+            ) -> pl.Tensor[[64], pl.FP32]:
+                return out
+
+            @pl.function(type=pl.FunctionType.InCore)
+            def consume(self, x: pl.Tensor[[64], pl.FP32]) -> pl.Tensor[[64], pl.FP32]:
+                return x
+
+            @pl.function(type=pl.FunctionType.Orchestration)
+            def main(self, scratch: pl.Tensor[[64], pl.FP32]) -> pl.Tensor[[64], pl.FP32]:
+                produced, producer_tid = pl.submit(self.fill, scratch)
+                out, _ = pl.submit(self.consume, produced)
+                return out
+
+        pm = PassManager.get_strategy(OptimizationStrategy.Default)
+        transformed = pm.run_passes(Prog)
+        code = _generate_orch_code(transformed)
+
+        assert "PTO2_SCOPE(PTO2ScopeMode::MANUAL)" not in code, code
+        assert "PTO2_SCOPE() {" in code, code
+        assert "PTO2TaskId producer_tid = task_0_outs.task_id();" in code, code
+        assert "PTO2TaskId params_t1_deps[1];" in code, code
+        assert "params_t1_deps[params_t1_deps_count++] = producer_tid;" in code, code
+        assert "params_t1.set_dependencies(params_t1_deps, params_t1_deps_count);" in code, code
+
+    def test_compiler_derived_deps_for_plain_auto_call_capture_task_id(self):
+        """pl.at-style ordinary calls can be captured only when deps need them."""
+        backend.reset_for_testing()
+        backend.set_backend_type(BackendType.Ascend910B)
+
+        @pl.program
+        class Prog:
+            @pl.function(type=pl.FunctionType.InCore)
+            def fill(
+                self,
+                out: pl.Out[pl.Tensor[[64], pl.FP32]],
+            ) -> pl.Tensor[[64], pl.FP32]:
+                return out
+
+            @pl.function(type=pl.FunctionType.InCore)
+            def consume(self, x: pl.Tensor[[64], pl.FP32]) -> pl.Tensor[[64], pl.FP32]:
+                return x
+
+            @pl.function(type=pl.FunctionType.Orchestration)
+            def main(self, scratch: pl.Tensor[[64], pl.FP32]) -> pl.Tensor[[64], pl.FP32]:
+                produced = self.fill(scratch)
+                out = self.consume(produced)
+                return out
+
+        pm = PassManager.get_strategy(OptimizationStrategy.Default)
+        transformed = pm.run_passes(Prog)
+        code = _generate_orch_code(transformed)
+
+        assert "PTO2_SCOPE(PTO2ScopeMode::MANUAL)" not in code, code
+        assert "TaskOutputTensors task_0_outs = rt_submit_aiv_task(" in code, code
+        producer_tid = re.search(r"PTO2TaskId (\w+_tid) = task_0_outs\.task_id\(\);", code)
+        assert producer_tid, code
+        assert f"params_t1_deps[params_t1_deps_count++] = {producer_tid.group(1)};" in code, code
+        assert "params_t1.set_dependencies(params_t1_deps, params_t1_deps_count);" in code, code
+
     def test_auto_scope_task_id_array_slot_dep_uses_scalar_snapshot(self):
         """A TaskId array slot read is a valid explicit dep in auto scope."""
         backend.reset_for_testing()
@@ -4592,12 +4746,13 @@ class TestManualScopeCodegen:
         transformed = pm.run_passes(Prog)
         code = _generate_orch_code(transformed)
 
-        # MANUAL wrapper + both loops survive without extra auto-scope wrappers.
-        assert "PTO2_SCOPE(PTO2ScopeMode::MANUAL)" in code, code
+        # With AutoDeriveTaskDependencies, loop-carried hazards (stage1 in the
+        # inner pl.parallel loop produces dynamic producers) trigger a manual→auto
+        # scope fallback.  The scope survives as AUTO; the intra-iteration user
+        # dep still wires correctly.
+        assert "PTO2_SCOPE(PTO2ScopeMode::MANUAL)" not in code, code
         assert "for (int64_t i = 0; i < 4; i += 1)" in code, code
         assert "for (int64_t j = 0; j < 8; j += 1)" in code, code
-        assert code.count("PTO2_SCOPE() {") == 1, code
-        assert code.count("PTO2_SCOPE(PTO2ScopeMode::MANUAL)") == 1, code
 
         # The producer TaskId is preserved through windowed rewriting and is
         # threaded into the consumer dependency edge.
@@ -4682,11 +4837,11 @@ class TestManualScopeCodegen:
         transformed = pm.run_passes(Prog)
         code = _generate_orch_code(transformed)
 
-        assert "PTO2_SCOPE(PTO2ScopeMode::MANUAL)" in code, code
+        # With AutoDeriveTaskDependencies, loop-carried hazards trigger a
+        # manual→auto scope fallback (same as the seq-outer/parallel-inner case).
+        assert "PTO2_SCOPE(PTO2ScopeMode::MANUAL)" not in code, code
         assert "for (int64_t i = 0; i < 8; i += 1)" in code, code
         assert "for (int64_t j = 0; j < 4; j += 1)" in code, code
-        assert code.count("PTO2_SCOPE() {") == 1, code
-        assert code.count("PTO2_SCOPE(PTO2ScopeMode::MANUAL)") == 1, code
 
         # The producer TaskId is preserved through windowed rewriting and is
         # threaded into the consumer dependency edge.
@@ -4900,7 +5055,9 @@ class TestManualScopeCodegen:
         code = _generate_orch_code(transformed)
 
         assert "rt_submit_dummy_task" not in code, code
-        assert re.search(r"PTO2TaskId params_t\d+_deps\[5\];", code), code
+        # 4 user deps (tids[0..3]) + 1 user dep (seed_tid) + 1 compiler dep
+        # (WAW hazard seed_tid → iter tid from prior phase) = 6
+        assert re.search(r"PTO2TaskId params_t\d+_deps\[6\];", code), code
 
     def test_auto_scope_array_dep_does_not_emit_dummy_barrier(self):
         """Array deps outside manual_scope keep the existing explicit-deps lowering."""

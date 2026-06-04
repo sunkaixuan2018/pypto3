@@ -79,12 +79,11 @@ void IRVisitor::VisitExpr_(const CallPtr& op) {
     INTERNAL_CHECK_SPAN(op->args_[i], op->span_) << "Call has null argument at index " << i;
     VisitExpr(op->args_[i]);
   }
-  // Var-typed attrs ``manual_dep_edges`` / ``dump_vars`` reference Vars defined
-  // elsewhere in the IR. Treat them as real uses so analyses such as the
-  // unused-variable check don't flag a Var referenced only via ``deps=[tid]``
-  // or ``dumps=[t]`` / ``pl.dump_tag``.
+  // Var-typed attrs reference Vars defined elsewhere in the IR. Treat them as
+  // real uses so analyses such as the unused-variable check don't flag a Var
+  // referenced only via ``deps=[tid]`` or ``dumps=[t]`` / ``pl.dump_tag``.
   for (const auto& [k, v] : op->attrs_) {
-    if (k != kAttrManualDepEdges && k != kAttrDumpVars) continue;
+    if (k != kAttrManualDepEdges && k != kAttrCompilerManualDepEdges && k != kAttrDumpVars) continue;
     const auto* edges = std::any_cast<std::vector<VarPtr>>(&v);
     if (!edges) continue;
     for (const auto& e : *edges) {
