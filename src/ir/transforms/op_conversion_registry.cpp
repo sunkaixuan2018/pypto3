@@ -49,40 +49,6 @@ namespace {
 
 bool IsConstOne(const ExprPtr& expr) { return IsConstValue(expr, 1); }
 
-std::optional<std::vector<int64_t>> ExtractStaticShape(const std::vector<ExprPtr>& dims) {
-  std::vector<int64_t> shape;
-  shape.reserve(dims.size());
-  for (const auto& dim : dims) {
-    auto const_dim = As<ConstInt>(dim);
-    if (!const_dim) return std::nullopt;
-    shape.push_back(const_dim->value_);
-  }
-  return shape;
-}
-
-std::optional<std::vector<int64_t>> ExtractStaticShapeTuple(const ExprPtr& expr) {
-  auto tuple = As<MakeTuple>(expr);
-  if (!tuple) return std::nullopt;
-  return ExtractStaticShape(tuple->elements_);
-}
-
-bool IsRowToColVectorReshape(const std::vector<int64_t>& src_shape, const std::vector<int64_t>& dst_shape) {
-  if (src_shape.size() != 2 || dst_shape.size() != 2) return false;
-  return src_shape[0] == 1 && src_shape[1] > 1 && dst_shape[0] == src_shape[1] && dst_shape[1] == 1;
-}
-
-std::optional<std::vector<ExprPtr>> MakePackedScalarNDShape(const TileType& input_type, int64_t vector_len,
-                                                            const Span& span) {
-  const int64_t dtype_bytes = static_cast<int64_t>(input_type.dtype_.GetBit()) / 8;
-  if (dtype_bytes <= 0 || 32 % dtype_bytes != 0) return std::nullopt;
-  const int64_t lane_elems = 32 / dtype_bytes;
-  if (lane_elems <= 1 || vector_len % lane_elems != 0) return std::nullopt;
-  const int64_t rows = vector_len / lane_elems;
-  if (rows <= 1) return std::nullopt;
-  return std::vector<ExprPtr>{std::make_shared<ConstInt>(rows, DataType::INDEX, span),
-                              std::make_shared<ConstInt>(lane_elems, DataType::INDEX, span)};
-}
-
 // Detect row-broadcast pattern: [M, N] op [M, 1] or [M, 1] op [M, N]
 // Returns {wider_arg_idx, narrower_arg_idx} if broadcast detected, empty otherwise
 std::pair<int, int> DetectRowBroadcast(const std::vector<ExprPtr>& args) {
@@ -208,23 +174,6 @@ void OpConversionRegistry::RegisterBroadcastAndTransformOps() {
             << "tensor.reshape conversion expects 2 or 3 args (input, shape[, valid_shape]), got "
             << args.size();
         auto& op_reg = OpRegistry::GetInstance();
-
-        auto input_tile_type = As<TileType>(args[0]->GetType());
-        auto src_shape = input_tile_type ? ExtractStaticShape(input_tile_type->shape_) : std::nullopt;
-        auto dst_shape = ExtractStaticShapeTuple(args[1]);
-        if (args.size() == 2 && src_shape && dst_shape && IsRowToColVectorReshape(*src_shape, *dst_shape)) {
-          auto scalar_nd_shape = MakePackedScalarNDShape(*input_tile_type, (*src_shape)[1], span);
-          if (scalar_nd_shape) {
-            std::vector<StmtPtr> prologue;
-            auto scalar_nd_call =
-                op_reg.Create("tile.reshape", {args[0], MakeShapeTuple(*scalar_nd_shape, span)}, {}, span);
-            auto scalar_nd_var = std::make_shared<Var>("reshape_scalar_nd", scalar_nd_call->GetType(), span);
-            prologue.push_back(std::make_shared<AssignStmt>(scalar_nd_var, scalar_nd_call, span));
-
-            auto reshape_call = op_reg.Create("tile.reshape", {scalar_nd_var, args[1]}, kwargs, span);
-            return ConversionResult{std::move(prologue), reshape_call};
-          }
-        }
 
         return ConversionResult{op_reg.Create("tile.reshape", {args[0], args[1]}, kwargs, span)};
       });

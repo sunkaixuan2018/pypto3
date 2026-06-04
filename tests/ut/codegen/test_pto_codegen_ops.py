@@ -916,7 +916,7 @@ class TestBroadcastOpsCodegen:
             raise AssertionError("no pto.trowexpand ins(...) line in MLIR")
 
     def test_row_vector_reshape_feeding_row_expand_mul_materializes(self):
-        """A tensor [1, K] -> [K, 1] vector reshape must pack through scalar-ND layout."""
+        """A tensor [1, K] -> [K, 1] vector reshape must not repack through scalar-ND layout."""
 
         @pl.program
         class Prog:
@@ -934,13 +934,10 @@ class TestBroadcastOpsCodegen:
             f"tensor reshape [1,K] -> [K,1] feeding row_expand_mul is not a matrix transpose; got:\n{mlir}"
         )
         treshape_lines = [line for line in mlir.splitlines() if "pto.treshape" in line]
-        assert len(treshape_lines) >= 2, (
-            "tensor reshape [1,K] -> [K,1] feeding row_expand_mul must first pack [1,K] into "
-            "32-byte scalar-ND rows, then reshape to DN [K,1]; got:\n"
+        assert not any("rows=2, cols=8" in line for line in treshape_lines), (
+            "tensor reshape [1,K] -> [K,1] feeding row_expand_mul must not repack through "
+            "32-byte scalar-ND rows; got:\n"
             f"{mlir}"
-        )
-        assert any("rows=2, cols=8" in line and "blayout=row_major" in line for line in treshape_lines), (
-            f"FP32 K=16 row vector should first reshape to packed scalar-ND [2,8]; got:\n{mlir}"
         )
         assert any("rows=16, cols=1" in line and "blayout=col_major" in line for line in treshape_lines), (
             f"final reshape result must carry a [K,1] column-vector output type; got:\n{mlir}"
@@ -970,6 +967,31 @@ class TestBroadcastOpsCodegen:
         )
         assert not any("pto.alloc_tile :" in line for line in mlir.splitlines()), (
             f"level-3 alloc_tile operations must carry addr and valid shape operands; got:\n{mlir}"
+        )
+        assert "pto.trowexpandmul" in mlir, f"row_expand_mul should generate pto.trowexpandmul, got:\n{mlir}"
+
+    def test_k64_row_vector_cast_feeding_row_expand_mul_avoids_scalar_nd_pack(self):
+        """The raceB K=64 row generator must not feed row_expand_mul via an [8,8] packed view."""
+
+        @pl.program
+        class Prog:
+            @pl.function(type=pl.FunctionType.InCore)
+            def kernel(self, src: pl.Tensor[[64, 32], pl.FP32]) -> pl.Tensor[[64, 32], pl.FP32]:
+                idx: pl.Tensor[[1, 64], pl.INT32] = pl.tensor.ci(0, [1, 64], dtype=pl.INT32)
+                idx_col: pl.Tensor[[64, 1], pl.INT32] = pl.tensor.reshape(idx, [64, 1])
+                row_64x1: pl.Tensor[[64, 1], pl.FP32] = pl.tensor.cast(idx_col, target_type=pl.FP32)
+                return pl.row_expand_mul(src, row_64x1)
+
+        mlir = self._generate_mlir(Prog)
+        treshape_lines = [line for line in mlir.splitlines() if "pto.treshape" in line]
+        assert not any("rows=8, cols=8" in line for line in treshape_lines), (
+            "K=64 row arange feeding row_expand_mul must not be repacked through [8,8]; "
+            "fresh L2 dump_row_cmp showed that path zeroes rows 60-63. Got:\n"
+            f"{mlir}"
+        )
+        tcvt_lines = [line for line in mlir.splitlines() if "pto.tcvt" in line]
+        assert any("rows=1, cols=64" in line and "blayout=row_major" in line for line in tcvt_lines), (
+            f"K=64 cast should happen in a [1,64] row-major view; got:\n{mlir}"
         )
         assert "pto.trowexpandmul" in mlir, f"row_expand_mul should generate pto.trowexpandmul, got:\n{mlir}"
 
