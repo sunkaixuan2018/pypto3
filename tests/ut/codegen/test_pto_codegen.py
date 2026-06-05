@@ -2201,6 +2201,15 @@ def test_pto_codegen_transpose_dynamic_valid_shape_uses_distinct_output_buffer()
     src_ssa, _tmp_ssa, dst_ssa = match.groups()
     assert src_ssa != dst_ssa, f"pto.ttrans must not reuse input SSA as dynamic-valid output: {line}"
     assert "valid=?" in line, f"transpose output should carry dynamic valid_shape: {line}"
+    dst_alloc_lines = [
+        alloc_line
+        for alloc_line in _get_alloc_tile_lines(mlir_code)
+        if alloc_line.startswith(f"{dst_ssa} = pto.alloc_tile")
+    ]
+    assert len(dst_alloc_lines) == 1, f"Expected one alloc_tile for transpose output {dst_ssa}: {mlir_code}"
+    assert "valid=?" in dst_alloc_lines[0], (
+        f"transpose output alloc_tile must match the dynamic-valid ttrans output type: {dst_alloc_lines[0]}"
+    )
 
 
 def test_pto_codegen_slice_static_subwindow_binds_subview_result():
