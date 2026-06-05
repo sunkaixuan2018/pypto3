@@ -313,6 +313,10 @@ class PTOCodegen : public CodegenBase {
                               const std::string& addr_ssa = "", const std::string& valid_row_ssa = "",
                               const std::string& valid_col_ssa = "");
 
+  /// Allocate a new tile buffer matching the current assignment result TileType.
+  /// Preserves dynamic valid_shape operands.
+  std::string AllocNewTileBufForCurrentResult(const std::string& name_hint = "");
+
   /**
    * @brief Emit alloc_tile for a tile variable before its first use
    *

@@ -1184,6 +1184,14 @@ std::string PTOCodegen::AllocNewTileBuf(const std::string& tile_buf_type_string,
   return name;
 }
 
+std::string PTOCodegen::AllocNewTileBufForCurrentResult(const std::string& name_hint) {
+  INTERNAL_CHECK(fs_.current_result_tile_type)
+      << "Internal error: current result TileType is required to allocate a matching tile buffer";
+  AllocTileFields fields = ComputeAllocTileFields(fs_.current_result_tile_type);
+  return AllocNewTileBuf(fields.type_str, name_hint, fields.addr_ssa, fields.valid_row_ssa,
+                         fields.valid_col_ssa);
+}
+
 void PTOCodegen::SetCurrentResultBuf(const std::string& buf) { fs_.current_result_buf = buf; }
 
 void PTOCodegen::RegisterTileBufType(const std::string& ssa_name, const std::string& type_string) {

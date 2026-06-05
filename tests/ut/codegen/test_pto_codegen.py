@@ -2170,6 +2170,39 @@ def test_pto_codegen_slice_full_window_dynamic_valid_shape_uses_subview_valid():
     )
 
 
+def test_pto_codegen_transpose_dynamic_valid_shape_uses_distinct_output_buffer():
+    """A transpose view that changes valid_shape must not use the same SSA as input and output.
+
+    PTOAS rejects a single tile_buf SSA annotated with two different types in the same
+    ``pto.ttrans`` line, e.g. ``!pto.tile_buf<vec, 1x16xf32>`` vs
+    ``!pto.tile_buf<vec, 1x16xf32, valid=?x?>``.
+    """
+
+    @pl.program
+    class RowVectorReshapeProgram:
+        @pl.function(type=pl.FunctionType.InCore)
+        def kernel(
+            self,
+            src: pl.Tensor[[1, 16], pl.FP32],
+            valid_rows: pl.Scalar[pl.INDEX],
+            out: pl.Out[pl.Tensor[[16, 1], pl.FP32]],
+        ) -> pl.Tensor[[16, 1], pl.FP32]:
+            row: pl.Tile[[1, 16], pl.FP32] = pl.load(src, [0, 0], [1, 16])
+            col = pl.tile.reshape(row, [16, 1], [valid_rows, 1])
+            return pl.store(col, [0, 0], out)
+
+    mlir_code = _generate_default_mlir(RowVectorReshapeProgram)
+    ttrans_lines = [line.strip() for line in mlir_code.splitlines() if "pto.ttrans" in line]
+    assert len(ttrans_lines) == 1, f"Expected one pto.ttrans, got: {ttrans_lines}"
+
+    line = ttrans_lines[0]
+    match = re.search(r"pto\.ttrans ins\((%[\w.]+), (%[\w.]+).*?\) outs\((%[\w.]+)", line)
+    assert match, f"Could not parse pto.ttrans operands: {line}"
+    src_ssa, _tmp_ssa, dst_ssa = match.groups()
+    assert src_ssa != dst_ssa, f"pto.ttrans must not reuse input SSA as dynamic-valid output: {line}"
+    assert "valid=?" in line, f"transpose output should carry dynamic valid_shape: {line}"
+
+
 def test_pto_codegen_slice_static_subwindow_binds_subview_result():
     """Static subwindow slice without explicit valid_shape should remain a
     true pto.subview SSA result and avoid a materializing pto.tmov."""
