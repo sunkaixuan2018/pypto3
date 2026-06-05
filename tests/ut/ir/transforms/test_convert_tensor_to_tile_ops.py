@@ -408,8 +408,15 @@ class TestConvertTensorToTileOps:
             return ib.let("y", tensor_ops.reshape(ins[0], [16, 1], [extras[0], 1]))
 
         def expected_body(ib, tiles, extras):
-            transposed = ib.let("reshape_tile", tile_ops.transpose(tiles[0], 0, 1))
-            return ib.let("y_tile", tile_ops.set_validshape(transposed, extras[0], 1))
+            return ib.let(
+                "y_tile",
+                ir.create_op_call(
+                    "tile.transpose",
+                    [tiles[0], ir.ConstInt(0, DataType.INDEX), ir.ConstInt(1, DataType.INDEX)],
+                    {"valid_rows": extras[0], "valid_cols": ir.ConstInt(1, DataType.INDEX)},
+                    ir.Span.unknown(),
+                ),
+            )
 
         before = _make_before(
             in_specs=in_specs,

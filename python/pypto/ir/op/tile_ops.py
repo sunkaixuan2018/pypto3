@@ -2200,6 +2200,8 @@ def transpose(
     axis1: int | ConstInt,
     axis2: int | ConstInt,
     tmp: Expr | None = None,
+    valid_rows: int | Expr | None = None,
+    valid_cols: int | Expr | None = None,
     span: Span | None = None,
 ) -> Call:
     """Transpose tile by swapping two axes.
@@ -2227,7 +2229,17 @@ def transpose(
     args: list[Expr] = [tile, axis1_expr, axis2_expr]
     if tmp is not None:
         args.append(tmp)
-    return _ir_core.create_op_call("tile.transpose", args, {}, actual_span)
+    kwargs: dict[str, Expr] = {}
+    if valid_rows is not None or valid_cols is not None:
+        if valid_rows is None or valid_cols is None:
+            raise ValueError(
+                "tile.transpose internal valid_shape metadata requires both valid_rows and valid_cols"
+            )
+        kwargs = {
+            "valid_rows": _normalize_expr(valid_rows, actual_span, int_dtype=DataType.INDEX),
+            "valid_cols": _normalize_expr(valid_cols, actual_span, int_dtype=DataType.INDEX),
+        }
+    return _ir_core.create_op_call("tile.transpose", args, kwargs, actual_span)
 
 
 def set_validshape(

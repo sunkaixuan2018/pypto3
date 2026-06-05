@@ -2533,6 +2533,63 @@ class TestFlattenTileNdTo2DStandaloneTranspose:
         creates = [c for c in calls if c.op.name == "tile.create"]
         assert any(cast(ir.TileType, c.type).shape == [3, 8] for c in creates)
 
+    def test_2d_transpose_preserves_internal_valid_shape_kwargs(self):
+        """Scratch materialization keeps compiler-generated transpose valid_shape metadata."""
+        span = ir.Span.unknown()
+        ib = IRBuilder()
+        with ib.program("main") as prog:
+            gvar = prog.declare_function("main_incore_0")
+            prog.declare_function("main")
+            with ib.function("main_incore_0", type=ir.FunctionType.InCore) as f:
+                x = f.param("x", ir.TensorType([1, 16], DataType.FP32))
+                valid_rows = f.param("valid_rows", ir.ScalarType(DataType.INDEX))
+                out_0 = f.param(
+                    "out_0",
+                    ir.TensorType([16, 1], DataType.FP32),
+                    direction=ir.ParamDirection.Out,
+                )
+                f.return_type(ir.TensorType([16, 1], DataType.FP32))
+                x_tile = ib.let("x_tile", tile_ops.load(x, [0, 0], [1, 16], span=span))
+                transpose = ir.create_op_call(
+                    "tile.transpose",
+                    [x_tile, ir.ConstInt(0, DataType.INDEX), ir.ConstInt(1, DataType.INDEX)],
+                    {"valid_rows": valid_rows, "valid_cols": ir.ConstInt(1, DataType.INDEX)},
+                    span,
+                )
+                y_tile = ib.let("y_tile", transpose)
+                out = ib.let("out_0", tile_ops.store(y_tile, [0, 0], out_0, span=span))
+                ib.return_stmt(out)
+            prog.add_function(f.get_result())
+
+            with ib.function("main") as f:
+                x = f.param("x", ir.TensorType([1, 16], DataType.FP32))
+                valid_rows = f.param("valid_rows", ir.ScalarType(DataType.INDEX))
+                f.return_type(ir.TensorType([16, 1], DataType.FP32))
+                out_0 = ib.let("out_0", tensor_ops.create([16, 1], DataType.FP32))
+                y = ib.let("y", ir.Call(gvar, [x, valid_rows, out_0], span))
+                ib.return_stmt(y)
+            prog.add_function(f.get_result())
+        before = prog.get_result()
+
+        after = passes.flatten_tile_nd_to_2d()(before)
+        after_func = after.get_function("main_incore_0")
+        assert after_func is not None
+        calls = self._all_calls(after_func)
+
+        transposes = [c for c in calls if c.op.name == "tile.transpose"]
+        assert len(transposes) == 1
+        t = transposes[0]
+        assert len(t.args) == 4
+        assert set(t.kwargs) == {"valid_rows", "valid_cols"}
+        assert isinstance(t.kwargs["valid_rows"], ir.Var)
+        assert isinstance(t.kwargs["valid_cols"], ir.ConstInt)
+
+        res_type = cast(ir.TileType, t.type)
+        assert res_type.tile_view is not None
+        assert len(res_type.tile_view.valid_shape) == 2
+        assert isinstance(res_type.tile_view.valid_shape[0], ir.Var)
+        assert isinstance(res_type.tile_view.valid_shape[1], ir.ConstInt)
+
     def test_batch_axis_transpose_rejected(self):
         """Transposing a batch axis (axes not {ndim-2, ndim-1}) is a clear user error."""
 

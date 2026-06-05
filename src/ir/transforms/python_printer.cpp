@@ -926,10 +926,12 @@ void IRPythonPrinter::VisitExpr_(const CallPtr& op) {
           stream_ << "min";
           break;
       }
+    } else if (value.type() == typeid(ExprPtr)) {
+      VisitExpr(AnyCast<ExprPtr>(value, "printing kwarg: " + key));
     } else {
       throw TypeError("Invalid kwarg type for key: " + key +
                       ", expected int, bool, std::string, double, float, DataType, MemorySpace, "
-                      "TensorLayout, or PadValue, but got " +
+                      "TensorLayout, PadValue, or ExprPtr, but got " +
                       DemangleTypeName(value.type().name()));
     }
   }

@@ -177,15 +177,12 @@ void OpConversionRegistry::RegisterBroadcastAndTransformOps() {
             << "tensor.reshape conversion expects 2 or 3 args (input, shape[, valid_shape]), got "
             << args.size();
         auto& op_reg = OpRegistry::GetInstance();
-        auto finish_with_valid_shape = [&](const ExprPtr& tile) -> ConversionResult {
-          if (args.size() != 3) {
-            return ConversionResult{tile};
-          }
-
+        auto get_valid_shape_2d = [&]() -> std::optional<std::pair<ExprPtr, ExprPtr>> {
+          if (args.size() != 3) return std::nullopt;
           auto valid_shape_tuple_type = As<TupleType>(args[2]->GetType());
           INTERNAL_CHECK_SPAN(valid_shape_tuple_type && valid_shape_tuple_type->types_.size() == 2, span)
               << "tensor.reshape conversion expects 2D valid_shape (args[2]) before lowering through "
-                 "tile.set_validshape, got "
+                 "tile ops, got "
               << args[2]->GetType()->TypeName();
 
           ExprPtr valid_rows = std::make_shared<TupleGetItemExpr>(args[2], 0, span);
@@ -193,17 +190,24 @@ void OpConversionRegistry::RegisterBroadcastAndTransformOps() {
           if (auto valid_shape_tuple = As<MakeTuple>(args[2])) {
             INTERNAL_CHECK_SPAN(valid_shape_tuple->elements_.size() == 2, span)
                 << "tensor.reshape conversion expects 2D valid_shape (args[2]) before lowering through "
-                   "tile.set_validshape, got "
+                   "tile ops, got "
                 << valid_shape_tuple->elements_.size() << " elements";
             valid_rows = valid_shape_tuple->elements_[0];
             valid_cols = valid_shape_tuple->elements_[1];
           }
+          return std::make_pair(valid_rows, valid_cols);
+        };
+        auto finish_reshape_with_valid_shape = [&](const ExprPtr& tile) -> ConversionResult {
+          auto valid_shape = get_valid_shape_2d();
+          if (!valid_shape.has_value()) {
+            return ConversionResult{tile};
+          }
 
           auto tile_var = std::make_shared<Var>("reshape_tile", tile->GetType(), span);
           std::vector<StmtPtr> prologue = {std::make_shared<AssignStmt>(tile_var, tile, span)};
-          return ConversionResult{
-              std::move(prologue),
-              op_reg.Create("tile.set_validshape", {tile_var, valid_rows, valid_cols}, span)};
+          return ConversionResult{std::move(prologue),
+                                  op_reg.Create("tile.set_validshape",
+                                                {tile_var, valid_shape->first, valid_shape->second}, span)};
         };
 
         auto input_tile_type = As<TileType>(args[0]->GetType());
@@ -218,13 +222,21 @@ void OpConversionRegistry::RegisterBroadcastAndTransformOps() {
               dst_rows->value_ == src_cols->value_ && dst_cols->value_ == 1) {
             auto axis0 = std::make_shared<ConstInt>(0, DataType::INDEX, span);
             auto axis1 = std::make_shared<ConstInt>(1, DataType::INDEX, span);
-            auto transpose_call = op_reg.Create("tile.transpose", {args[0], axis0, axis1}, span);
-            return finish_with_valid_shape(transpose_call);
+            std::vector<std::pair<std::string, std::any>> transpose_kwargs;
+            if (auto valid_shape = get_valid_shape_2d(); valid_shape.has_value()) {
+              transpose_kwargs = {
+                  {"valid_rows", valid_shape->first},
+                  {"valid_cols", valid_shape->second},
+              };
+            }
+            auto transpose_call =
+                op_reg.Create("tile.transpose", {args[0], axis0, axis1}, transpose_kwargs, span);
+            return ConversionResult{transpose_call};
           }
         }
 
         auto reshape_call = op_reg.Create("tile.reshape", {args[0], args[1]}, kwargs, span);
-        return finish_with_valid_shape(reshape_call);
+        return finish_reshape_with_valid_shape(reshape_call);
       });
 
   // tensor.transpose → tile.transpose(input, axis1, axis2). The pto.ttrans scratch is a pure

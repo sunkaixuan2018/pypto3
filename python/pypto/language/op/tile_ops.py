@@ -1479,7 +1479,14 @@ def reshape(tile: Tile, shape: Sequence[IntLike]) -> Tile:
     return Tile(expr=call_expr)
 
 
-def transpose(tile: Tile, axis1: int, axis2: int, tmp_tile: Tile | None = None) -> Tile:
+def transpose(
+    tile: Tile,
+    axis1: int,
+    axis2: int,
+    tmp_tile: Tile | None = None,
+    valid_rows: IntLike | None = None,
+    valid_cols: IntLike | None = None,
+) -> Tile:
     """Transpose tile by swapping two axes.
 
     The ``pto.ttrans`` scratch buffer is a codegen detail allocated later by
@@ -1497,7 +1504,15 @@ def transpose(tile: Tile, axis1: int, axis2: int, tmp_tile: Tile | None = None) 
     """
     tile_expr = tile.unwrap()
     tmp_expr = tmp_tile.unwrap() if tmp_tile is not None else None
-    call_expr = _ir_ops.transpose(tile_expr, axis1, axis2, tmp=tmp_expr)
+    kwargs = {}
+    if valid_rows is not None or valid_cols is not None:
+        if valid_rows is None or valid_cols is None:
+            raise ValueError(
+                "pl.tile.transpose internal valid_shape metadata requires both valid_rows and valid_cols"
+            )
+        kwargs["valid_rows"] = valid_rows.unwrap() if isinstance(valid_rows, Scalar) else valid_rows
+        kwargs["valid_cols"] = valid_cols.unwrap() if isinstance(valid_cols, Scalar) else valid_cols
+    call_expr = _ir_ops.transpose(tile_expr, axis1, axis2, tmp=tmp_expr, **kwargs)
     return Tile(expr=call_expr)
 
 

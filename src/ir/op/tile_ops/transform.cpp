@@ -373,6 +373,22 @@ TypePtr DeduceTileTransposeType(const std::vector<ExprPtr>& args,
       std::swap(tile_view.valid_shape[axis1], tile_view.valid_shape[axis2]);
     }
   }
+  ExprPtr explicit_valid_rows;
+  ExprPtr explicit_valid_cols;
+  for (const auto& [key, value] : kwargs) {
+    if (key == "valid_rows") {
+      explicit_valid_rows = std::any_cast<ExprPtr>(value);
+    } else if (key == "valid_cols") {
+      explicit_valid_cols = std::any_cast<ExprPtr>(value);
+    }
+  }
+  CHECK(static_cast<bool>(explicit_valid_rows) == static_cast<bool>(explicit_valid_cols))
+      << "tile.transpose internal valid_shape kwargs must provide both valid_rows and valid_cols";
+  if (explicit_valid_rows) {
+    CHECK(ndim == 2)
+        << "tile.transpose internal valid_shape kwargs are only supported for 2D output, got rank " << ndim;
+    tile_view.valid_shape = {explicit_valid_rows, explicit_valid_cols};
+  }
   tile_view.blayout = InferTileLayoutFromShape(new_shape);
   return std::make_shared<TileType>(new_shape, input_type->dtype_, std::nullopt, tile_view);
 }

@@ -1989,8 +1989,8 @@ std::vector<StmtPtr> TransformBody(const std::vector<StmtPtr>& stmts, FlattenCon
         auto scratch_var = std::make_shared<Var>("transpose_tmp", scratch_create->GetType(), span);
         result.push_back(std::make_shared<AssignStmt>(scratch_var, scratch_create, span));
 
-        auto t_call =
-            op_registry.Create("tile.transpose", {in, call->args_[1], call->args_[2], scratch_var}, span);
+        auto t_call = op_registry.Create("tile.transpose", {in, call->args_[1], call->args_[2], scratch_var},
+                                         call->kwargs_, span);
         auto t_var = std::make_shared<Var>(assign->var_->name_hint_, t_call->GetType(), assign->var_->span_);
         result.push_back(std::make_shared<AssignStmt>(t_var, t_call, assign->span_));
         ctx.Insert(assign->var_, t_var);

@@ -10,12 +10,14 @@
 
 import enum
 from collections.abc import Callable, Mapping, Sequence
-from typing import TYPE_CHECKING, Any, Final, overload
+from typing import TYPE_CHECKING, Any, Final, TypeAlias, overload
 
 from pypto import DataType
 
 if TYPE_CHECKING:
     from pypto.language.typing.scalar import Scalar
+
+KwargValue: TypeAlias = int | bool | str | float | DataType | "MemorySpace" | "PadValue" | "Expr"
 
 class Span:
     """Source location information tracking file, line, and column positions."""
@@ -1307,7 +1309,7 @@ class Call(Expr):
           :attr:`arg_directions` shortcut for typed access).
         """
 
-    kwargs: Final[Mapping[str, int | bool | str | float | DataType | MemorySpace | PadValue]]
+    kwargs: Final[Mapping[str, KwargValue]]
     """Keyword arguments (metadata)."""
 
     @overload
@@ -1345,7 +1347,7 @@ class Call(Expr):
         self,
         op: Op,
         args: Sequence[Expr],
-        kwargs: Mapping[str, int | bool | str | float | DataType | MemorySpace | PadValue],
+        kwargs: Mapping[str, KwargValue],
         span: Span,
     ) -> None:
         """Create a function call expression with kwargs.
@@ -1363,7 +1365,7 @@ class Call(Expr):
         self,
         op: Op,
         args: Sequence[Expr],
-        kwargs: Mapping[str, int | bool | str | float | DataType | MemorySpace | PadValue],
+        kwargs: Mapping[str, KwargValue],
         type: Type,
         span: Span,
     ) -> None:
@@ -1383,7 +1385,7 @@ class Call(Expr):
         self,
         op: Op,
         args: Sequence[Expr],
-        kwargs: Mapping[str, int | bool | str | float | DataType | MemorySpace | PadValue],
+        kwargs: Mapping[str, KwargValue],
         attrs: Mapping[str, object] | Sequence[tuple[str, object]] | None,
         type: Type,
         span: Span,
@@ -1447,7 +1449,7 @@ class Submit(Expr):
     def attrs(self) -> Mapping[str, Any]:
         """Compiler-internal node metadata (see :attr:`Call.attrs`)."""
 
-    kwargs: Final[Mapping[str, int | bool | str | float | DataType | MemorySpace | PadValue]]
+    kwargs: Final[Mapping[str, KwargValue]]
     """Keyword arguments (metadata)."""
 
     @overload
@@ -1476,7 +1478,7 @@ class Submit(Expr):
         op: Op,
         args: Sequence[Expr],
         deps: Sequence[Expr],
-        kwargs: Mapping[str, int | bool | str | float | DataType | MemorySpace | PadValue],
+        kwargs: Mapping[str, KwargValue],
         attrs: Mapping[str, object] | Sequence[tuple[str, object]] | None,
         type: Type,
         span: Span,
@@ -2916,7 +2918,7 @@ def create_op_call(op_name: str, args: Sequence[Expr], span: Span) -> Call:
 def create_op_call(
     op_name: str,
     args: Sequence[Expr],
-    kwargs: Mapping[str, int | bool | str | float | DataType | MemorySpace | PadValue],
+    kwargs: Mapping[str, KwargValue],
     span: Span,
 ) -> Call:
     """Create a Call expression with args and kwargs.
