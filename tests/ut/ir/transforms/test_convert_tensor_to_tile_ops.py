@@ -399,6 +399,62 @@ class TestConvertTensorToTileOps:
         )
         _assert_convert_equal(before, expected)
 
+    def test_row_vector_reshape_preserves_valid_shape(self):
+        """3-arg tensor.reshape keeps valid_shape when lowered through tile.transpose."""
+        in_specs: list[InSpec] = [("x", [1, 16], DataType.FP32)]
+        extra_specs: list[ExtraSpec] = [("valid_rows", ir.ScalarType(DataType.INDEX))]
+
+        def before_body(ib, ins, extras):
+            return ib.let("y", tensor_ops.reshape(ins[0], [16, 1], [extras[0], 1]))
+
+        def expected_body(ib, tiles, extras):
+            transposed = ib.let("reshape_tile", tile_ops.transpose(tiles[0], 0, 1))
+            return ib.let("y_tile", tile_ops.set_validshape(transposed, extras[0], 1))
+
+        before = _make_before(
+            in_specs=in_specs,
+            out_shape=[16, 1],
+            out_dtype=DataType.FP32,
+            body=before_body,
+            extra_specs=extra_specs,
+        )
+        expected = _make_expected(
+            in_specs=in_specs,
+            out_shape=[16, 1],
+            out_dtype=DataType.FP32,
+            body=expected_body,
+            extra_specs=extra_specs,
+        )
+        _assert_convert_equal(before, expected)
+
+    def test_reshape_fallback_preserves_valid_shape(self):
+        """3-arg tensor.reshape keeps valid_shape when lowered through tile.reshape."""
+        in_specs: list[InSpec] = [("x", [4, 4], DataType.FP32)]
+        extra_specs: list[ExtraSpec] = [("valid_rows", ir.ScalarType(DataType.INDEX))]
+
+        def before_body(ib, ins, extras):
+            return ib.let("y", tensor_ops.reshape(ins[0], [2, 8], [extras[0], 8]))
+
+        def expected_body(ib, tiles, extras):
+            reshaped = ib.let("reshape_tile", tile_ops.reshape(tiles[0], [2, 8]))
+            return ib.let("y_tile", tile_ops.set_validshape(reshaped, extras[0], 8))
+
+        before = _make_before(
+            in_specs=in_specs,
+            out_shape=[2, 8],
+            out_dtype=DataType.FP32,
+            body=before_body,
+            extra_specs=extra_specs,
+        )
+        expected = _make_expected(
+            in_specs=in_specs,
+            out_shape=[2, 8],
+            out_dtype=DataType.FP32,
+            body=expected_body,
+            extra_specs=extra_specs,
+        )
+        _assert_convert_equal(before, expected)
+
     def test_put_emits_tile_create_plus_tile_put(self):
         """pld.tensor.put lowers to tile.create(stage) + pld.tile.put(dst, peer, src, stage).
 

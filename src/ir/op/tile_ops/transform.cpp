@@ -363,7 +363,16 @@ TypePtr DeduceTileTransposeType(const std::vector<ExprPtr>& args,
   std::swap(new_shape[axis1], new_shape[axis2]);
 
   TileView tile_view;
-  tile_view.valid_shape = new_shape;
+  if (input_type->tile_view_.has_value()) {
+    const auto& input_valid_shape = input_type->tile_view_->valid_shape;
+    if (!input_valid_shape.empty()) {
+      CHECK(input_valid_shape.size() == ndim)
+          << "tile.transpose: input valid_shape rank (" << input_valid_shape.size()
+          << ") must match tile rank (" << ndim << ")";
+      tile_view.valid_shape = input_valid_shape;
+      std::swap(tile_view.valid_shape[axis1], tile_view.valid_shape[axis2]);
+    }
+  }
   tile_view.blayout = InferTileLayoutFromShape(new_shape);
   return std::make_shared<TileType>(new_shape, input_type->dtype_, std::nullopt, tile_view);
 }

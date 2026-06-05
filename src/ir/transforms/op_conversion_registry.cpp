@@ -177,6 +177,34 @@ void OpConversionRegistry::RegisterBroadcastAndTransformOps() {
             << "tensor.reshape conversion expects 2 or 3 args (input, shape[, valid_shape]), got "
             << args.size();
         auto& op_reg = OpRegistry::GetInstance();
+        auto finish_with_valid_shape = [&](const ExprPtr& tile) -> ConversionResult {
+          if (args.size() != 3) {
+            return ConversionResult{tile};
+          }
+
+          auto valid_shape_tuple_type = As<TupleType>(args[2]->GetType());
+          INTERNAL_CHECK_SPAN(valid_shape_tuple_type && valid_shape_tuple_type->types_.size() == 2, span)
+              << "tensor.reshape conversion expects 2D valid_shape (args[2]) before lowering through "
+                 "tile.set_validshape, got "
+              << args[2]->GetType()->TypeName();
+
+          ExprPtr valid_rows = std::make_shared<TupleGetItemExpr>(args[2], 0, span);
+          ExprPtr valid_cols = std::make_shared<TupleGetItemExpr>(args[2], 1, span);
+          if (auto valid_shape_tuple = As<MakeTuple>(args[2])) {
+            INTERNAL_CHECK_SPAN(valid_shape_tuple->elements_.size() == 2, span)
+                << "tensor.reshape conversion expects 2D valid_shape (args[2]) before lowering through "
+                   "tile.set_validshape, got "
+                << valid_shape_tuple->elements_.size() << " elements";
+            valid_rows = valid_shape_tuple->elements_[0];
+            valid_cols = valid_shape_tuple->elements_[1];
+          }
+
+          auto tile_var = std::make_shared<Var>("reshape_tile", tile->GetType(), span);
+          std::vector<StmtPtr> prologue = {std::make_shared<AssignStmt>(tile_var, tile, span)};
+          return ConversionResult{
+              std::move(prologue),
+              op_reg.Create("tile.set_validshape", {tile_var, valid_rows, valid_cols}, span)};
+        };
 
         auto input_tile_type = As<TileType>(args[0]->GetType());
         auto shape_tuple = As<MakeTuple>(args[1]);
@@ -190,11 +218,13 @@ void OpConversionRegistry::RegisterBroadcastAndTransformOps() {
               dst_rows->value_ == src_cols->value_ && dst_cols->value_ == 1) {
             auto axis0 = std::make_shared<ConstInt>(0, DataType::INDEX, span);
             auto axis1 = std::make_shared<ConstInt>(1, DataType::INDEX, span);
-            return ConversionResult{op_reg.Create("tile.transpose", {args[0], axis0, axis1}, span)};
+            auto transpose_call = op_reg.Create("tile.transpose", {args[0], axis0, axis1}, span);
+            return finish_with_valid_shape(transpose_call);
           }
         }
 
-        return ConversionResult{op_reg.Create("tile.reshape", {args[0], args[1]}, kwargs, span)};
+        auto reshape_call = op_reg.Create("tile.reshape", {args[0], args[1]}, kwargs, span);
+        return finish_with_valid_shape(reshape_call);
       });
 
   // tensor.transpose → tile.transpose(input, axis1, axis2). The pto.ttrans scratch is a pure
