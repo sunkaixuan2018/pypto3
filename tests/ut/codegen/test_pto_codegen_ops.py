@@ -935,6 +935,84 @@ class TestBroadcastOpsCodegen:
         else:
             raise AssertionError("no pto.trowexpand ins(...) line in MLIR")
 
+    def test_row_vector_reshape_feeding_row_expand_mul_materializes(self):
+        """A tensor [1, K] -> [K, 1] vector reshape must materialize a safe column vector."""
+
+        @pl.program
+        class Prog:
+            @pl.function(type=pl.FunctionType.InCore)
+            def kernel(
+                self,
+                src: pl.Tensor[[16, 16], pl.FP32],
+            ) -> pl.Tensor[[16, 16], pl.FP32]:
+                idx: pl.Tensor[[1, 16], pl.INT32] = pl.tensor.ci(0, [1, 16], dtype=pl.INT32)
+                idx_col: pl.Tensor[[16, 1], pl.INT32] = pl.tensor.reshape(idx, [16, 1])
+                row_16x1: pl.Tensor[[16, 1], pl.FP32] = pl.tensor.cast(idx_col, target_type=pl.FP32)
+                return pl.row_expand_mul(src, row_16x1)
+
+        mlir = self._generate_mlir(Prog)
+        assert "pto.ttrans" in mlir, (
+            f"tensor reshape [1,K] -> [K,1] feeding row_expand_mul must materialize data; got:\n{mlir}"
+        )
+        treshape_lines = [line for line in mlir.splitlines() if "pto.treshape" in line]
+        ttrans_lines = [line for line in mlir.splitlines() if "pto.ttrans" in line]
+        assert not any("rows=2, cols=8" in line for line in treshape_lines), (
+            "tensor reshape [1,K] -> [K,1] feeding row_expand_mul must not repack through "
+            "32-byte scalar-ND rows; got:\n"
+            f"{mlir}"
+        )
+        assert any("rows=16, cols=1" in line and "blayout=col_major" in line for line in ttrans_lines), (
+            f"final reshape result must carry a [K,1] column-vector output type; got:\n{mlir}"
+        )
+        assert "pto.trowexpandmul" in mlir, f"row_expand_mul should generate pto.trowexpandmul, got:\n{mlir}"
+
+    def test_k64_row_vector_cast_feeding_row_expand_mul_materializes(self):
+        """The raceB K=64 row generator must materialize the row-to-column vector reshape."""
+
+        @pl.program
+        class Prog:
+            @pl.function(type=pl.FunctionType.InCore)
+            def kernel(self, src: pl.Tensor[[64, 32], pl.FP32]) -> pl.Tensor[[64, 32], pl.FP32]:
+                idx: pl.Tensor[[1, 64], pl.INT32] = pl.tensor.ci(0, [1, 64], dtype=pl.INT32)
+                idx_col: pl.Tensor[[64, 1], pl.INT32] = pl.tensor.reshape(idx, [64, 1])
+                row_64x1: pl.Tensor[[64, 1], pl.FP32] = pl.tensor.cast(idx_col, target_type=pl.FP32)
+                return pl.row_expand_mul(src, row_64x1)
+
+        mlir = self._generate_mlir(Prog)
+        assert "pto.ttrans" in mlir, (
+            "K=64 row arange feeding row_expand_mul must not rely on view-only TRESHAPE; "
+            f"fresh L2 direct-row dump showed rows 57-63 can be corrupt. Got:\n{mlir}"
+        )
+        treshape_lines = [line for line in mlir.splitlines() if "pto.treshape" in line]
+        assert not any("rows=8, cols=8" in line for line in treshape_lines), (
+            f"K=64 row arange feeding row_expand_mul must not be repacked through [8,8]; got:\n{mlir}"
+        )
+        assert "rows=64, cols=1" in mlir and "blayout=col_major" in mlir, (
+            f"final reshape result must be a [64,1] column-vector tile; got:\n{mlir}"
+        )
+        assert "pto.trowexpandmul" in mlir, f"row_expand_mul should generate pto.trowexpandmul, got:\n{mlir}"
+
+    def test_k64_row_vector_reshape_cast_store_materializes_tail_rows(self):
+        """Direct row dump repro: cast(reshape(arange([1,64]), [64,1])) must be materialized before store."""
+
+        @pl.program
+        class Prog:
+            @pl.function(type=pl.FunctionType.InCore)
+            def kernel(self) -> pl.Tensor[[64, 1], pl.FP32]:
+                idx: pl.Tensor[[1, 64], pl.INT32] = pl.tensor.ci(0, [1, 64], dtype=pl.INT32)
+                idx_col: pl.Tensor[[64, 1], pl.INT32] = pl.tensor.reshape(idx, [64, 1])
+                row_64x1: pl.Tensor[[64, 1], pl.FP32] = pl.tensor.cast(idx_col, target_type=pl.FP32)
+                return row_64x1
+
+        mlir = self._generate_mlir(Prog)
+        assert "pto.ttrans" in mlir, (
+            f"direct out_row store must materialize [1,64] -> [64,1] before TCVT/TSTORE; got:\n{mlir}"
+        )
+        assert "pto.tstore" in mlir, f"direct row repro should store out_row, got:\n{mlir}"
+        assert "rows=64, cols=1" in mlir and "blayout=col_major" in mlir, (
+            f"direct row repro must retain a [64,1] column-vector result type; got:\n{mlir}"
+        )
+
 
 class TestTileSliceCodegen:
     """Tests for tile.slice PTO code generation (pto.subview).

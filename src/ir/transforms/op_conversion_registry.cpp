@@ -169,7 +169,33 @@ void OpConversionRegistry::RegisterBroadcastAndTransformOps() {
   RegisterSimple("tensor.col_expand_div", "tile.col_expand_div");
   RegisterSimple("tensor.expands", "tile.expands");
 
-  RegisterSimple("tensor.reshape", "tile.reshape");
+  RegisterCustom(
+      "tensor.reshape",
+      [](const std::vector<ExprPtr>& args, const std::vector<std::pair<std::string, std::any>>& kwargs,
+         const Span& span) -> ConversionResult {
+        INTERNAL_CHECK_SPAN(args.size() == 2 || args.size() == 3, span)
+            << "tensor.reshape conversion expects 2 or 3 args (input, shape[, valid_shape]), got "
+            << args.size();
+        auto& op_reg = OpRegistry::GetInstance();
+
+        auto input_tile_type = As<TileType>(args[0]->GetType());
+        auto shape_tuple = As<MakeTuple>(args[1]);
+        if (input_tile_type && shape_tuple && input_tile_type->shape_.size() == 2 &&
+            shape_tuple->elements_.size() == 2) {
+          auto src_rows = As<ConstInt>(input_tile_type->shape_[0]);
+          auto src_cols = As<ConstInt>(input_tile_type->shape_[1]);
+          auto dst_rows = As<ConstInt>(shape_tuple->elements_[0]);
+          auto dst_cols = As<ConstInt>(shape_tuple->elements_[1]);
+          if (src_rows && src_cols && dst_rows && dst_cols && src_rows->value_ == 1 && src_cols->value_ > 1 &&
+              dst_rows->value_ == src_cols->value_ && dst_cols->value_ == 1) {
+            auto axis0 = std::make_shared<ConstInt>(0, DataType::INDEX, span);
+            auto axis1 = std::make_shared<ConstInt>(1, DataType::INDEX, span);
+            return ConversionResult{op_reg.Create("tile.transpose", {args[0], axis0, axis1}, span)};
+          }
+        }
+
+        return ConversionResult{op_reg.Create("tile.reshape", {args[0], args[1]}, kwargs, span)};
+      });
 
   // tensor.transpose → tile.transpose(input, axis1, axis2). The pto.ttrans scratch is a pure
   // codegen detail, not a semantic operand: FlattenTileNdTo2D is the sole owner of scratch
