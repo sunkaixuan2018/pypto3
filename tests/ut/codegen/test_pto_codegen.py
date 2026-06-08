@@ -23,7 +23,7 @@ import re
 
 import pypto.language as pl
 import pytest
-from pypto import DataType, backend, codegen, ir
+from pypto import DataType, backend, codegen, ir, passes
 from pypto.backend import BackendType
 from pypto.backend.pto_backend import (
     _emit_group_output,
@@ -2202,7 +2202,12 @@ def test_pto_codegen_transpose_dynamic_valid_shape_uses_distinct_output_buffer()
             ib.return_stmt(y)
         prog.add_function(f.get_result())
 
-    mlir_code = _get_mlir_code(PTOCodegen().generate(_run_default_passes(prog.get_result())))
+    instruments: list[passes.PassInstrument] = [
+        passes.VerificationInstrument(passes.VerificationMode.BEFORE_AND_AFTER)
+    ]
+    with passes.PassContext(instruments):
+        optimized = _run_default_passes(prog.get_result())
+    mlir_code = _get_mlir_code(PTOCodegen().generate(optimized))
     ttrans_lines = [line.strip() for line in mlir_code.splitlines() if "pto.ttrans" in line]
     assert len(ttrans_lines) == 1, f"Expected one pto.ttrans, got: {ttrans_lines}"
 
