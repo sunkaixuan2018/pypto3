@@ -9,11 +9,13 @@
 
 """Unit tests for ``pypto.runtime.runner.RunConfig`` and DFX plumbing."""
 
+import sys
+import types
 from unittest.mock import MagicMock, patch
 
 import pytest
 from pypto.backend import BackendType
-from pypto.runtime.runner import RunConfig, _DfxOpts, compile_program, run
+from pypto.runtime.runner import RunConfig, _DfxOpts, compile_program, execute_compiled, run
 
 
 class TestRunConfigPlatformResolution:
@@ -167,6 +169,38 @@ class TestRunConfigCompileForwarding:
         run(object(), config=RunConfig(platform="a2a3sim", analyze_auto_scopes_for_deps=True))
 
         assert captured["analyze_auto_scopes_for_deps"] is True
+
+    def test_execute_compiled_accepts_auto_scope_deps_switch(self, tmp_path, monkeypatch):
+        captured: dict = {}
+
+        def fake_compile_and_assemble(_work_dir, platform, pto_isa_commit):
+            captured["compile"] = {
+                "platform": platform,
+                "pto_isa_commit": pto_isa_commit,
+            }
+            return object(), "fake_runtime", {}
+
+        def fake_execute_on_device(*args, **kwargs):
+            captured["execute"] = {"args": args, "kwargs": kwargs}
+
+        fake_device_runner = types.SimpleNamespace(
+            compile_and_assemble=fake_compile_and_assemble,
+            execute_on_device=fake_execute_on_device,
+        )
+        monkeypatch.setitem(sys.modules, "pypto.runtime.device_runner", fake_device_runner)
+
+        execute_compiled(
+            tmp_path,
+            [],
+            platform="a2a3sim",
+            device_id=0,
+            analyze_auto_scopes_for_deps=True,
+        )
+
+        assert captured["compile"]["platform"] == "a2a3sim"
+        assert captured["execute"]["args"][3] == "fake_runtime"
+        assert captured["execute"]["kwargs"]["block_dim"] is None
+        assert captured["execute"]["kwargs"]["aicpu_thread_num"] is None
 
     def test_compile_program_forwards_auto_scope_deps_switch(self, tmp_path, monkeypatch):
         captured: dict = {}
