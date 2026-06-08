@@ -935,8 +935,8 @@ class TestBroadcastOpsCodegen:
         else:
             raise AssertionError("no pto.trowexpand ins(...) line in MLIR")
 
-    def test_row_vector_reshape_feeding_row_expand_mul_materializes(self):
-        """A tensor [1, K] -> [K, 1] vector reshape must materialize a safe column vector."""
+    def test_row_vector_reshape_feeding_row_expand_mul_preserves_order(self):
+        """A tensor [1, K] -> [K, 1] vector reshape must not lower through transpose."""
 
         @pl.program
         class Prog:
@@ -951,9 +951,11 @@ class TestBroadcastOpsCodegen:
                 return pl.row_expand_mul(src, row_16x1)
 
         mlir = self._generate_mlir(Prog)
-        assert "pto.treshape" in mlir, (
-            "tensor reshape [1,K] -> [K,1] feeding row_expand_mul must materialize data "
-            f"without transpose; got:\n{mlir}"
+        assert "pto.ttrans" not in mlir, (
+            f"tensor reshape [1,K] -> [K,1] feeding row_expand_mul must not transpose data; got:\n{mlir}"
+        )
+        assert "pto.treshape" not in mlir, (
+            f"tensor reshape [1,K] -> [K,1] feeding row_expand_mul should stay a layout no-op; got:\n{mlir}"
         )
         treshape_lines = [line for line in mlir.splitlines() if "pto.treshape" in line]
         assert not any("rows=2, cols=8" in line for line in treshape_lines), (
@@ -961,13 +963,13 @@ class TestBroadcastOpsCodegen:
             "32-byte scalar-ND rows; got:\n"
             f"{mlir}"
         )
-        assert any("rows=16, cols=1" in line and "blayout=col_major" in line for line in treshape_lines), (
+        assert "rows=16, cols=1" in mlir and "blayout=col_major" in mlir, (
             f"final reshape result must carry a [K,1] column-vector output type; got:\n{mlir}"
         )
         assert "pto.trowexpandmul" in mlir, f"row_expand_mul should generate pto.trowexpandmul, got:\n{mlir}"
 
-    def test_k64_row_vector_cast_feeding_row_expand_mul_materializes(self):
-        """The raceB K=64 row generator must materialize the row-to-column vector reshape."""
+    def test_k64_row_vector_cast_feeding_row_expand_mul_preserves_order(self):
+        """The K=64 row generator must keep row-to-column reshape as a layout no-op."""
 
         @pl.program
         class Prog:
@@ -979,9 +981,11 @@ class TestBroadcastOpsCodegen:
                 return pl.row_expand_mul(src, row_64x1)
 
         mlir = self._generate_mlir(Prog)
-        assert "pto.treshape" in mlir, (
-            "K=64 row arange feeding row_expand_mul must materialize the layout change; "
-            f"fresh L2 direct-row dump showed rows 57-63 can be corrupt. Got:\n{mlir}"
+        assert "pto.ttrans" not in mlir, (
+            f"K=64 row arange feeding row_expand_mul must not transpose reshape data. Got:\n{mlir}"
+        )
+        assert "pto.treshape" not in mlir, (
+            f"K=64 row arange feeding row_expand_mul should stay a layout no-op. Got:\n{mlir}"
         )
         treshape_lines = [line for line in mlir.splitlines() if "pto.treshape" in line]
         assert not any("rows=8, cols=8" in line for line in treshape_lines), (
@@ -992,8 +996,8 @@ class TestBroadcastOpsCodegen:
         )
         assert "pto.trowexpandmul" in mlir, f"row_expand_mul should generate pto.trowexpandmul, got:\n{mlir}"
 
-    def test_k64_row_vector_reshape_cast_store_materializes_tail_rows(self):
-        """Direct row dump repro: cast(reshape(arange([1,64]), [64,1])) must be materialized before store."""
+    def test_k64_row_vector_reshape_cast_store_preserves_order(self):
+        """Direct row dump repro: cast(reshape(arange([1,64]), [64,1])) must not transpose data."""
 
         @pl.program
         class Prog:
@@ -1005,8 +1009,11 @@ class TestBroadcastOpsCodegen:
                 return row_64x1
 
         mlir = self._generate_mlir(Prog)
-        assert "pto.treshape" in mlir, (
-            f"direct out_row store must materialize [1,64] -> [64,1] before TCVT/TSTORE; got:\n{mlir}"
+        assert "pto.ttrans" not in mlir, (
+            f"direct out_row store must not transpose [1,64] -> [64,1] before TCVT/TSTORE; got:\n{mlir}"
+        )
+        assert "pto.treshape" not in mlir, (
+            f"direct out_row store should keep [1,64] -> [64,1] as a layout no-op; got:\n{mlir}"
         )
         assert "pto.tstore" in mlir, f"direct row repro should store out_row, got:\n{mlir}"
         assert "rows=64, cols=1" in mlir and "blayout=col_major" in mlir, (
