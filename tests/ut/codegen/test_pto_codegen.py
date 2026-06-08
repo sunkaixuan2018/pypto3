@@ -2207,7 +2207,11 @@ def test_pto_codegen_transpose_dynamic_valid_shape_uses_distinct_output_buffer()
     ]
     with passes.PassContext(instruments):
         optimized = _run_default_passes(prog.get_result())
-    mlir_code = _get_mlir_code(PTOCodegen().generate(optimized))
+    incore_funcs = [func for func in optimized.functions.values() if ir.is_incore_type(func.func_type)]
+    assert len(incore_funcs) == 1
+    mlir_code = _get_mlir_code(
+        PTOCodegen().generate(ir.Program([incore_funcs[0]], incore_funcs[0].name, span))
+    )
     ttrans_lines = [line.strip() for line in mlir_code.splitlines() if "pto.ttrans" in line]
     assert len(ttrans_lines) == 1, f"Expected one pto.ttrans, got: {ttrans_lines}"
 
