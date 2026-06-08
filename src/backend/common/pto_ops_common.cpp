@@ -509,6 +509,11 @@ static std::string MakeTileTransposeCodegenPTO(const CallPtr& op, codegen::Codeg
   if (tmp_type.empty()) {
     tmp_type = src_type;
   }
+  if (!src_type.empty() && !tmp_type.empty() && src_type != tmp_type &&
+      src_type.find("v_row=?") == std::string::npos && src_type.find("v_col=?") == std::string::npos) {
+    tmp_ssa = codegen.AllocNewTileBuf(src_type, "transpose_tmp");
+    tmp_type = codegen.GetSSATileBufType(tmp_ssa);
+  }
 
   std::string result_target = codegen.GetCurrentResultTarget();
   std::string result_type = codegen.GetCurrentResultTileBufTypeString();
