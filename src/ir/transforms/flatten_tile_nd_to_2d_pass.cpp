@@ -1313,16 +1313,10 @@ NdTransposeResult LowerNdTranspose(const AssignStmtPtr& assign, const CallPtr& c
   out.stmts.push_back(std::make_shared<AssignStmt>(out_var, create_out, span));
 
   // Pre-create one flat scratch pool [batch_count*A, B] sliced per batch.
-  // pto.ttrans requires a scratch operand whose type matches the source page's;
-  // its codegen reuses the SOURCE's type for BOTH ins operands
-  // (MakeTileTransposeCodegenPTO emits "src_type, src_type"). The source page is
-  // a tile.slice -> pto.subview, which produces a NEW SSA value with STATIC valid
-  // [A, B]. The scratch must be the same kind of value, so it is sliced from this
-  // pool per batch (a partial tile.slice -> pto.subview), NOT
-  // created+set_validshape: set_validshape mutates the alloc in place (dynamic
-  // valid ?x?) without renaming it, so ttrans would see the same SSA value typed
-  // both dynamic (at its def/set_validshape) and static (at the ttrans use) ->
-  // ptoas type conflict. The pool lives across the loop; being a single
+  // pto.ttrans requires a scratch operand whose physical type matches the source
+  // page. Codegen annotates source and scratch with their own SSA types, so a
+  // scratch slice is used here to keep the scratch SSA's type coherent with its
+  // alloc/subview definition. The pool lives across the loop; being a single
   // allocation it is cheap relative to per-batch scratch churn.
   auto tmp_pool_shape = std::make_shared<MakeTuple>(Make2DShapeExprs(batch_count * a, b, span), span);
   std::vector<std::pair<std::string, std::any>> tmp_pool_kw = {

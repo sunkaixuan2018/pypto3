@@ -498,9 +498,16 @@ static std::string MakeTileTransposeCodegenPTO(const CallPtr& op, codegen::Codeg
     src_type = codegen.GetExprTypeAnnotation(op->args_[0]);
   }
   std::string tmp_ssa = codegen.GetExprAsCode(op->args_[3]);
+  std::string tmp_type = codegen.GetSSATileBufType(tmp_ssa);
+  if (tmp_type.empty()) {
+    tmp_type = codegen.GetExprTypeAnnotation(op->args_[3]);
+  }
   // Fall back to tmp's annotation when src lacks a MemRef (ForStmt result var, tile.reshape view).
   if (src_type.empty()) {
-    src_type = codegen.GetExprTypeAnnotation(op->args_[3]);
+    src_type = tmp_type;
+  }
+  if (tmp_type.empty()) {
+    tmp_type = src_type;
   }
 
   std::string result_target = codegen.GetCurrentResultTarget();
@@ -524,8 +531,8 @@ static std::string MakeTileTransposeCodegenPTO(const CallPtr& op, codegen::Codeg
 
   std::ostringstream oss;
   oss << "pto.ttrans ins(" << src_ssa << ", " << tmp_ssa;
-  if (!src_type.empty()) {
-    oss << " : " << src_type << ", " << src_type;
+  if (!src_type.empty() && !tmp_type.empty()) {
+    oss << " : " << src_type << ", " << tmp_type;
   }
   oss << ") outs(" << result_target;
   if (!result_type.empty()) {
