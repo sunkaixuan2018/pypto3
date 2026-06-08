@@ -700,20 +700,21 @@ Pass ExpandManualPhaseFence();
 /**
  * @brief Derive explicit task-to-task dependency edges inside runtime scopes.
  *
- * Walks runtime scopes as dependency-analysis regions. For each submit-style
- * Call that has a producer ``Scalar[TASK_ID]`` tuple element, computes a
- * conservative storage access summary from ``arg_directions`` and attaches
- * RAW/WAR/WAW hazards against prior calls in the same scope under
- * ``Call.attrs["compiler_manual_dep_edges"]``. AUTO scopes keep
- * ``manual=false`` in the output IR; on unanalyzable hazards, partial compiler
- * deps are stripped and the scope falls back to AUTO tracking. User-provided
- * ``manual_dep_edges`` remain authoritative and separate; codegen merges both
- * attrs before emitting ``Arg::set_dependencies``.
+ * Walks manual runtime scopes as dependency-analysis regions. For each submit-style
+ * Call with a producer ``Scalar[TASK_ID]`` tuple element, computes a conservative
+ * storage access summary from ``arg_directions`` and attaches RAW/WAR/WAW hazards
+ * against prior calls in the same scope under
+ * ``Call.attrs["compiler_manual_dep_edges"]``. AUTO scopes are skipped by default;
+ * pass ``analyze_auto_scopes=true`` to analyze them while keeping ``manual=false``
+ * in the output IR. On unanalyzable hazards, partial compiler deps are stripped
+ * and the scope falls back to AUTO tracking. User-provided ``manual_dep_edges``
+ * remain authoritative and separate; codegen merges both attrs before emitting
+ * ``Arg::set_dependencies``.
  *
  * Requirements:
  *   - Call directions resolved (run DeriveCallDirections first)
  */
-Pass AutoDeriveTaskDependencies();
+Pass AutoDeriveTaskDependencies(bool analyze_auto_scopes = false);
 
 /**
  * @brief Fold no-op tile.reshape assignments into Var-to-Var assignments

@@ -170,6 +170,10 @@ class RunConfig:
             forwards no compile-side overrides, so distributed ``@pl.program``
             execution is driven by ``ir.compile(..., distributed_config=...)``
             directly rather than through ``RunConfig``.
+        analyze_auto_scopes_for_deps: If ``True``, enable compiler-derived task
+            dependency analysis for AUTO runtime scopes during compilation.
+            Defaults to ``False`` so existing runs keep using TensorMap fallback
+            unless this behavior is explicitly requested.
     """
 
     __test__ = False  # Not a pytest test class
@@ -197,6 +201,7 @@ class RunConfig:
     block_dim: int | None = None
     aicpu_thread_num: int | None = None
     distributed_config: "DistributedConfig | None" = None
+    analyze_auto_scopes_for_deps: bool = False
 
     def __post_init__(self) -> None:
         if self.platform not in ("a2a3sim", "a2a3", "a5sim", "a5"):
@@ -302,6 +307,7 @@ def compile_program(
     diagnostic_phase: DiagnosticPhase | None = None,
     disabled_diagnostics: DiagnosticCheckSet | None = None,
     profiling: bool = False,
+    analyze_auto_scopes_for_deps: bool = False,
 ) -> None:
     """Compile *program* to *work_dir* and patch orchestration headers.
 
@@ -317,6 +323,8 @@ def compile_program(
         diagnostic_phase: Override the diagnostic phase gate for compilation.
         disabled_diagnostics: Set of diagnostic checks to disable.
         profiling: If ``True``, enable compile profiling.
+        analyze_auto_scopes_for_deps: If ``True``, enable compiler-derived task
+            dependency analysis for AUTO runtime scopes.
     """
     from pypto import ir  # noqa: PLC0415
 
@@ -329,6 +337,7 @@ def compile_program(
         diagnostic_phase=diagnostic_phase,
         disabled_diagnostics=disabled_diagnostics,
         profiling=profiling,
+        analyze_auto_scopes_for_deps=analyze_auto_scopes_for_deps,
     )
     _patch_orchestration_headers(work_dir)
 
@@ -379,6 +388,7 @@ def run(
         disabled_diagnostics=config.disabled_diagnostics,
         platform=config.platform,
         profiling=config.compile_profiling,
+        analyze_auto_scopes_for_deps=config.analyze_auto_scopes_for_deps,
     )
 
     if tensors and not config.codegen_only:

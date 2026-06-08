@@ -748,12 +748,13 @@ class AutoDepMutator : public IRMutator {
  public:
   AutoDepMutator(ProgramPtr program, const StorageRootAnalysis* storage,
                  const std::unordered_map<const Call*, VarPtr>* task_id_by_call,
-                 const std::unordered_map<uint64_t, VarPtr>* task_id_by_var_id,
+                 const std::unordered_map<uint64_t, VarPtr>* task_id_by_var_id, bool analyze_auto_scopes,
                  bool analyze_whole_body_as_auto_scope)
       : program_(std::move(program)),
         storage_(storage),
         task_id_by_call_(task_id_by_call),
         task_id_by_var_id_(task_id_by_var_id),
+        analyze_auto_scopes_(analyze_auto_scopes),
         analyze_whole_body_as_auto_scope_(analyze_whole_body_as_auto_scope) {}
 
   StmtPtr AnalyzeBody(const StmtPtr& body) {
@@ -785,6 +786,9 @@ class AutoDepMutator : public IRMutator {
   }
 
   StmtPtr VisitStmt_(const RuntimeScopeStmtPtr& op) override {
+    if (!op->manual_ && !analyze_auto_scopes_) {
+      return IRMutator::VisitStmt_(op);
+    }
     return AnalyzeRuntimeScopeBody(op->body_, op->manual_, op->name_hint_, op->span_,
                                    /*is_virtual_whole_body=*/false, op, op->leading_comments_, op->attrs_);
   }
@@ -1024,6 +1028,7 @@ class AutoDepMutator : public IRMutator {
   const StorageRootAnalysis* storage_;
   const std::unordered_map<const Call*, VarPtr>* task_id_by_call_;
   const std::unordered_map<uint64_t, VarPtr>* task_id_by_var_id_;
+  bool analyze_auto_scopes_ = false;
   bool analyze_whole_body_as_auto_scope_ = false;
   std::vector<std::vector<StorageAccess>> prior_stack_;
   std::vector<bool> fallback_stack_;
@@ -1035,8 +1040,8 @@ class AutoDepMutator : public IRMutator {
 
 namespace pass {
 
-Pass AutoDeriveTaskDependencies() {
-  auto pass_func = [](const ProgramPtr& program) -> ProgramPtr {
+Pass AutoDeriveTaskDependencies(bool analyze_auto_scopes) {
+  auto pass_func = [analyze_auto_scopes](const ProgramPtr& program) -> ProgramPtr {
     if (!program) return program;
 
     auto new_functions = program->functions_;
@@ -1053,10 +1058,11 @@ Pass AutoDeriveTaskDependencies() {
       SubmitTaskIdCollector task_ids;
       task_ids.VisitStmt(func->body_);
 
-      const bool analyze_whole_body_as_auto_scope =
-          func->func_type_ == FunctionType::Orchestration && func->GetAttr<bool>("auto_scope", true);
+      const bool analyze_whole_body_as_auto_scope = analyze_auto_scopes &&
+                                                    func->func_type_ == FunctionType::Orchestration &&
+                                                    func->GetAttr<bool>("auto_scope", true);
       AutoDepMutator mutator(program, &storage, &task_ids.task_id_by_call(), &task_ids.task_id_by_var_id(),
-                             analyze_whole_body_as_auto_scope);
+                             analyze_auto_scopes, analyze_whole_body_as_auto_scope);
       auto new_body = mutator.AnalyzeBody(func->body_);
       if (new_body.get() == func->body_.get()) continue;
 

@@ -245,6 +245,7 @@ def _compile_for_cache(test_case: "PTOTestCase", work_dir: Path, dump_passes: bo
         strategy=test_case.get_strategy(),
         backend_type=backend_type,
         dump_passes=dump_passes,
+        analyze_auto_scopes_for_deps=test_case.config.analyze_auto_scopes_for_deps,
     )
     if not list((work_dir / "kernels").rglob("*.cpp")):
         raise ValueError(f"No kernels generated for {test_case.get_name()}")
@@ -624,6 +625,7 @@ class TestRunner:
                 strategy=strategy,
                 backend_type=backend_type,
                 dump_passes=self.config.dump_passes,
+                analyze_auto_scopes_for_deps=self.config.analyze_auto_scopes_for_deps,
             )
 
             if not list((work_dir / "kernels").rglob("*.cpp")):

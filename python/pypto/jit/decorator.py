@@ -1033,6 +1033,9 @@ def _run_config_compile_kwargs(run_config: Any) -> dict[str, Any]:
     unset value defers to ``ir.compile()``'s default (a single-chip
     ``CompiledProgram``) and keeps it out of the cache key for non-distributed
     callers.
+
+    ``analyze_auto_scopes_for_deps`` is forwarded because it changes the pass
+    pipeline's dependency derivation and therefore the generated orchestration.
     """
     kwargs: dict[str, Any] = {
         "strategy": run_config.strategy,
@@ -1040,6 +1043,7 @@ def _run_config_compile_kwargs(run_config: Any) -> dict[str, Any]:
         "profiling": run_config.compile_profiling,
         "diagnostic_phase": run_config.diagnostic_phase,
         "disabled_diagnostics": run_config.disabled_diagnostics,
+        "analyze_auto_scopes_for_deps": run_config.analyze_auto_scopes_for_deps,
     }
     if run_config.save_kernels_dir is not None:
         kwargs["output_dir"] = run_config.save_kernels_dir
@@ -1344,6 +1348,9 @@ class JITFunction:
         # drives per-rank dispatch, so it must split the cache: two @pl.jit.host
         # calls with different device_ids compile to distinct artifacts.
         distributed_config = run_config.distributed_config if run_config is not None else None
+        analyze_auto_scopes_for_deps = (
+            run_config.analyze_auto_scopes_for_deps if run_config is not None else False
+        )
         key = make_cache_key(
             source_hash=self._get_source_hash(),
             param_names=param_names,
@@ -1354,6 +1361,7 @@ class JITFunction:
             platform=platform,
             strategy=strategy,
             distributed_config=distributed_config,
+            analyze_auto_scopes_for_deps=analyze_auto_scopes_for_deps,
         )
 
         # L1 cache lookup

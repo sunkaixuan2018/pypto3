@@ -13,7 +13,7 @@ from unittest.mock import MagicMock, patch
 
 import pytest
 from pypto.backend import BackendType
-from pypto.runtime.runner import RunConfig, _DfxOpts
+from pypto.runtime.runner import RunConfig, _DfxOpts, compile_program, run
 
 
 class TestRunConfigPlatformResolution:
@@ -40,6 +40,11 @@ class TestRunConfigPlatformResolution:
         assert cfg.platform == "a5"
         assert cfg.backend_type == BackendType.Ascend950
         assert cfg.save_kernels is True
+
+    def test_auto_scope_deps_switch_defaults_off(self):
+        cfg = RunConfig(platform="a5")
+
+        assert cfg.analyze_auto_scopes_for_deps is False
 
 
 class TestRunConfigDfxFlags:
@@ -139,6 +144,52 @@ class TestRunConfigDfxFlags:
 
     def test_dfx_opts_any_false_when_all_off(self):
         assert _DfxOpts().any() is False
+
+
+class TestRunConfigCompileForwarding:
+    """Compile-side RunConfig fields are forwarded into ``ir.compile``."""
+
+    def test_run_forwards_auto_scope_deps_switch(self, monkeypatch):
+        captured: dict = {}
+
+        class FakeCompiled:
+            def __call__(self, *_args, **_kwargs):
+                return None
+
+        def fake_compile(_program, **kwargs):
+            captured.update(kwargs)
+            return FakeCompiled()
+
+        import pypto.ir as ir_mod  # noqa: PLC0415
+
+        monkeypatch.setattr(ir_mod, "compile", fake_compile)
+
+        run(object(), config=RunConfig(platform="a2a3sim", analyze_auto_scopes_for_deps=True))
+
+        assert captured["analyze_auto_scopes_for_deps"] is True
+
+    def test_compile_program_forwards_auto_scope_deps_switch(self, tmp_path, monkeypatch):
+        captured: dict = {}
+
+        def fake_compile(_program, **kwargs):
+            captured.update(kwargs)
+            return object()
+
+        import pypto.ir as ir_mod  # noqa: PLC0415
+        import pypto.runtime.runner as runner_mod  # noqa: PLC0415
+
+        monkeypatch.setattr(ir_mod, "compile", fake_compile)
+        monkeypatch.setattr(runner_mod, "_patch_orchestration_headers", lambda _work_dir: None)
+
+        compile_program(
+            object(),
+            tmp_path,
+            strategy=RunConfig().strategy,
+            backend_type=BackendType.Ascend910B,
+            analyze_auto_scopes_for_deps=True,
+        )
+
+        assert captured["analyze_auto_scopes_for_deps"] is True
 
 
 # ``execute_on_device`` lives in ``device_runner`` which eagerly imports the

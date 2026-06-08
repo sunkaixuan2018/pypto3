@@ -52,6 +52,10 @@ def _compiler_edges(call: ir.Call) -> list[ir.Var]:
     return list(call.attrs.get("compiler_manual_dep_edges", []))
 
 
+def _printed(program: ir.Program) -> str:
+    return ir.python_print(program)
+
+
 def _runtime_scopes(program: ir.Program) -> list[ir.RuntimeScopeStmt]:
     scopes: list[ir.RuntimeScopeStmt] = []
 
@@ -64,9 +68,9 @@ def _runtime_scopes(program: ir.Program) -> list[ir.RuntimeScopeStmt]:
     return scopes
 
 
-def _run_auto_deps(program: ir.Program) -> ir.Program:
+def _run_auto_deps(program: ir.Program, *, analyze_auto_scopes: bool = False) -> ir.Program:
     program = passes.derive_call_directions()(program)
-    return passes.auto_derive_task_dependencies()(program)
+    return passes.auto_derive_task_dependencies(analyze_auto_scopes=analyze_auto_scopes)(program)
 
 
 class TestAutoDeriveTaskDependencies:
@@ -173,7 +177,7 @@ class TestAutoDeriveTaskDependencies:
         assert len(edges) == 1
         assert edges[0].name_hint == "reader_tid"
 
-    def test_default_auto_scope_raw_hazard_adds_compiler_edge(self):
+    def test_default_auto_scope_raw_hazard_skips_compiler_edge(self):
         @pl.program
         class Prog:
             @pl.function(type=pl.FunctionType.InCore)
@@ -194,12 +198,9 @@ class TestAutoDeriveTaskDependencies:
                 return out
 
         out = _run_auto_deps(Prog)
-        consume_call = _user_calls(out, "consume")[0]
-        edges = _compiler_edges(consume_call)
-        assert len(edges) == 1
-        assert edges[0].name_hint == "producer_tid"
+        assert "compiler_manual_dep_edges" not in _printed(out)
 
-    def test_auto_runtime_scope_raw_hazard_adds_compiler_edge_and_stays_auto(self):
+    def test_auto_runtime_scope_raw_hazard_skips_compiler_edge_by_default(self):
         @pl.program
         class Prog:
             @pl.function(type=pl.FunctionType.InCore)
@@ -216,7 +217,7 @@ class TestAutoDeriveTaskDependencies:
             @pl.function(type=pl.FunctionType.Orchestration, auto_scope=False)
             def main(self, scratch: pl.Tensor[[64], pl.FP32]) -> pl.Tensor[[64], pl.FP32]:
                 with pl.scope(mode=pl.ScopeMode.AUTO):
-                    produced, producer_tid = pl.submit(self.fill, scratch)
+                    produced, _producer_tid = pl.submit(self.fill, scratch)
                     out, _ = pl.submit(self.consume, produced)
                 return out
 
@@ -225,10 +226,36 @@ class TestAutoDeriveTaskDependencies:
         assert len(scopes) == 1
         assert scopes[0].manual is False
 
-        consume_call = _user_calls(out, "consume")[0]
-        edges = _compiler_edges(consume_call)
-        assert len(edges) == 1
-        assert edges[0].name_hint == "producer_tid"
+        assert "compiler_manual_dep_edges" not in _printed(out)
+
+    def test_auto_runtime_scope_raw_hazard_adds_compiler_edge_when_enabled_and_stays_auto(self):
+        @pl.program
+        class Prog:
+            @pl.function(type=pl.FunctionType.InCore)
+            def fill(
+                self,
+                out: pl.Out[pl.Tensor[[64], pl.FP32]],
+            ) -> pl.Tensor[[64], pl.FP32]:
+                return out
+
+            @pl.function(type=pl.FunctionType.InCore)
+            def consume(self, x: pl.Tensor[[64], pl.FP32]) -> pl.Tensor[[64], pl.FP32]:
+                return x
+
+            @pl.function(type=pl.FunctionType.Orchestration, auto_scope=False)
+            def main(self, scratch: pl.Tensor[[64], pl.FP32]) -> pl.Tensor[[64], pl.FP32]:
+                with pl.scope(mode=pl.ScopeMode.AUTO):
+                    produced = self.fill(scratch)
+                    out = self.consume(produced)
+                return out
+
+        out = _run_auto_deps(Prog, analyze_auto_scopes=True)
+        scopes = _runtime_scopes(out)
+        assert len(scopes) == 1
+        assert scopes[0].manual is False
+
+        printed = _printed(out)
+        assert '"compiler_manual_dep_edges": [produced]' in printed
 
     def test_auto_runtime_scope_unencodable_hazard_falls_back_without_stale_edges(self):
         @pl.program
@@ -252,13 +279,12 @@ class TestAutoDeriveTaskDependencies:
                     out, _ = pl.submit(self.consume, produced)
                 return out
 
-        out = _run_auto_deps(Prog)
+        out = _run_auto_deps(Prog, analyze_auto_scopes=True)
         scopes = _runtime_scopes(out)
         assert len(scopes) == 1
         assert scopes[0].manual is False
 
-        consume_call = _user_calls(out, "consume")[0]
-        assert _compiler_edges(consume_call) == []
+        assert "compiler_manual_dep_edges" not in _printed(out)
 
     def test_user_edges_are_preserved_separately_from_compiler_edges(self):
         @pl.program
@@ -344,8 +370,7 @@ class TestAutoDeriveTaskDependencies:
                 return out
 
         out = _run_auto_deps(Prog)
-        consume_call = _user_calls(out, "consume")[0]
-        assert _compiler_edges(consume_call) == []
+        assert "compiler_manual_dep_edges" not in _printed(out)
 
     def test_static_overlapping_slices_add_compiler_edge(self):
         @pl.program
@@ -841,7 +866,7 @@ class TestAutoDeriveTaskDependencies:
         for call in _user_calls(out, "consume"):
             assert _compiler_edges(call) == []
 
-    def test_default_auto_scope_plain_call_raw_hazard_adds_synthetic_task_id_edge(self):
+    def test_default_auto_scope_plain_call_raw_hazard_skips_synthetic_task_id_edge(self):
         @pl.program
         class Prog:
             @pl.function(type=pl.FunctionType.InCore)
@@ -863,9 +888,31 @@ class TestAutoDeriveTaskDependencies:
 
         out = _run_auto_deps(Prog)
         consume_call = _user_calls(out, "consume")[0]
-        edges = _compiler_edges(consume_call)
-        assert len(edges) == 1
-        assert edges[0].name_hint == "produced"
+        assert _compiler_edges(consume_call) == []
+
+    def test_default_auto_scope_plain_call_raw_hazard_adds_synthetic_task_id_edge_when_enabled(self):
+        @pl.program
+        class Prog:
+            @pl.function(type=pl.FunctionType.InCore)
+            def fill(
+                self,
+                out: pl.Out[pl.Tensor[[64], pl.FP32]],
+            ) -> pl.Tensor[[64], pl.FP32]:
+                return out
+
+            @pl.function(type=pl.FunctionType.InCore)
+            def consume(self, x: pl.Tensor[[64], pl.FP32]) -> pl.Tensor[[64], pl.FP32]:
+                return x
+
+            @pl.function(type=pl.FunctionType.Orchestration)
+            def main(self, scratch: pl.Tensor[[64], pl.FP32]) -> pl.Tensor[[64], pl.FP32]:
+                produced = self.fill(scratch)
+                out = self.consume(produced)
+                return out
+
+        out = _run_auto_deps(Prog, analyze_auto_scopes=True)
+        printed = _printed(out)
+        assert '"compiler_manual_dep_edges": [produced]' in printed
 
     def test_large_control_flow_root_set_falls_back_to_auto_scope(self):
         @pl.program

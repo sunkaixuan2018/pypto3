@@ -197,32 +197,50 @@ class PassManager:
     def get_strategy(
         cls,
         strategy: OptimizationStrategy = OptimizationStrategy.Default,
+        *,
+        analyze_auto_scopes_for_deps: bool = False,
     ) -> "PassManager":
         """Get a PassManager configured for the specified strategy.
 
         Args:
             strategy: The optimization strategy to use (default: Default)
+            analyze_auto_scopes_for_deps: If True, enable compiler-derived task
+                dependency analysis for AUTO runtime scopes. The default stays
+                False so only manual scopes are analyzed.
 
         Returns:
             A PassManager instance configured with the appropriate passes
         """
         if not cls._strategy_passes:
             cls._register_passes()
-        return cls(strategy)
+        return cls(strategy, analyze_auto_scopes_for_deps=analyze_auto_scopes_for_deps)
 
-    def __init__(self, strategy: OptimizationStrategy):
+    def __init__(
+        self,
+        strategy: OptimizationStrategy,
+        *,
+        analyze_auto_scopes_for_deps: bool = False,
+    ):
         """Initialize PassManager with a specific strategy.
 
         Args:
             strategy: The optimization strategy to use
+            analyze_auto_scopes_for_deps: If True, enable compiler-derived task
+                dependency analysis for AUTO runtime scopes.
         """
         self.strategy = strategy
+        self.analyze_auto_scopes_for_deps = analyze_auto_scopes_for_deps
         self.passes: list[passes.Pass] = []
         self.pass_names: list[str] = []
 
         # Build pass list
         for pass_name, pass_factory in self._strategy_passes[strategy]:
-            self.passes.append(pass_factory())
+            if pass_name == "AutoDeriveTaskDependencies":
+                self.passes.append(
+                    passes.auto_derive_task_dependencies(analyze_auto_scopes=analyze_auto_scopes_for_deps)
+                )
+            else:
+                self.passes.append(pass_factory())
             self.pass_names.append(pass_name)
 
         # Build C++ PassPipeline
