@@ -83,6 +83,8 @@ bool HasInitializePipeOps(const std::vector<StmtPtr>& stmts) {
       }
     } else if (auto while_stmt = std::dynamic_pointer_cast<const WhileStmt>(stmt)) {
       if (HasInitializePipeOps(FlattenBody(while_stmt->body_))) return true;
+    } else if (auto scope = std::dynamic_pointer_cast<const ScopeStmt>(stmt)) {
+      if (HasInitializePipeOps(FlattenBody(scope->body_))) return true;
     }
   }
   return false;
@@ -492,6 +494,7 @@ void InjectGMSlotBufferInPlace(std::vector<FunctionPtr>& functions) {
 
   for (auto& func : functions) {
     if (func->func_type_ != FunctionType::Orchestration) continue;
+    if (!func->body_) continue;
 
     std::unordered_set<std::string> mod_callees = needs_gm_param;
     if (mod_callees.empty()) continue;

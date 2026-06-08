@@ -1943,13 +1943,17 @@ class OrchestrationStmtCodegen : public CodegenBase {
     return IsSubmitCall(call) || capture_plain_task_id;
   }
 
-  size_t CountManualDeps(const std::vector<VarPtr>& edges) const {
+  size_t CountManualDeps(const std::vector<VarPtr>& edges, const CallPtr& call) const {
     size_t total = 0;
     for (const auto& edge : edges) {
       if (!edge) continue;
       auto it = manual_task_id_map_.find(edge.get());
       if (it == manual_task_id_map_.end()) continue;
-      if (std::get_if<int>(&it->second)) continue;
+      if (std::get_if<int>(&it->second)) {
+        INTERNAL_CHECK_SPAN(false, call->span_) << "Internal error: manual_dep_edge var '" << edge->name_hint_
+                                                << "' resolves to a kernel-Call LHS (int variant). Expected "
+                                                << "a Scalar[TASK_ID] Var (string variant).";
+      }
       if (auto* names = std::get_if<std::vector<std::string>>(&it->second)) {
         total += names->size();
       } else {
@@ -2003,7 +2007,7 @@ class OrchestrationStmtCodegen : public CodegenBase {
   /// No-op when there are no edges attached.
   void EmitManualDeps(const CallPtr& call, const std::string& task_var) {
     const auto edges = GetDependencyEdges(call);
-    const size_t dep_capacity = CountManualDeps(edges);
+    const size_t dep_capacity = CountManualDeps(edges, call);
     if (dep_capacity == 0) return;
     const std::string deps_arr = task_var + "_deps";
     const std::string deps_cnt = task_var + "_deps_count";
@@ -2053,7 +2057,7 @@ class OrchestrationStmtCodegen : public CodegenBase {
     const std::string task_var = "params_phase_fence_barrier_" + std::to_string(barrier_idx);
     const std::string deps_cnt = task_var + "_deps_count";
     const std::string outs_var = "phase_fence_barrier_" + std::to_string(barrier_idx) + "_outs";
-    const size_t dep_capacity = CountManualDeps(GetDependencyEdges(call));
+    const size_t dep_capacity = CountManualDeps(GetDependencyEdges(call), call);
     code_ << "\n";
     code_ << Indent() << "// Phase-fence barrier " << barrier_idx << ": dependency-only dummy task\n";
     EmitTaskParamsDecl(Indent(), task_var);

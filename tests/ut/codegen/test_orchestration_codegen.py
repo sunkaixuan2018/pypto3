@@ -4343,7 +4343,7 @@ class TestManualScopeCodegen:
                 other: pl.Tensor[[64], pl.FP32],
             ) -> pl.Tensor[[64], pl.FP32]:
                 with pl.manual_scope():
-                    produced, producer_tid = pl.submit(self.fill, scratch)
+                    produced, _producer_tid = pl.submit(self.fill, scratch)
                     _unused, user_tid = pl.submit(self.unrelated, other)
                     out, _ = pl.submit(self.consume, produced, deps=[user_tid])
                 return out
@@ -4354,7 +4354,9 @@ class TestManualScopeCodegen:
 
         assert "PTO2TaskId params_t2_deps[2];" in code
         assert "params_t2_deps[params_t2_deps_count++] = user_tid;" in code
-        assert "params_t2_deps[params_t2_deps_count++] = producer_tid;" in code
+        producer_tid = re.search(r"PTO2TaskId (\w+) = task_0_outs\.task_id\(\);", code)
+        assert producer_tid, code
+        assert f"params_t2_deps[params_t2_deps_count++] = {producer_tid.group(1)};" in code
         assert code.count("params_t2.set_dependencies(") == 1
 
     def test_auto_scope_does_not_emit_task_id_capture(self):
