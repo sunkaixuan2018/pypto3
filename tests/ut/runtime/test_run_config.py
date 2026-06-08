@@ -197,7 +197,9 @@ class TestRunConfigCompileForwarding:
             make_tensor_arg=lambda _arg: object(),
             scalar_to_uint64=lambda _arg: 0,
         )
+        fake_task_interface = types.SimpleNamespace(device_tensor_to_continuous=lambda _arg: object())
         monkeypatch.setitem(sys.modules, "pypto.runtime.device_runner", fake_device_runner)
+        monkeypatch.setitem(sys.modules, "pypto.runtime.task_interface", fake_task_interface)
 
         execute_compiled(
             tmp_path,
