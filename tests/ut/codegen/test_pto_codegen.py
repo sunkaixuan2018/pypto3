@@ -36,6 +36,7 @@ from pypto.backend.pto_backend import (
 )
 from pypto.ir import OptimizationStrategy, PassManager
 from pypto.ir.builder import IRBuilder
+from pypto.ir.op import tensor as tensor_ops
 from pypto.ir.op import tile
 
 PTOCodegen = codegen.PTOCodegen
@@ -2178,20 +2179,30 @@ def test_pto_codegen_transpose_dynamic_valid_shape_uses_distinct_output_buffer()
     ``!pto.tile_buf<vec, 1x16xf32, valid=?x?>``.
     """
 
-    @pl.program
-    class RowVectorReshapeProgram:
-        @pl.function(type=pl.FunctionType.InCore)
-        def kernel(
-            self,
-            src: pl.Tensor[[1, 16], pl.FP32],
-            valid_rows: pl.Scalar[pl.INDEX],
-            out: pl.Out[pl.Tensor[[16, 1], pl.FP32]],
-        ) -> pl.Tensor[[16, 1], pl.FP32]:
-            row: pl.Tile[[1, 16], pl.FP32] = pl.load(src, [0, 0], [1, 16])
-            col = pl.tile.reshape(row, [16, 1], [valid_rows, 1])
-            return pl.store(col, [0, 0], out)
+    span = ir.Span.unknown()
+    idx = DataType.INDEX
+    in_type = ir.TensorType([1, 16], DataType.FP32)
+    out_type = ir.TensorType([16, 1], DataType.FP32)
+    ib = IRBuilder()
+    with ib.program("row_vector_reshape") as prog:
+        kernel_gvar = prog.declare_function("kernel")
+        prog.declare_function("main")
+        with ib.function("kernel", type=ir.FunctionType.InCore) as f:
+            src = f.param("src", in_type)
+            valid_rows = f.param("valid_rows", ir.ScalarType(idx))
+            f.return_type(out_type)
+            col = ib.let("col", tensor_ops.reshape(src, [16, 1], [valid_rows, 1]))
+            ib.return_stmt(col)
+        prog.add_function(f.get_result())
+        with ib.function("main") as f:
+            src = f.param("src", in_type)
+            valid_rows = f.param("valid_rows", ir.ScalarType(idx))
+            f.return_type(out_type)
+            y = ib.let("y", ir.Call(kernel_gvar, [src, valid_rows], span))
+            ib.return_stmt(y)
+        prog.add_function(f.get_result())
 
-    mlir_code = _generate_default_mlir(RowVectorReshapeProgram)
+    mlir_code = _get_mlir_code(PTOCodegen().generate(_run_default_passes(prog.get_result())))
     ttrans_lines = [line.strip() for line in mlir_code.splitlines() if "pto.ttrans" in line]
     assert len(ttrans_lines) == 1, f"Expected one pto.ttrans, got: {ttrans_lines}"
 
