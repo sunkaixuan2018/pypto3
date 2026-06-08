@@ -183,9 +183,19 @@ class TestRunConfigCompileForwarding:
         def fake_execute_on_device(*args, **kwargs):
             captured["execute"] = {"args": args, "kwargs": kwargs}
 
+        class FakeChipStorageTaskArgs:
+            def add_tensor(self, _arg):
+                return None
+
+            def add_scalar(self, _arg):
+                return None
+
         fake_device_runner = types.SimpleNamespace(
+            ChipStorageTaskArgs=FakeChipStorageTaskArgs,
             compile_and_assemble=fake_compile_and_assemble,
             execute_on_device=fake_execute_on_device,
+            make_tensor_arg=lambda _arg: object(),
+            scalar_to_uint64=lambda _arg: 0,
         )
         monkeypatch.setitem(sys.modules, "pypto.runtime.device_runner", fake_device_runner)
 
