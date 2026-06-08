@@ -511,21 +511,8 @@ static std::string MakeTileTransposeCodegenPTO(const CallPtr& op, codegen::Codeg
   }
   if (!src_type.empty() && !tmp_type.empty() && src_type != tmp_type &&
       src_type.find("v_row=?") == std::string::npos && src_type.find("v_col=?") == std::string::npos) {
-    auto source_tile_type = ir::As<ir::TileType>(op->args_[0]->GetType());
-    INTERNAL_CHECK_SPAN(source_tile_type, op->span_)
-        << "Internal error: tile.transpose source must be TileType when adapting scratch type";
-    auto src_type_info =
-        codegen::ExtractTileTypeInfo(*source_tile_type, codegen.GetTypeString(source_tile_type->dtype_));
-    std::string zero = codegen.GetOrEmitConstant(int64_t{0}, DataType::INDEX);
-    std::string tmp_view = codegen.NewNamedTemp("transpose_tmp_view");
-    std::ostringstream tmp_view_oss;
-    tmp_view_oss << tmp_view << " = pto.subview " << tmp_ssa << "[" << zero << ", " << zero << "] sizes ["
-                 << src_type_info.rows << ", " << src_type_info.cols << "] : " << tmp_type << " -> "
-                 << src_type;
-    codegen.Emit(tmp_view_oss.str());
-    codegen.RegisterTileBufType(tmp_view, src_type);
-    tmp_ssa = tmp_view;
-    tmp_type = src_type;
+    tmp_ssa = codegen.AllocNewTileBufForExistingAddress(tmp_ssa, src_type, "transpose_tmp_static");
+    tmp_type = codegen.GetSSATileBufType(tmp_ssa);
   }
 
   std::string result_target = codegen.GetCurrentResultTarget();

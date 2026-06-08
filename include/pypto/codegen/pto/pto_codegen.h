@@ -313,6 +313,11 @@ class PTOCodegen : public CodegenBase {
                               const std::string& addr_ssa = "", const std::string& valid_row_ssa = "",
                               const std::string& valid_col_ssa = "");
 
+  /// Allocate a new tile buffer with the same addr operand as an existing SSA.
+  std::string AllocNewTileBufForExistingAddress(const std::string& existing_ssa,
+                                                const std::string& tile_buf_type_string,
+                                                const std::string& name_hint = "");
+
   /// Allocate a new tile buffer matching the current assignment result TileType.
   /// Preserves dynamic valid_shape operands.
   std::string AllocNewTileBufForCurrentResult(const std::string& name_hint = "");
@@ -717,6 +722,7 @@ class PTOCodegen : public CodegenBase {
     };
     std::vector<ExtraAllocTile> extra_alloc_tiles;
     std::map<std::string, std::string> ssa_to_tile_buf_type;
+    std::map<std::string, AllocTileFields> ssa_to_alloc_tile_fields;
     std::map<std::string, SubviewMaterializationInfo> subview_materializations;
 
     int temp_counter = 0;
@@ -772,6 +778,7 @@ class PTOCodegen : public CodegenBase {
 
       extra_alloc_tiles.clear();
       ssa_to_tile_buf_type.clear();
+      ssa_to_alloc_tile_fields.clear();
       subview_materializations.clear();
 
       temp_counter = 0;

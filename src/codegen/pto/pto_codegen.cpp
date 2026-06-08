@@ -1084,6 +1084,7 @@ void PTOCodegen::EmitAllocTileForVar(const ir::VarPtr& tile_var,
   Emit(line.str());
 
   fs_.ssa_to_tile_buf_type[tile_buf] = fields.type_str;
+  fs_.ssa_to_alloc_tile_fields[tile_buf] = fields;
 }
 
 // ========================================================================
@@ -1181,7 +1182,20 @@ std::string PTOCodegen::AllocNewTileBuf(const std::string& tile_buf_type_string,
   fs_.extra_alloc_tiles.push_back(
       FunctionState::ExtraAllocTile{name, tile_buf_type_string, addr_ssa, valid_row_ssa, valid_col_ssa});
   fs_.ssa_to_tile_buf_type[name] = tile_buf_type_string;
+  fs_.ssa_to_alloc_tile_fields[name] =
+      AllocTileFields{tile_buf_type_string, addr_ssa, valid_row_ssa, valid_col_ssa};
   return name;
+}
+
+std::string PTOCodegen::AllocNewTileBufForExistingAddress(const std::string& existing_ssa,
+                                                          const std::string& tile_buf_type_string,
+                                                          const std::string& name_hint) {
+  auto it = fs_.ssa_to_alloc_tile_fields.find(existing_ssa);
+  INTERNAL_CHECK(it != fs_.ssa_to_alloc_tile_fields.end())
+      << "Internal error: no alloc_tile metadata registered for SSA '" << existing_ssa << "'";
+  INTERNAL_CHECK(!it->second.addr_ssa.empty())
+      << "Internal error: alloc_tile SSA '" << existing_ssa << "' has no addr operand to reuse";
+  return AllocNewTileBuf(tile_buf_type_string, name_hint, it->second.addr_ssa);
 }
 
 std::string PTOCodegen::AllocNewTileBufForCurrentResult(const std::string& name_hint) {

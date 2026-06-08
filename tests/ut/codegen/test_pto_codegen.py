@@ -2216,19 +2216,22 @@ def test_pto_codegen_transpose_dynamic_valid_shape_uses_distinct_output_buffer()
     assert "v_row=?" in line and "v_col=?" in line, (
         f"transpose output should carry dynamic valid_shape: {line}"
     )
-    tmp_subview_lines = [
-        subview_line.strip()
-        for subview_line in mlir_code.splitlines()
-        if subview_line.strip().startswith(f"{tmp_ssa} = pto.subview")
+    tmp_alloc_lines = [
+        alloc_line
+        for alloc_line in _get_alloc_tile_lines(mlir_code)
+        if alloc_line.startswith(f"{tmp_ssa} = pto.alloc_tile")
     ]
-    assert len(tmp_subview_lines) == 1, (
-        f"Expected one pto.subview for transpose scratch {tmp_ssa}: {mlir_code}"
+    assert len(tmp_alloc_lines) == 1, (
+        f"Expected one static alloc_tile for transpose scratch {tmp_ssa}: {mlir_code}"
     )
-    assert "sizes [1, 16]" in tmp_subview_lines[0], (
-        f"transpose scratch subview must match the static source shape: {tmp_subview_lines[0]}"
+    assert " addr = " in tmp_alloc_lines[0], (
+        f"transpose scratch alloc_tile must reuse the original scratch addr: {tmp_alloc_lines[0]}"
     )
-    tmp_type = tmp_subview_lines[0].split(" -> ", maxsplit=1)[1]
-    assert tmp_type in line, f"ttrans scratch operand must use the static subview type: {line}"
+    tmp_type = tmp_alloc_lines[0].split(" : ", maxsplit=1)[1]
+    assert "v_row=1, v_col=16" in tmp_type, (
+        f"transpose scratch alloc_tile must use the static source type: {tmp_alloc_lines[0]}"
+    )
+    assert tmp_type in line, f"ttrans scratch operand must use the static alloc_tile type: {line}"
     dst_alloc_lines = [
         alloc_line
         for alloc_line in _get_alloc_tile_lines(mlir_code)
