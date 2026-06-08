@@ -836,6 +836,7 @@ def execute_compiled(  # noqa: PLR0913
     level: int = 2,
     block_dim: int | None = None,
     aicpu_thread_num: int | None = None,
+    analyze_auto_scopes_for_deps: bool = False,
 ) -> "RunTiming":
     """Execute a pre-compiled program with user-provided tensors and scalars.
 
@@ -870,6 +871,10 @@ def execute_compiled(  # noqa: PLR0913
             precedence over ``RUNTIME_CONFIG``.
         aicpu_thread_num: Optional override of the AICPU thread count;
             same precedence rules as ``block_dim``.
+        analyze_auto_scopes_for_deps: Compile-side compatibility option.
+            Accepted here so callers that reuse one config dictionary for
+            compile and execute can pass it through safely. It has no effect
+            after the program has already been compiled.
 
     Returns:
         The :class:`RunTiming` from :func:`execute_on_device` (``host_wall_us``
@@ -879,6 +884,8 @@ def execute_compiled(  # noqa: PLR0913
         ``None`` (on a non-``PTO2_PROFILING`` build ``device_wall_us`` is ``0``,
         not absent). Callers that do not need timing can ignore it.
     """
+    del analyze_auto_scopes_for_deps
+
     work_dir = Path(work_dir)
 
     # Ensure orchestration headers are patched (idempotent)

@@ -216,5 +216,25 @@ def test_execute_compiled_no_runtime_config_block_dim_forwards_none(patched_exec
     assert captured["calls"][0]["aicpu_thread_num"] == 4
 
 
+def test_execute_compiled_accepts_compile_side_auto_scope_switch(patched_execute_compiled):
+    """Shared compile/execute configs may include this compile-only switch."""
+    captured, tmp = patched_execute_compiled
+    captured["runtime_config"] = {"runtime": "host_build_graph"}
+
+    from pypto.runtime.runner import execute_compiled  # noqa: PLC0415
+
+    execute_compiled(
+        tmp,
+        [],
+        platform="a2a3sim",
+        device_id=0,
+        analyze_auto_scopes_for_deps=True,
+    )
+
+    assert len(captured["calls"]) == 1
+    assert captured["calls"][0]["block_dim"] is None
+    assert captured["calls"][0]["aicpu_thread_num"] is None
+
+
 if __name__ == "__main__":
     pytest.main([__file__, "-v"])
