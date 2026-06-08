@@ -2238,7 +2238,7 @@ def test_pto_codegen_transpose_dynamic_valid_shape_uses_distinct_output_buffer()
         if alloc_line.startswith(f"{dst_ssa} = pto.alloc_tile")
     ]
     assert len(dst_alloc_lines) == 1, f"Expected one alloc_tile for transpose output {dst_ssa}: {mlir_code}"
-    assert "valid=?" in dst_alloc_lines[0], (
+    assert "v_row=?" in dst_alloc_lines[0] and "v_col=?" in dst_alloc_lines[0], (
         f"transpose output alloc_tile must match the dynamic-valid ttrans output type: {dst_alloc_lines[0]}"
     )
 
