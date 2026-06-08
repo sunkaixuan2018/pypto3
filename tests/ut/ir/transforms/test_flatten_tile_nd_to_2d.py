@@ -2552,8 +2552,8 @@ class TestFlattenTileNdTo2DStandaloneTranspose:
                 x_tile = ib.let("x_tile", tile_ops.load(x, [0, 0], [1, 16], span=span))
                 transpose = ir.create_op_call(
                     "tile.transpose",
-                    [x_tile, ir.ConstInt(0, DataType.INDEX), ir.ConstInt(1, DataType.INDEX)],
-                    {"valid_rows": valid_rows, "valid_cols": ir.ConstInt(1, DataType.INDEX)},
+                    [x_tile, ir.ConstInt(0, DataType.INDEX, span), ir.ConstInt(1, DataType.INDEX, span)],
+                    {"valid_rows": valid_rows, "valid_cols": ir.ConstInt(1, DataType.INDEX, span)},
                     span,
                 )
                 y_tile = ib.let("y_tile", transpose)
