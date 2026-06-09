@@ -43,8 +43,10 @@ scope 发出 `PTO2_SCOPE()`，runtime OverlapMap/TensorMap tracking 也继续启
    region 不同时拓宽为 unknown。
 3. 为 loop 和 while 的 return var 合并初始 carried value 与循环体末尾
    `pl.yield_()` 的 lineage，然后把 region 拓宽为 unknown，因为最终来源受控制流影响。
-4. 把常量矩形 `tensor.slice` window 记录为相对 storage root 的 region。shape 或
-   offset 含符号表达式的 slice 会回退为 unknown region，并保守视为重叠。
+4. 只对裸 tensor 或 packed ND `TensorView` tensor，把常量矩形 `tensor.slice`
+   window 记录为相对 storage root 的 region。shape/offset 含符号表达式、strided
+   view、非 ND layout、`valid_shape` 或 padding 的 slice 会回退为 unknown region，
+   并保守视为重叠。
 5. 对带 MemRef 的 shaped value，如果 `MemRef::MayAlias` 判断它们来自同一 base
    且字节范围重叠或包含符号 offset，则视为可能 alias。
 6. 从 `pl.submit` tuple 尾部收集静态绑定的 producer TaskId。

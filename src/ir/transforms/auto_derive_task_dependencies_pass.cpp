@@ -14,6 +14,7 @@
 #include <cstddef>
 #include <cstdint>
 #include <cstdlib>
+#include <exception>
 #include <iostream>
 #include <limits>
 #include <memory>
@@ -38,6 +39,7 @@
 #include "pypto/ir/transforms/base/visitor.h"
 #include "pypto/ir/transforms/pass_properties.h"
 #include "pypto/ir/transforms/passes.h"
+#include "pypto/ir/transforms/utils/tensor_view_semantics.h"
 #include "pypto/ir/transforms/utils/transform_utils.h"
 #include "pypto/ir/type.h"
 
@@ -218,6 +220,40 @@ StorageLocation UnknownRegionsFor(const StorageLocation& location) {
   return widened;
 }
 
+bool SameStaticConstInt(const ExprPtr& lhs, const ExprPtr& rhs) {
+  auto lhs_const = As<ConstInt>(lhs);
+  auto rhs_const = As<ConstInt>(rhs);
+  return lhs_const && rhs_const && lhs_const->value_ == rhs_const->value_;
+}
+
+bool IsPackedNdTensorView(const TensorTypePtr& tensor_type) {
+  if (!tensor_type || !tensor_type->tensor_view_.has_value()) return true;
+
+  const auto& view = tensor_type->tensor_view_.value();
+  if (view.layout != TensorLayout::ND) return false;
+  if (!view.valid_shape.empty()) return false;
+  if (view.pad != PadValue::null) return false;
+
+  std::vector<ExprPtr> packed_strides;
+  try {
+    packed_strides =
+        tensor_view_semantics::BuildLogicalStridesFromLayout(tensor_type->shape_, TensorLayout::ND);
+  } catch (const std::exception&) {
+    return false;
+  }
+  if (view.stride.size() != packed_strides.size()) return false;
+  for (size_t i = 0; i < view.stride.size(); ++i) {
+    if (!SameStaticConstInt(view.stride[i], packed_strides[i])) return false;
+  }
+  return true;
+}
+
+StorageLocation MaybeUnknownRegionsForTensorType(const StorageLocation& location, const TypePtr& type) {
+  auto tensor_type = As<TensorType>(type);
+  if (!tensor_type || IsPackedNdTensorView(tensor_type)) return location;
+  return UnknownRegionsFor(location);
+}
+
 StorageLocation SliceLocation(const StorageLocation& parent, const ExprPtr& shape_expr,
                               const ExprPtr& offset_expr) {
   StorageLocation sliced;
@@ -368,7 +404,8 @@ class StorageRootAnalysis : public IRVisitor {
   void Initialize(const std::vector<VarPtr>& params) {
     for (const auto& param : params) {
       if (param && IsTensorType(param->GetType())) {
-        RegisterVarLocation(param, SingleLocation(param.get(), FullRegion()));
+        RegisterVarLocation(param, MaybeUnknownRegionsForTensorType(SingleLocation(param.get(), FullRegion()),
+                                                                    param->GetType()));
       }
     }
   }
@@ -526,19 +563,22 @@ class StorageRootAnalysis : public IRVisitor {
     if (auto call = As<Call>(op->value_)) {
       const std::string& op_name = call->op_->name_;
       if (op_name == "tensor.create") {
-        RegisterVarLocation(op->var_, SingleLocation(op->var_.get(), FullRegion()));
+        RegisterVarLocation(op->var_, MaybeUnknownRegionsForTensorType(
+                                          SingleLocation(op->var_.get(), FullRegion()), op->var_->GetType()));
       } else if (op_name == "tensor.slice") {
         if (call->args_.size() >= 3) {
           auto parent = ResolveExpr(call->args_[0]);
           if (HasLocation(parent)) {
-            RegisterVarLocation(op->var_, SliceLocation(parent, call->args_[1], call->args_[2]));
+            RegisterVarLocation(
+                op->var_, MaybeUnknownRegionsForTensorType(
+                              SliceLocation(parent, call->args_[1], call->args_[2]), op->var_->GetType()));
           }
         }
       } else if (op_name == "tensor.assemble") {
         if (!call->args_.empty()) {
           auto base = ResolveExpr(call->args_[0]);
           if (HasLocation(base)) {
-            RegisterVarLocation(op->var_, std::move(base));
+            RegisterVarLocation(op->var_, MaybeUnknownRegionsForTensorType(base, op->var_->GetType()));
           }
         }
       } else if (IsDynamicAccessOp(op_name)) {
@@ -548,7 +588,8 @@ class StorageRootAnalysis : public IRVisitor {
         if (As<TupleType>(call->GetType())) {
           tuple_locations_[op->var_.get()] = std::move(out_locations);
         } else if (!out_locations.empty() && HasLocation(out_locations[0])) {
-          RegisterVarLocation(op->var_, std::move(out_locations[0]));
+          RegisterVarLocation(op->var_,
+                              MaybeUnknownRegionsForTensorType(out_locations[0], op->var_->GetType()));
         }
       }
     } else if (auto submit = As<Submit>(op->value_)) {
@@ -557,7 +598,8 @@ class StorageRootAnalysis : public IRVisitor {
         if (As<TupleType>(submit->GetType())) {
           tuple_locations_[op->var_.get()] = std::move(out_locations);
         } else if (!out_locations.empty() && HasLocation(out_locations[0])) {
-          RegisterVarLocation(op->var_, std::move(out_locations[0]));
+          RegisterVarLocation(op->var_,
+                              MaybeUnknownRegionsForTensorType(out_locations[0], op->var_->GetType()));
         }
       }
     } else if (auto tuple_get = As<TupleGetItemExpr>(op->value_)) {
@@ -566,13 +608,14 @@ class StorageRootAnalysis : public IRVisitor {
         if (it != tuple_locations_.end() && tuple_get->index_ >= 0 &&
             tuple_get->index_ < static_cast<int>(it->second.size()) &&
             HasLocation(it->second[tuple_get->index_])) {
-          RegisterVarLocation(op->var_, it->second[tuple_get->index_]);
+          RegisterVarLocation(
+              op->var_, MaybeUnknownRegionsForTensorType(it->second[tuple_get->index_], op->var_->GetType()));
         }
       }
     } else {
       auto location = ResolveExpr(op->value_);
       if (HasLocation(location)) {
-        RegisterVarLocation(op->var_, std::move(location));
+        RegisterVarLocation(op->var_, MaybeUnknownRegionsForTensorType(location, op->var_->GetType()));
       }
     }
 

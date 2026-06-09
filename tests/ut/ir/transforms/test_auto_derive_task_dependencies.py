@@ -395,6 +395,247 @@ class TestAutoDeriveTaskDependencies:
         out = _run_auto_deps(Prog)
         assert "compiler_manual_dep_edges" not in _printed(out)
 
+    def test_packed_nd_tensor_view_disjoint_slices_do_not_add_compiler_edge(self):
+        @pl.program
+        class Prog:
+            @pl.function(type=pl.FunctionType.InCore)
+            def fill(
+                self,
+                out: pl.Out[
+                    pl.Tensor[
+                        [32, 32],
+                        pl.FP32,
+                        pl.TensorView(stride=[32, 1], layout=pl.TensorLayout.ND),
+                    ]
+                ],
+            ) -> pl.Tensor[
+                [32, 32],
+                pl.FP32,
+                pl.TensorView(stride=[32, 1], layout=pl.TensorLayout.ND),
+            ]:
+                return out
+
+            @pl.function(type=pl.FunctionType.InCore)
+            def consume(
+                self,
+                x: pl.Tensor[
+                    [32, 32],
+                    pl.FP32,
+                    pl.TensorView(stride=[32, 1], layout=pl.TensorLayout.ND),
+                ],
+            ) -> pl.Tensor[
+                [32, 32],
+                pl.FP32,
+                pl.TensorView(stride=[32, 1], layout=pl.TensorLayout.ND),
+            ]:
+                return x
+
+            @pl.function(type=pl.FunctionType.Orchestration)
+            def main(
+                self,
+                scratch: pl.Tensor[
+                    [64, 32],
+                    pl.FP32,
+                    pl.TensorView(stride=[32, 1], layout=pl.TensorLayout.ND),
+                ],
+            ) -> pl.Tensor[
+                [32, 32],
+                pl.FP32,
+                pl.TensorView(stride=[32, 1], layout=pl.TensorLayout.ND),
+            ]:
+                with pl.manual_scope():
+                    top = scratch[0:32, 0:32]
+                    bottom = scratch[32:64, 0:32]
+                    _produced, producer_tid = pl.submit(self.fill, top)
+                    out, _ = pl.submit(self.consume, bottom)
+                return out
+
+        out = _run_auto_deps(Prog)
+        assert "compiler_manual_dep_edges" not in _printed(out)
+
+    def test_strided_nd_tensor_view_disjoint_slices_stay_conservative(self):
+        @pl.program
+        class Prog:
+            @pl.function(type=pl.FunctionType.InCore)
+            def fill(
+                self,
+                out: pl.Out[
+                    pl.Tensor[
+                        [16, 32],
+                        pl.FP32,
+                        pl.TensorView(stride=[64, 1], layout=pl.TensorLayout.ND),
+                    ]
+                ],
+            ) -> pl.Tensor[
+                [16, 32],
+                pl.FP32,
+                pl.TensorView(stride=[64, 1], layout=pl.TensorLayout.ND),
+            ]:
+                return out
+
+            @pl.function(type=pl.FunctionType.InCore)
+            def consume(
+                self,
+                x: pl.Tensor[
+                    [16, 32],
+                    pl.FP32,
+                    pl.TensorView(stride=[64, 1], layout=pl.TensorLayout.ND),
+                ],
+            ) -> pl.Tensor[
+                [16, 32],
+                pl.FP32,
+                pl.TensorView(stride=[64, 1], layout=pl.TensorLayout.ND),
+            ]:
+                return x
+
+            @pl.function(type=pl.FunctionType.Orchestration)
+            def main(
+                self,
+                scratch: pl.Tensor[
+                    [32, 32],
+                    pl.FP32,
+                    pl.TensorView(stride=[64, 1], layout=pl.TensorLayout.ND),
+                ],
+            ) -> pl.Tensor[
+                [16, 32],
+                pl.FP32,
+                pl.TensorView(stride=[64, 1], layout=pl.TensorLayout.ND),
+            ]:
+                with pl.manual_scope():
+                    top = scratch[0:16, 0:32]
+                    bottom = scratch[16:32, 0:32]
+                    _produced, producer_tid = pl.submit(self.fill, top)
+                    out, _ = pl.submit(self.consume, bottom)
+                return out
+
+        out = _run_auto_deps(Prog)
+        consume_call = _user_calls(out, "consume")[0]
+        edges = _compiler_edges(consume_call)
+        assert len(edges) == 1
+        assert edges[0].name_hint == "producer_tid"
+
+    def test_dn_tensor_view_disjoint_slices_stay_conservative(self):
+        @pl.program
+        class Prog:
+            @pl.function(type=pl.FunctionType.InCore)
+            def fill(
+                self,
+                out: pl.Out[
+                    pl.Tensor[
+                        [16, 32],
+                        pl.FP32,
+                        pl.TensorView(stride=[1, 16], layout=pl.TensorLayout.DN),
+                    ]
+                ],
+            ) -> pl.Tensor[
+                [16, 32],
+                pl.FP32,
+                pl.TensorView(stride=[1, 16], layout=pl.TensorLayout.DN),
+            ]:
+                return out
+
+            @pl.function(type=pl.FunctionType.InCore)
+            def consume(
+                self,
+                x: pl.Tensor[
+                    [16, 32],
+                    pl.FP32,
+                    pl.TensorView(stride=[1, 16], layout=pl.TensorLayout.DN),
+                ],
+            ) -> pl.Tensor[
+                [16, 32],
+                pl.FP32,
+                pl.TensorView(stride=[1, 16], layout=pl.TensorLayout.DN),
+            ]:
+                return x
+
+            @pl.function(type=pl.FunctionType.Orchestration)
+            def main(
+                self,
+                scratch: pl.Tensor[
+                    [32, 32],
+                    pl.FP32,
+                    pl.TensorView(stride=[1, 32], layout=pl.TensorLayout.DN),
+                ],
+            ) -> pl.Tensor[
+                [16, 32],
+                pl.FP32,
+                pl.TensorView(stride=[1, 16], layout=pl.TensorLayout.DN),
+            ]:
+                with pl.manual_scope():
+                    top = scratch[0:16, 0:32]
+                    bottom = scratch[16:32, 0:32]
+                    _produced, producer_tid = pl.submit(self.fill, top)
+                    out, _ = pl.submit(self.consume, bottom)
+                return out
+
+        out = _run_auto_deps(Prog)
+        consume_call = _user_calls(out, "consume")[0]
+        edges = _compiler_edges(consume_call)
+        assert len(edges) == 1
+        assert edges[0].name_hint == "producer_tid"
+
+    def test_tensor_view_valid_shape_disjoint_slices_stay_conservative(self):
+        @pl.program
+        class Prog:
+            @pl.function(type=pl.FunctionType.InCore)
+            def fill(
+                self,
+                out: pl.Out[
+                    pl.Tensor[
+                        [16, 32],
+                        pl.FP32,
+                        pl.TensorView(stride=[32, 1], layout=pl.TensorLayout.ND, valid_shape=[15, 32]),
+                    ]
+                ],
+            ) -> pl.Tensor[
+                [16, 32],
+                pl.FP32,
+                pl.TensorView(stride=[32, 1], layout=pl.TensorLayout.ND, valid_shape=[15, 32]),
+            ]:
+                return out
+
+            @pl.function(type=pl.FunctionType.InCore)
+            def consume(
+                self,
+                x: pl.Tensor[
+                    [16, 32],
+                    pl.FP32,
+                    pl.TensorView(stride=[32, 1], layout=pl.TensorLayout.ND, valid_shape=[15, 32]),
+                ],
+            ) -> pl.Tensor[
+                [16, 32],
+                pl.FP32,
+                pl.TensorView(stride=[32, 1], layout=pl.TensorLayout.ND, valid_shape=[15, 32]),
+            ]:
+                return x
+
+            @pl.function(type=pl.FunctionType.Orchestration)
+            def main(
+                self,
+                scratch: pl.Tensor[
+                    [32, 32],
+                    pl.FP32,
+                    pl.TensorView(stride=[32, 1], layout=pl.TensorLayout.ND, valid_shape=[31, 32]),
+                ],
+            ) -> pl.Tensor[
+                [16, 32],
+                pl.FP32,
+                pl.TensorView(stride=[32, 1], layout=pl.TensorLayout.ND, valid_shape=[15, 32]),
+            ]:
+                with pl.manual_scope():
+                    top = scratch[0:16, 0:32]
+                    bottom = scratch[16:32, 0:32]
+                    _produced, producer_tid = pl.submit(self.fill, top)
+                    out, _ = pl.submit(self.consume, bottom)
+                return out
+
+        out = _run_auto_deps(Prog)
+        consume_call = _user_calls(out, "consume")[0]
+        edges = _compiler_edges(consume_call)
+        assert len(edges) == 1
+        assert edges[0].name_hint == "producer_tid"
+
     def test_static_overlapping_slices_add_compiler_edge(self):
         @pl.program
         class Prog:

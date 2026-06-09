@@ -50,8 +50,9 @@ For each function body:
    with the trailing body `pl.yield_()` value, then widening regions to unknown
    because the final iteration source is control-flow dependent.
 4. Track constant rectangular `tensor.slice` windows as regions relative to the
-   storage root. Slices with symbolic shape or offset fall back to an unknown
-   region and overlap conservatively.
+   storage root only for bare tensors or packed ND `TensorView` tensors. Slices
+   with symbolic shape/offset, strided views, non-ND layouts, `valid_shape`, or
+   padding fall back to an unknown region and overlap conservatively.
 5. Treat MemRef-backed shaped values as aliases when `MemRef::MayAlias` reports
    the same base allocation with overlapping or symbolic byte ranges.
 6. Collect statically bound producer TaskIds from `pl.submit` tuple tails.
