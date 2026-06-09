@@ -265,12 +265,14 @@ inline const PassProperties kExpandManualPhaseFenceProperties{
     .produced = {IRProperty::NoNestedCalls, IRProperty::NormalizedStmtStructure,
                  IRProperty::CallDirectionsResolved}};
 
-// -- Automatic manual-scope task dependency pass -----------------------------
+// -- Automatic runtime-scope task dependency pass -----------------------------
 //
 // Reads ``Call.attrs_["arg_directions"]`` and writes
-// ``Call.attrs_["compiler_manual_dep_edges"]`` inside manual runtime scopes.
-// The pass preserves CallDirectionsResolved because it does not rewrite call
-// args or direction attrs.
+// ``Call.attrs_["compiler_manual_dep_edges"]`` for runtime scopes. MANUAL
+// scopes are analyzed in the default pipeline. AUTO-scope analysis is
+// controlled by the pass option and remains off by default at high-level
+// pipeline entry points. The pass preserves CallDirectionsResolved because it
+// does not rewrite call args or direction attrs.
 inline const PassProperties kAutoDeriveTaskDependenciesProperties{
     .required = {IRProperty::SplitIncoreOrch, IRProperty::CallDirectionsResolved},
     .produced = {IRProperty::CallDirectionsResolved}};

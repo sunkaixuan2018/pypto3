@@ -2,15 +2,17 @@
 
 ## 状态
 
-这是 `auto-deps` 分支的设计提案。本文描述的 pass 还没有接入默认
-pipeline。
+这是 `auto-deps` 分支已经落地的设计。该 pass 现在已经接入默认 pipeline，
+位置在 `DeriveCallDirections` 之后。默认情况下它会分析
+`with pl.manual_scope():` 区域；AUTO-scope 分析仍需要通过编译期开关
+`analyze_auto_scopes_for_deps` 显式开启。
 
 ## 目标
 
 在 pass 层推导 task 之间的依赖边，让用户大多数情况下不需要手写
-`pl.submit(..., deps=[...])`。第一阶段目标是保证 `with pl.manual_scope():`
-的正确性；普通 auto scope 仍保留 runtime TensorMap 作为 fallback，等分析成熟
-后再考虑接管。
+`pl.submit(..., deps=[...])`。默认 pipeline 的目标是保证
+`with pl.manual_scope():` 的正确性；普通 AUTO scope 默认仍保留 runtime
+TensorMap/OverlapMap tracking，只有调用方显式开启 AUTO-scope 分析时才接入。
 
 下沉路径复用现有机制：
 
@@ -18,7 +20,9 @@ pipeline。
 Call.attrs["manual_dep_edges"] -> orchestration codegen -> Arg::set_dependencies(...)
 ```
 
-P0 不需要修改 runtime。
+P0 不需要修改 runtime 实现。但编译器可能会为 MANUAL scope 额外发出
+`Arg::set_dependencies(...)`，也可能在无法完整静态编码依赖时把整个 MANUAL
+scope fallback 成 AUTO，让 runtime tracking 保证正确性。
 
 ## 当前代码触点
 
@@ -75,17 +79,21 @@ Hazard 规则：
 3. 不修改现有 `BufferRootCollector`。auto-deps 需要新的
    `StorageRootAnalysis`，因为 storage 语义和 direction/codegen root 语义不同。
 4. dynamic fan-in 只有在能编码成现有 `Scalar[TASK_ID]` 或定长
-   `Array[N, TASK_ID]` carry 时才支持。`manual_scope` 下无法表达的情况应给出
-   明确诊断，而不是泛化的 internal check。
+   `Array[N, TASK_ID]` carry 时才支持。`manual_scope` 下无法表达的情况会让整个
+   scope fallback 到 AUTO runtime tracking，而不是在 MANUAL 区域里留下部分
+   compiler deps。
 
 ## P0：Manual-Scope 正确性
 
 范围：
 
-- 只分析 `with pl.manual_scope():`。
+- 默认 pipeline 会分析 `with pl.manual_scope():`。
+- AUTO-scope 分析默认关闭；调用方必须通过
+  `analyze_auto_scopes_for_deps=True` 显式开启。
 - 只在能静态表达依赖集合时自动生成 deps。
 - 保留用户手写 `deps=[...]`，去重后追加 compiler deps。
-- 普通 auto scope 不变。
+- 如果某个 MANUAL scope 不能完整编码成固定 TaskId deps，则把整个 scope 改写为
+  AUTO，让 TensorMap/OverlapMap 保守跟踪。
 
 实现清单：
 
@@ -97,8 +105,22 @@ Hazard 规则：
 3. 为可能作为依赖 producer 的 call 生成或保留 producer TaskId 变量。
 4. 维护每个 scope 内的历史 read/write access 集合，并为 RAW/WAR/WAW hazard
    发出 compiler dependency edges。
-5. 增加测试：overlap、暂时保守处理的 disjoint window、用户 deps 加 compiler
-   deps、unsupported dynamic fan-in 诊断。
+5. 增加测试：overlap、可证明 disjoint 的静态 window、用户 deps 加 compiler
+   deps、unsupported dynamic fan-in 的 whole-scope fallback。
+
+## 默认路径影响
+
+- 默认 pipeline 中的 MANUAL scope 现在可能新增编译器推导的
+  `compiler_manual_dep_edges`，codegen 会把它们下沉为
+  `Arg::set_dependencies(...)`。如果编译器发现用户 deps 没覆盖的 RAW/WAR/WAW
+  hazard，就可能增加保守排序。
+- 如果某个 MANUAL scope 无法安全地把所有必需依赖编码成固定 TaskId deps，pass
+  会剥离该 scope 内已经生成的部分 compiler deps，并把整个 scope 发出为
+  `manual=false`。这是有意的正确性 fallback：它可能重新启用 runtime
+  TensorMap/OverlapMap 开销，但避免 MANUAL scope 中静态 deps 不完整的不安全状态。
+- Dead scalar assignment elimination 现在会无条件保留 TaskId tuple-element
+  extract。这是一个很小的默认路径变化：以前可能被删掉的廉价 scalar TaskId
+  local 会被保留，方便后续 dependency pass 和 codegen 恢复 producer task id。
 
 ## P1：稳定 Storage Lineage
 

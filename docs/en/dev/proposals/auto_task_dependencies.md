@@ -2,15 +2,18 @@
 
 ## Status
 
-Design proposal for the `auto-deps` branch. The pass described here is not yet
-registered in the default pipeline.
+Implemented design for the `auto-deps` branch. The pass is now registered in
+the default pipeline after `DeriveCallDirections`. By default it analyzes
+`with pl.manual_scope():` regions. AUTO-scope analysis remains opt-in through
+the compile-time `analyze_auto_scopes_for_deps` switch.
 
 ## Goal
 
 Derive task-to-task dependencies in the pass layer so users do not need to
-write most `pl.submit(..., deps=[...])` edges by hand. The first target is
-correctness for `with pl.manual_scope():`; normal auto scope keeps the runtime
-TensorMap as a fallback until the analysis is mature.
+write most `pl.submit(..., deps=[...])` edges by hand. The default pipeline
+target is correctness for `with pl.manual_scope():`; normal AUTO scope keeps
+runtime TensorMap/OverlapMap tracking unless callers explicitly enable
+AUTO-scope analysis.
 
 The lowering target is the existing path:
 
@@ -18,7 +21,10 @@ The lowering target is the existing path:
 Call.attrs["manual_dep_edges"] -> orchestration codegen -> Arg::set_dependencies(...)
 ```
 
-No runtime change is required for P0.
+No runtime implementation change is required for P0. The compiler may still
+emit additional `Arg::set_dependencies(...)` calls for MANUAL scopes, and may
+fall an unencodable MANUAL scope back to AUTO mode so runtime tracking preserves
+correctness.
 
 ## Current Code Touchpoints
 
@@ -78,17 +84,20 @@ Hazards:
    direction/codegen root semantics.
 4. Dynamic fan-in is only supported when it can be encoded as existing
    `Scalar[TASK_ID]` or fixed-size `Array[N, TASK_ID]` carries. Unsupported
-   `manual_scope` cases should produce a targeted diagnostic, not a generic
-   internal check.
+   `manual_scope` cases fall back for the whole scope to AUTO runtime tracking
+   rather than leaving partial compiler deps inside a MANUAL region.
 
 ## P0: Manual-Scope Correctness
 
 Scope:
 
-- Only analyze `with pl.manual_scope():`.
+- Analyze `with pl.manual_scope():` in the default pipeline.
+- Keep AUTO-scope analysis disabled by default; callers must opt in with
+  `analyze_auto_scopes_for_deps=True`.
 - Only synthesize deps when the representation is statically encodable.
 - Preserve user-written `deps=[...]` and add compiler deps after de-duplication.
-- Keep normal auto scope unchanged.
+- If a MANUAL scope cannot be completely encoded as fixed TaskId deps, rewrite
+  the whole scope to AUTO so TensorMap/OverlapMap can conservatively track it.
 
 Implementation checklist:
 
@@ -101,8 +110,24 @@ Implementation checklist:
    dependency producers.
 4. Maintain per-scope prior read/write access sets and emit compiler dependency
    edges for RAW/WAR/WAW hazards.
-5. Add tests for overlap, disjoint windows conservatively treated as overlap,
-   user deps plus compiler deps, and unsupported dynamic fan-in diagnostics.
+5. Add tests for overlap, proven-disjoint static windows, user deps plus
+   compiler deps, and unsupported dynamic fan-in whole-scope fallback.
+
+## Default-Path Effects
+
+- MANUAL scopes in the default pipeline may now gain compiler-derived
+  `compiler_manual_dep_edges`, which codegen lowers to
+  `Arg::set_dependencies(...)`. This can add conservative ordering where the
+  compiler finds a RAW/WAR/WAW hazard not already covered by user deps.
+- If analysis cannot safely encode all required deps for a MANUAL scope, the
+  pass strips any partial compiler-derived deps from that whole scope and emits
+  it as `manual=false`. This is an intentional correctness fallback: it may
+  re-enable runtime TensorMap/OverlapMap overhead, but it avoids the unsafe
+  state of a MANUAL scope with incomplete static deps.
+- Dead scalar assignment elimination now preserves TaskId tuple-element
+  extracts unconditionally. This is a small default-path change that may keep a
+  cheap scalar TaskId local which was previously removed, so later dependency
+  passes and codegen can still recover producer task ids.
 
 ## P1: Stable Storage Lineage
 

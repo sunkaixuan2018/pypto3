@@ -23,14 +23,17 @@ them immediately before emitting `Arg::set_dependencies(...)`.
     -> Simplify (final)
 ```
 
-The pass analyzes both MANUAL and AUTO regions. Hand-placed AUTO
+The pass is active for MANUAL regions in the default pipeline. AUTO regions are
+different: they are analyzed only when the compile-time
+`analyze_auto_scopes_for_deps` switch is enabled. Hand-placed AUTO
 `RuntimeScopeStmt` nodes keep `manual=false` in the output IR. For default
-`auto_scope=True` orchestration functions, this pass runs before
-`MaterializeRuntimeScopes`, so it uses an analysis-only virtual AUTO region
-around the function body and does not insert or move scope wrappers. Codegen
-still emits `PTO2_SCOPE()` from `MaterializeRuntimeScopes`, and runtime
-OverlapMap/TensorMap tracking remains enabled. Compiler-derived edges, when
-statically encodable, are emitted on top through `Arg::set_dependencies(...)`.
+`auto_scope=True` orchestration functions, the pass runs before
+`MaterializeRuntimeScopes`; when AUTO analysis is enabled, it uses an
+analysis-only virtual AUTO region around the function body and does not insert
+or move scope wrappers. Codegen still emits `PTO2_SCOPE()` from
+`MaterializeRuntimeScopes`, and runtime OverlapMap/TensorMap tracking remains
+enabled. Compiler-derived edges, when statically encodable, are emitted on top
+through `Arg::set_dependencies(...)`.
 
 ## Algorithm
 
@@ -81,6 +84,25 @@ Implemented fallback triggers include:
 
 This returns the entire region to runtime OverlapMap/TensorMap tracking instead
 of mixing partial compiler deps with runtime state at scope boundaries.
+
+This fallback also applies to user-written MANUAL scopes. It is a correctness
+fallback, not a performance guarantee: a scope the user wrote as
+`pl.manual_scope()` may compile as AUTO if the compiler cannot safely encode all
+needed dependencies as fixed TaskId edges. User-written `deps=[...]` are still
+preserved, and runtime tracking supplies the missing conservative ordering.
+
+## Default-Path Changes
+
+- MANUAL scopes are analyzed by default and may gain
+  `compiler_manual_dep_edges` that lower to `Arg::set_dependencies(...)`.
+  These edges are conservative and may add ordering not present before this
+  pass was registered.
+- AUTO-scope analysis is opt-in. With the default switch value, AUTO runtime
+  scope mode and TensorMap/OverlapMap tracking remain unchanged.
+- Dead scalar assignment elimination preserves TaskId tuple-element extracts in
+  all builds. This can leave a cheap scalar TaskId local that older pipelines
+  might have removed, so dependency derivation/codegen can recover producer task
+  ids.
 
 ## Properties
 
