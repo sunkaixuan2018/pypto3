@@ -71,6 +71,9 @@ enum class IRProperty : uint64_t {
                                     ///< value->GetType()) — covers dtype, shape, tile_view/tensor_view, and
                                     ///< TileType memory_space (memref excluded as an allocation detail;
                                     ///< memory_space exists only on TileType, not TensorType)
+  ManualDepsOnSubmitOnly,           ///< No plain cross-function Call (GlobalVar callee) carries
+                                    ///< attrs["manual_dep_edges"] — manual dependency edges live in the
+                                    ///< typed Submit::deps_ field. Op calls (system.task_dummy) are exempt
   kCount                            ///< Sentinel (must be last)
 };
 
@@ -201,8 +204,9 @@ enum class VerificationLevel {
  * @brief Get the set of properties automatically verified during compilation
  *
  * Returns {SSAForm, TypeChecked, MixedKernelExpanded, AllocatedMemoryAddr,
- * BreakContinueValid, NoRedundantBlocks} — lightweight checks that catch the
- * most common IR errors.
+ * BreakContinueValid, NoRedundantBlocks, InOutUseValid,
+ * CallDirectionsResolved, ManualDepsOnSubmitOnly} — lightweight checks that
+ * catch the most common IR errors.
  */
 const IRPropertySet& GetVerifiedProperties();
 
@@ -212,7 +216,7 @@ const IRPropertySet& GetVerifiedProperties();
  * These are verified automatically at pipeline start and never declared
  * in per-pass PassProperties. Returns {TypeChecked, BreakContinueValid,
  * NoRedundantBlocks, UseAfterDef, OutParamNotShadowed, NoNestedInCore,
- * InOutUseValid, PipelineLoopValid}.
+ * InOutUseValid, PipelineLoopValid, ArrayNotEscaped, ManualDepsOnSubmitOnly}.
  */
 const IRPropertySet& GetStructuralProperties();
 
