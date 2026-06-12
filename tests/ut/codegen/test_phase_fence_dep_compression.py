@@ -439,9 +439,15 @@ class TestPhaseFenceDepCompressionCodegen:
                 return out
 
         code = _compile_program(Prog)
-        # This mixed graph is not a stable phase-fence compression shape; it
-        # falls back to direct fan-in deps on the relevant TaskId array.
-        assert "rt_submit_dummy_task" not in code, code
+        # Mixed shapes keep compressible array deps as phase fences and leave
+        # the non-covered deps as direct fan-in arrays.
+        assert code.count("rt_submit_dummy_task(params_phase_fence_barrier_") == 1, code
+        assert re.search(r"PTO2TaskId params_phase_fence_barrier_\d+_deps\[3\];", code), code
+        assert re.search(
+            r"if \(phase_fence_barrier_\d+_tid\.is_valid\(\)\) "
+            r"params_t\d+_deps\[params_t\d+_deps_count\+\+\] = phase_fence_barrier_\d+_tid;",
+            code,
+        ), code
         assert re.search(r"PTO2TaskId params_t\d+_deps\[3\];", code), code
         _assert_ordered(
             code,
