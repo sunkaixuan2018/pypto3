@@ -935,7 +935,7 @@ class TestAutoDeriveTaskDependencies:
         assert len(edges) == 1
         assert edges[0].name_hint == "producer_tid"
 
-    def test_unencodable_auto_scope_hazard_keeps_auto_scope_without_compiler_edges(self):
+    def test_plain_call_auto_scope_hazard_adds_synthetic_edge_when_enabled(self):
         @pl.program
         class Prog:
             @pl.function(type=pl.FunctionType.InCore)
@@ -961,7 +961,9 @@ class TestAutoDeriveTaskDependencies:
         assert len(scopes) == 1
         assert scopes[0].manual is False
         consume_call = _user_calls(out, "consume")[0]
-        assert _compiler_edges(consume_call) == []
+        edges = _compiler_edges(consume_call)
+        assert len(edges) == 1
+        assert edges[0].name_hint == "produced"
 
     def test_dynamic_gather_result_falls_back_to_auto_scope(self):
         @pl.program

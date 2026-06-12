@@ -439,9 +439,10 @@ class TestPhaseFenceDepCompressionCodegen:
                 return out
 
         code = _compile_program(Prog)
-        # User-written manual scopes are not analyzed by AutoDeriveTaskDependencies;
-        # all array fan-in deps remain in the manual phase-fence path.
-        _assert_single_barrier_shape(code, fanin=branches)
+        # This mixed graph is not a stable phase-fence compression shape; it
+        # falls back to direct fan-in deps on the relevant TaskId array.
+        assert "rt_submit_dummy_task" not in code, code
+        assert re.search(r"PTO2TaskId params_t\d+_deps\[3\];", code), code
         _assert_ordered(
             code,
             "for (int64_t group =",

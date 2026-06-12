@@ -4852,8 +4852,8 @@ class TestManualScopeCodegen:
             code,
         ), code
 
-    def test_manual_scope_merges_user_and_compiler_deps(self):
-        """Auto-deps: compiler deps merge with user deps in manual scope."""
+    def test_manual_scope_preserves_user_deps_without_compiler_deps(self):
+        """Auto-deps: user deps stay intact while manual scopes are skipped."""
         backend.reset_for_testing()
         backend.set_backend_type(BackendType.Ascend910B)
 
@@ -4890,11 +4890,9 @@ class TestManualScopeCodegen:
         transformed = pm.run_passes(Prog)
         code = _generate_orch_code(transformed)
 
-        assert "PTO2TaskId params_t2_deps[2];" in code
+        assert "PTO2TaskId params_t2_deps[1];" in code
         assert "params_t2_deps[params_t2_deps_count++] = user_tid;" in code
-        producer_tid = re.search(r"PTO2TaskId (\w+) = task_0_outs\.task_id\(\);", code)
-        assert producer_tid, code
-        assert f"params_t2_deps[params_t2_deps_count++] = {producer_tid.group(1)};" in code
+        assert "task_0_outs.task_id()" not in code
         assert code.count("params_t2.set_dependencies(") == 1
 
     def test_auto_scope_does_not_emit_task_id_capture(self):
