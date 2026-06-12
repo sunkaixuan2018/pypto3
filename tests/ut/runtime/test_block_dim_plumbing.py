@@ -101,7 +101,7 @@ def test_execute_on_device_skips_config_assignment_when_block_dim_none(patched_e
     # Neither block_dim nor aicpu_thread_num should have been written.
     assert "block_dim" not in cfg._writes
     assert "aicpu_thread_num" not in cfg._writes
-    assert cfg.enable_dump_tensor is False
+    assert cfg.enable_dump_tensor == 0
     # Profiling flag is always set — sanity-check the spy is active.
     assert "enable_l2_swimlane" in cfg._writes
 
@@ -123,6 +123,24 @@ def test_execute_on_device_sets_block_dim_when_provided(patched_execute_on_devic
     cfg = patched_execute_on_device
     assert cfg.block_dim == 8
     assert cfg.aicpu_thread_num == 3
+
+
+def test_execute_on_device_preserves_dump_tensor_full_level(patched_execute_on_device):
+    """``enable_dump_tensor=2`` must reach ``ChipCallConfig`` as level 2."""
+    from pypto.runtime.device_runner import execute_on_device  # noqa: PLC0415
+
+    execute_on_device(
+        MagicMock(name="chip_callable"),
+        MagicMock(name="orch_args"),
+        platform="a2a3sim",
+        runtime_name="host_build_graph",
+        device_id=0,
+        output_prefix="/tmp/pypto-dfx",
+        enable_dump_tensor=2,
+    )
+
+    cfg = patched_execute_on_device
+    assert cfg.enable_dump_tensor == 2
 
 
 # ---------------------------------------------------------------------------
