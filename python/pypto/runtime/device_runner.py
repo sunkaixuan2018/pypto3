@@ -613,7 +613,7 @@ def execute_on_device(  # noqa: PLR0913
     # type); ``enable_dump_tensor`` is a dump level (0 off, 1 partial, 2 full)
     # — the setter also accepts a bool (True→1 partial, False→0).
     cfg.enable_l2_swimlane = enable_l2_swimlane
-    cfg.enable_dump_tensor = bool(enable_dump_tensor)
+    cfg.enable_dump_tensor = enable_dump_tensor
     cfg.enable_pmu = enable_pmu
     cfg.enable_dep_gen = enable_dep_gen
     if enable_scope_stats:
