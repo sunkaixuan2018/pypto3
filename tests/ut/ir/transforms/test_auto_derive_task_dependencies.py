@@ -133,7 +133,7 @@ class TestAutoDeriveTaskDependencies:
             def consume(self, x: pl.Tensor[[64], pl.FP32]) -> pl.Tensor[[64], pl.FP32]:
                 return x
 
-            @pl.function(type=pl.FunctionType.Orchestration)
+            @pl.function(type=pl.FunctionType.Orchestration, auto_scope=False)
             def main(self, scratch: pl.Tensor[[64], pl.FP32]) -> pl.Tensor[[64], pl.FP32]:
                 with pl.scope(mode=pl.ScopeMode.AUTO):
                     produced, producer_tid = pl.submit(self.fill, scratch)
@@ -157,7 +157,7 @@ class TestAutoDeriveTaskDependencies:
             def read2(self, x: pl.Tensor[[64], pl.FP32]) -> pl.Tensor[[64], pl.FP32]:
                 return x
 
-            @pl.function(type=pl.FunctionType.Orchestration)
+            @pl.function(type=pl.FunctionType.Orchestration, auto_scope=False)
             def main(self, x: pl.Tensor[[64], pl.FP32]) -> pl.Tensor[[64], pl.FP32]:
                 with pl.scope(mode=pl.ScopeMode.AUTO):
                     _a, _tid = pl.submit(self.read1, x)
@@ -178,7 +178,7 @@ class TestAutoDeriveTaskDependencies:
             ) -> pl.Tensor[[64], pl.FP32, pl.MemRef("shared_ddr", 0, 256)]:
                 return out
 
-            @pl.function(type=pl.FunctionType.Orchestration)
+            @pl.function(type=pl.FunctionType.Orchestration, auto_scope=False)
             def main(
                 self,
                 first: pl.Tensor[[64], pl.FP32, pl.MemRef("shared_ddr", 0, 256)],
@@ -209,7 +209,7 @@ class TestAutoDeriveTaskDependencies:
             ) -> pl.Tensor[[64], pl.FP32]:
                 return out
 
-            @pl.function(type=pl.FunctionType.Orchestration)
+            @pl.function(type=pl.FunctionType.Orchestration, auto_scope=False)
             def main(self, scratch: pl.Tensor[[64], pl.FP32]) -> pl.Tensor[[64], pl.FP32]:
                 with pl.scope(mode=pl.ScopeMode.AUTO):
                     _seen, reader_tid = pl.submit(self.read, scratch)
@@ -266,7 +266,7 @@ class TestAutoDeriveTaskDependencies:
                     out, _ = pl.submit(self.consume, produced)
                 return out
 
-        out = _run_auto_deps(Prog, analyze_auto_scopes=True)
+        out = _run_auto_deps(Prog)
         scopes = _runtime_scopes(out)
         assert len(scopes) == 1
         assert scopes[0].manual is False
@@ -355,7 +355,7 @@ class TestAutoDeriveTaskDependencies:
             def consume(self, x: pl.Tensor[[64], pl.FP32]) -> pl.Tensor[[64], pl.FP32]:
                 return x
 
-            @pl.function(type=pl.FunctionType.Orchestration)
+            @pl.function(type=pl.FunctionType.Orchestration, auto_scope=False)
             def main(
                 self,
                 scratch: pl.Tensor[[64], pl.FP32],
@@ -411,7 +411,7 @@ class TestAutoDeriveTaskDependencies:
             def consume(self, x: pl.Tensor[[32], pl.FP32]) -> pl.Tensor[[32], pl.FP32]:
                 return x
 
-            @pl.function(type=pl.FunctionType.Orchestration)
+            @pl.function(type=pl.FunctionType.Orchestration, auto_scope=False)
             def main(self, scratch: pl.Tensor[[64], pl.FP32]) -> pl.Tensor[[32], pl.FP32]:
                 with pl.scope(mode=pl.ScopeMode.AUTO):
                     left = scratch[0:32]
@@ -420,7 +420,7 @@ class TestAutoDeriveTaskDependencies:
                     out, _ = pl.submit(self.consume, right)
                 return out
 
-        out = _run_auto_deps(Prog)
+        out = _run_auto_deps(Prog, analyze_auto_scopes=True)
         assert "compiler_manual_dep_edges" not in _printed(out)
 
     def test_packed_nd_tensor_view_disjoint_slices_do_not_add_compiler_edge(self):
@@ -458,7 +458,7 @@ class TestAutoDeriveTaskDependencies:
             ]:
                 return x
 
-            @pl.function(type=pl.FunctionType.Orchestration)
+            @pl.function(type=pl.FunctionType.Orchestration, auto_scope=False)
             def main(
                 self,
                 scratch: pl.Tensor[
@@ -516,7 +516,7 @@ class TestAutoDeriveTaskDependencies:
             ]:
                 return x
 
-            @pl.function(type=pl.FunctionType.Orchestration)
+            @pl.function(type=pl.FunctionType.Orchestration, auto_scope=False)
             def main(
                 self,
                 scratch: pl.Tensor[
@@ -577,7 +577,7 @@ class TestAutoDeriveTaskDependencies:
             ]:
                 return x
 
-            @pl.function(type=pl.FunctionType.Orchestration)
+            @pl.function(type=pl.FunctionType.Orchestration, auto_scope=False)
             def main(
                 self,
                 scratch: pl.Tensor[
@@ -638,7 +638,7 @@ class TestAutoDeriveTaskDependencies:
             ]:
                 return x
 
-            @pl.function(type=pl.FunctionType.Orchestration)
+            @pl.function(type=pl.FunctionType.Orchestration, auto_scope=False)
             def main(
                 self,
                 scratch: pl.Tensor[
@@ -678,7 +678,7 @@ class TestAutoDeriveTaskDependencies:
             def consume(self, x: pl.Tensor[[32], pl.FP32]) -> pl.Tensor[[32], pl.FP32]:
                 return x
 
-            @pl.function(type=pl.FunctionType.Orchestration)
+            @pl.function(type=pl.FunctionType.Orchestration, auto_scope=False)
             def main(self, scratch: pl.Tensor[[64], pl.FP32]) -> pl.Tensor[[32], pl.FP32]:
                 with pl.scope(mode=pl.ScopeMode.AUTO):
                     left = scratch[0:32]
@@ -707,7 +707,7 @@ class TestAutoDeriveTaskDependencies:
             def consume(self, x: pl.Tensor[[32], pl.FP32]) -> pl.Tensor[[32], pl.FP32]:
                 return x
 
-            @pl.function(type=pl.FunctionType.Orchestration)
+            @pl.function(type=pl.FunctionType.Orchestration, auto_scope=False)
             def main(
                 self,
                 scratch: pl.Tensor[[64], pl.FP32],
@@ -740,7 +740,7 @@ class TestAutoDeriveTaskDependencies:
             def consume(self, x: pl.Tensor[[64], pl.FP32]) -> pl.Tensor[[64], pl.FP32]:
                 return x
 
-            @pl.function(type=pl.FunctionType.Orchestration)
+            @pl.function(type=pl.FunctionType.Orchestration, auto_scope=False)
             def main(
                 self,
                 scratch: pl.Tensor[[64], pl.FP32],
@@ -775,7 +775,7 @@ class TestAutoDeriveTaskDependencies:
             def consume(self, x: pl.Tensor[[64], pl.FP32]) -> pl.Tensor[[64], pl.FP32]:
                 return x
 
-            @pl.function(type=pl.FunctionType.Orchestration)
+            @pl.function(type=pl.FunctionType.Orchestration, auto_scope=False)
             def main(
                 self,
                 left: pl.Tensor[[64], pl.FP32],
@@ -811,7 +811,7 @@ class TestAutoDeriveTaskDependencies:
             def consume(self, x: pl.Tensor[[64], pl.FP32]) -> pl.Tensor[[64], pl.FP32]:
                 return x
 
-            @pl.function(type=pl.FunctionType.Orchestration)
+            @pl.function(type=pl.FunctionType.Orchestration, auto_scope=False)
             def main(
                 self,
                 left: pl.Tensor[[64], pl.FP32],
@@ -844,7 +844,7 @@ class TestAutoDeriveTaskDependencies:
             def consume(self, x: pl.Tensor[[4, 8], pl.FP32]) -> pl.Tensor[[4, 8], pl.FP32]:
                 return x
 
-            @pl.function(type=pl.FunctionType.Orchestration)
+            @pl.function(type=pl.FunctionType.Orchestration, auto_scope=False)
             def main(
                 self,
                 scratch: pl.Tensor[[4, 8], pl.FP32],
@@ -881,7 +881,7 @@ class TestAutoDeriveTaskDependencies:
             def consume(self, x: pl.Tensor[[4, 8], pl.FP32]) -> pl.Tensor[[4, 8], pl.FP32]:
                 return x
 
-            @pl.function(type=pl.FunctionType.Orchestration)
+            @pl.function(type=pl.FunctionType.Orchestration, auto_scope=False)
             def main(
                 self,
                 scratch: pl.Tensor[[4, 8], pl.FP32],
@@ -918,7 +918,7 @@ class TestAutoDeriveTaskDependencies:
             ) -> pl.Tensor[[64], pl.FP32, pl.MemRef("shared_ddr", 128, 256)]:
                 return x
 
-            @pl.function(type=pl.FunctionType.Orchestration)
+            @pl.function(type=pl.FunctionType.Orchestration, auto_scope=False)
             def main(
                 self,
                 left: pl.Tensor[[64], pl.FP32, pl.MemRef("shared_ddr", 0, 256)],
@@ -949,7 +949,7 @@ class TestAutoDeriveTaskDependencies:
             def consume(self, x: pl.Tensor[[64], pl.FP32]) -> pl.Tensor[[64], pl.FP32]:
                 return x
 
-            @pl.function(type=pl.FunctionType.Orchestration)
+            @pl.function(type=pl.FunctionType.Orchestration, auto_scope=False)
             def main(self, scratch: pl.Tensor[[64], pl.FP32]) -> pl.Tensor[[64], pl.FP32]:
                 with pl.scope(mode=pl.ScopeMode.AUTO):
                     produced = self.fill(scratch)
@@ -970,7 +970,7 @@ class TestAutoDeriveTaskDependencies:
             def consume(self, x: pl.Tensor[[4, 8], pl.FP32]) -> pl.Tensor[[4, 8], pl.FP32]:
                 return x
 
-            @pl.function(type=pl.FunctionType.Orchestration)
+            @pl.function(type=pl.FunctionType.Orchestration, auto_scope=False)
             def main(
                 self,
                 src: pl.Tensor[[4, 16], pl.FP32],
@@ -1000,7 +1000,7 @@ class TestAutoDeriveTaskDependencies:
             def consume(self, x: pl.Tensor[[64], pl.FP32]) -> pl.Tensor[[64], pl.FP32]:
                 return x
 
-            @pl.function(type=pl.FunctionType.Orchestration)
+            @pl.function(type=pl.FunctionType.Orchestration, auto_scope=False)
             def main(self, scratch: pl.Tensor[[64], pl.FP32]) -> pl.Tensor[[64], pl.FP32]:
                 with pl.scope(mode=pl.ScopeMode.AUTO):
                     carried = scratch
@@ -1104,7 +1104,7 @@ class TestAutoDeriveTaskDependencies:
             def consume(self, x: pl.Tensor[[64], pl.FP32]) -> pl.Tensor[[64], pl.FP32]:
                 return x
 
-            @pl.function(type=pl.FunctionType.Orchestration)
+            @pl.function(type=pl.FunctionType.Orchestration, auto_scope=False)
             def main(
                 self,
                 scratch: pl.Tensor[[64], pl.FP32],
@@ -1137,7 +1137,7 @@ class TestAutoDeriveTaskDependencies:
             def consume(self, x: pl.Tensor[[64], pl.FP32]) -> pl.Tensor[[64], pl.FP32]:
                 return x
 
-            @pl.function(type=pl.FunctionType.Orchestration)
+            @pl.function(type=pl.FunctionType.Orchestration, auto_scope=False)
             def main(
                 self,
                 scratch: pl.Tensor[[64], pl.FP32],
@@ -1151,7 +1151,7 @@ class TestAutoDeriveTaskDependencies:
                     out, _ = pl.submit(self.consume, gathered)
                 return out
 
-        out = _run_auto_deps(Prog)
+        out = _run_auto_deps(Prog, analyze_auto_scopes=True)
         scopes = _runtime_scopes(out)
         assert len(scopes) == 1
         assert scopes[0].manual is False
@@ -1178,7 +1178,7 @@ class TestAutoDeriveTaskDependencies:
                 out = self.consume(produced)
                 return out
 
-        out = _run_auto_deps(Prog, analyze_auto_scopes=True)
+        out = _run_auto_deps(Prog)
         consume_call = _user_calls(out, "consume")[0]
         assert _compiler_edges(consume_call) == []
 
@@ -1220,7 +1220,7 @@ class TestAutoDeriveTaskDependencies:
             def consume(self, x: pl.Tensor[[64], pl.FP32]) -> pl.Tensor[[64], pl.FP32]:
                 return x
 
-            @pl.function(type=pl.FunctionType.Orchestration)
+            @pl.function(type=pl.FunctionType.Orchestration, auto_scope=False)
             def main(
                 self,
                 t0: pl.Tensor[[64], pl.FP32],

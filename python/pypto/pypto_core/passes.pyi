@@ -552,7 +552,8 @@ def auto_derive_task_dependencies(analyze_auto_scopes: bool = False) -> Pass:
     AUTO scopes are skipped by default; pass ``analyze_auto_scopes=True`` to
     analyze them without changing their runtime scope mode. Unanalyzable hazards
     keep AUTO tracking with partial compiler deps stripped. User-written
-    ``deps=[...]`` entries remain under ``Call.attrs['manual_dep_edges']``.
+    ``deps=[...]`` entries stay in ``Submit::deps_``, preserving the
+    ``ManualDepsOnSubmitOnly`` invariant for codegen.
     """
 
 def expand_manual_phase_fence() -> Pass:
