@@ -1230,8 +1230,10 @@ class AutoDepMutator : public IRMutator {
     }
     if (fallback) {
       DebugLog("fallback_runtime_scope name_hint=" + name_hint);
+      // The virtual whole-body region has no runtime scope boundary to fall back to.
+      // Keep representable local edges; the fallback already prevents access export.
+      if (is_virtual_whole_body) return new_body;
       auto stripped_body = StripCompilerDeps(new_body);
-      if (is_virtual_whole_body) return stripped_body;
       return std::make_shared<const RuntimeScopeStmt>(false, name_hint, std::move(stripped_body), span,
                                                       std::move(leading_comments), std::move(attrs));
     }
