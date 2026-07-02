@@ -217,8 +217,9 @@ class PassManager:
             analyze_auto_scopes_for_deps: If True, enable compiler-derived task
                 dependency analysis for AUTO runtime scopes. The default stays
                 False so runtime AUTO tracking remains the only AUTO-scope
-                dependency mechanism. User-written manual scopes are not
-                analyzed by this pass.
+                dependency mechanism. User-written manual scopes do not get
+                compiler deps, but covered read-only inputs may still be
+                rewritten to NoDep.
 
         Returns:
             A PassManager instance configured with the appropriate passes

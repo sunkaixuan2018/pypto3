@@ -343,7 +343,11 @@ def test_compiler_derived_deps_for_fixed_trip_loop_fan_in_capture_task_ids():
             out = self.consume(carried)
             return out
 
-    code = _generate_orch_full_pipeline(P, analyze_auto_scopes_for_deps=True)
+    code = _generate_orch_full_pipeline(
+        P,
+        analyze_auto_scopes_for_deps=True,
+        allow_relaxed_verification=True,
+    )
 
     fan_in = re.search(r"PTO2TaskId\s+(last_tid\w*)\[4\];", code)
     assert fan_in, code
@@ -398,6 +402,7 @@ def test_compiler_derived_deps_for_dynamic_trip_loop_fan_in_falls_back():
     assert "std::vector<PTO2TaskId>" not in code
     assert "#include <vector>" not in code
     assert ".set_dependencies(" not in code
+    assert "PTO2_SCOPE(PTO2ScopeMode::MANUAL)" not in code
 
 
 def test_compiler_derived_deps_for_dynamic_trip_tensor_carrier_falls_back():
@@ -441,6 +446,90 @@ def test_compiler_derived_deps_for_dynamic_trip_tensor_carrier_falls_back():
     assert "std::vector<PTO2TaskId>" not in code
     assert "#include <vector>" not in code
     assert ".set_dependencies(" not in code
+
+
+def test_compiler_derived_deps_for_dynamic_parallel_tensor_carriers_share_phase_barrier():
+    """Dynamic parallel tensor producers in one phase should share one dummy barrier."""
+
+    backend.reset_for_testing()
+    backend.set_backend_type(BackendType.Ascend910B)
+
+    @pl.program
+    class P:
+        @pl.function(type=pl.FunctionType.AIV)
+        def fill_q(
+            self,
+            out: pl.Out[pl.Tensor[[64], pl.FP32]],
+        ) -> pl.Tensor[[64], pl.FP32]:
+            return out
+
+        @pl.function(type=pl.FunctionType.AIV)
+        def fill_k(
+            self,
+            out: pl.Out[pl.Tensor[[64], pl.FP32]],
+        ) -> pl.Tensor[[64], pl.FP32]:
+            return out
+
+        @pl.function(type=pl.FunctionType.AIV)
+        def fill_v(
+            self,
+            out: pl.Out[pl.Tensor[[64], pl.FP32]],
+        ) -> pl.Tensor[[64], pl.FP32]:
+            return out
+
+        @pl.function(type=pl.FunctionType.AIV)
+        def consume(
+            self,
+            q: pl.Tensor[[64], pl.FP32],
+            k: pl.Tensor[[64], pl.FP32],
+            v: pl.Tensor[[64], pl.FP32],
+        ) -> pl.Tensor[[64], pl.FP32]:
+            return q
+
+        @pl.function(type=pl.FunctionType.Orchestration)
+        def main(
+            self,
+            q: pl.Tensor[[64], pl.FP32],
+            k: pl.Tensor[[64], pl.FP32],
+            v: pl.Tensor[[64], pl.FP32],
+            n_steps: pl.Scalar[pl.INDEX],
+        ) -> pl.Tensor[[64], pl.FP32]:
+            q_carried = q
+            k_carried = k
+            v_carried = v
+            for _i, (q_carried, k_carried, v_carried) in pl.parallel(
+                0,
+                n_steps,
+                init_values=(q_carried, k_carried, v_carried),
+            ):
+                q_carried = self.fill_q(q_carried)
+                k_carried = self.fill_k(k_carried)
+                v_carried = self.fill_v(v_carried)
+                q_carried, k_carried, v_carried = pl.yield_(q_carried, k_carried, v_carried)
+            out = self.consume(q_carried, k_carried, v_carried)
+            return out
+
+    code = _generate_orch_full_pipeline(P, analyze_auto_scopes_for_deps=True)
+
+    assert "#include <vector>" in code
+    collection = re.search(
+        r"std::vector<PTO2TaskId>\s+(\w+)\(static_cast<size_t>\((\w+)\)\);\n\s+uint32_t\s+(\w+)\s*=\s*0;",
+        code,
+    )
+    assert collection, code
+    buffer_name, capacity_name, count_name = collection.groups()
+    capacity_init = re.search(rf"const int64_t {capacity_name} = ([^\n]+);", code)
+    assert capacity_init, code
+    assert " * 3" in capacity_init.group(1), code
+    assert ".push_back(" not in code
+    assert code.count(f"{buffer_name}[{count_name}++] =") == 3, code
+    assert code.count("rt_orch_profile_add_dynamic_dep_vector") == 4, code
+    assert code.count("Dynamic compiler-dependency barrier") == 1, code
+    assert code.count("rt_submit_dummy_task") == 1, code
+    assert f".set_dependencies({buffer_name}.data(), {count_name});" in code, code
+    assert re.search(r"PTO2TaskId params_t\d+_deps\[1\];", code), code
+    assert not re.search(r"PTO2TaskId params_t\d+_deps\[[23]\];", code), code
+    assert code.count(".add_no_dep(") >= 3, code
 
 
 def test_compiler_derived_deps_for_dynamic_trip_tuple_output_tensor_carrier_falls_back():
@@ -548,13 +637,31 @@ def test_compiler_derived_deps_keep_outer_tuple_producer_task_id_stable_in_dynam
             out = self.consume(k_cache_carried)
             return out
 
-    code = _generate_orch_full_pipeline(P, analyze_auto_scopes_for_deps=True)
+    code = _generate_orch_full_pipeline(
+        P,
+        analyze_auto_scopes_for_deps=True,
+        allow_relaxed_verification=True,
+    )
 
+    assert code.count("PTO2_SCOPE(PTO2ScopeMode::MANUAL)") == 1, code
     qk_tid = re.search(r"\b(\w+_tid)\s*=\s*task_0_outs\.task_id\(\);", code)
     assert qk_tid, code
     rope_tid = re.search(r"(?:PTO2TaskId\s+)?(\w+_tid\w*)\s*=\s*task_1_outs\.task_id\(\);", code)
     assert rope_tid, code
     assert qk_tid.group(1) != rope_tid.group(1), code
+    collection = re.search(
+        r"std::vector<PTO2TaskId>\s+(\w+)\(static_cast<size_t>\(\w+\)\);\n\s+uint32_t\s+(\w+)\s*=\s*0;",
+        code,
+    )
+    assert collection, code
+    buffer_name, count_name = collection.groups()
+    assert code.count(f"{buffer_name}[{count_name}++] =") == 1, code
+    manual_scope_idx = code.index("PTO2_SCOPE(PTO2ScopeMode::MANUAL)")
+    qk_submit_idx = code.index("TaskOutputTensors task_0_outs")
+    assert manual_scope_idx < qk_submit_idx, code
+    rope_submit_idx = code.index("TaskOutputTensors task_1_outs", manual_scope_idx)
+    rope_deps_idx = code.rfind("params_t1.set_dependencies", manual_scope_idx, rope_submit_idx)
+    assert rope_deps_idx > manual_scope_idx, code
     assert re.search(
         rf"if \({qk_tid.group(1)}\.is_valid\(\)\) "
         rf"params_t1_deps\[params_t1_deps_count\+\+\] = {qk_tid.group(1)};",

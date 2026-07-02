@@ -503,14 +503,6 @@ preserves array carries whose backing storage is enclosing-scope-valid (named by
 an identifier not in the scope's local set), and reverts only the scope-local
 ones.
 
-When a later sibling or parent scope references a producer TaskId created in an
-earlier nested or sibling scope through `compiler_manual_dep_edges`, codegen
-hoists only that TaskId binding: it declares a
-`PTO2TaskId <name> = PTO2TaskId::invalid();` sentinel before the producer
-`PTO2_SCOPE`, assigns `<name> = task_<n>_outs.task_id();` inside the block, and
-then emits the later guarded `set_dependencies(...)` entry from the enclosing
-C++ scope. Ordinary scope-local TaskIds still stay local.
-
 **Cross-scope tensors and `manual_scope`.** A `manual_scope` is a *scheduling*
 region, not a storage/value scope: a tensor it touches flows transparently to
 tasks placed *after* the `PTO2_SCOPE(MANUAL) { ... }` block. So nothing an
