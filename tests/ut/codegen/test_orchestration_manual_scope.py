@@ -548,7 +548,7 @@ class TestManualScopeCodegen:
         assert "params_t1.set_dependencies(" not in code, code
 
     def test_compiler_derived_deps_in_default_auto_scope_emit_set_dependencies_when_enabled(self):
-        """AUTO-scope analysis can be enabled explicitly for default auto_scope=True."""
+        """Default auto_scope=True can become MANUAL when analysis covers the body."""
         backend.reset_for_testing()
         backend.set_backend_type(BackendType.Ascend910B)
 
@@ -574,8 +574,8 @@ class TestManualScopeCodegen:
         transformed = _run_default_pipeline_with_auto_scope_deps(Prog)
         code = _generate_orch_code(transformed)
 
-        assert "PTO2_SCOPE(PTO2ScopeMode::MANUAL)" not in code, code
-        assert "PTO2_SCOPE() {" in code, code
+        assert code.count("PTO2_SCOPE(PTO2ScopeMode::MANUAL)") == 1, code
+        assert "PTO2_SCOPE() {" not in code, code
         producer_tid = re.search(
             r"PTO2TaskId (\w+_tid) = PTO2TaskId::invalid\(\);[\s\S]*\1 = task_0_outs\.task_id\(\);",
             code,
@@ -621,7 +621,7 @@ class TestManualScopeCodegen:
         assert "set_dependencies(" not in code, code
 
     def test_compiler_derived_deps_for_plain_auto_call_capture_task_id_when_enabled(self):
-        """pl.at-style ordinary calls can be captured only when deps need them."""
+        """pl.at-style ordinary calls are captured when deps need them."""
         backend.reset_for_testing()
         backend.set_backend_type(BackendType.Ascend910B)
 
@@ -647,7 +647,8 @@ class TestManualScopeCodegen:
         transformed = _run_default_pipeline_with_auto_scope_deps(Prog)
         code = _generate_orch_code(transformed)
 
-        assert "PTO2_SCOPE(PTO2ScopeMode::MANUAL)" not in code, code
+        assert code.count("PTO2_SCOPE(PTO2ScopeMode::MANUAL)") == 1, code
+        assert "PTO2_SCOPE() {" not in code, code
         assert "TaskOutputTensors task_0_outs = rt_submit_aiv_task(" in code, code
         producer_tid = re.search(
             r"PTO2TaskId (\w+_tid) = PTO2TaskId::invalid\(\);[\s\S]*\1 = task_0_outs\.task_id\(\);",

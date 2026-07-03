@@ -116,8 +116,9 @@ def compile(  # noqa: PLR0913
         analyze_auto_scopes_for_deps: If True, let
             ``AutoDeriveTaskDependencies`` analyze AUTO runtime scopes. The
             default is False to preserve the existing TensorMap-fallback
-            behavior unless explicitly enabled. User-written manual scopes are
-            not analyzed by this pass.
+            behavior unless explicitly enabled. User-written manual scopes do
+            not get compiler deps, but covered read-only inputs may still be
+            rewritten to NoDep.
 
     Returns:
         A :class:`CompiledProgram` that wraps the output directory and can

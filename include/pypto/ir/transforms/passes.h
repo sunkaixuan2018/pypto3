@@ -696,11 +696,13 @@ Pass ExpandManualPhaseFence();
 /**
  * @brief Derive explicit task-to-task dependency edges inside runtime scopes.
  *
- * User-written manual runtime scopes are skipped: the user's explicit
- * ``deps=[...]`` edges are treated as the complete scheduling contract. AUTO
- * scopes are skipped by default; pass ``analyze_auto_scopes=true`` to analyze
- * them while keeping ``manual=false`` in the output IR. For each analyzed AUTO
- * scope, the pass computes a conservative storage access summary from
+ * User-written manual runtime scopes do not receive compiler-derived dependency
+ * edges: the user's explicit ``deps=[...]`` edges are treated as the complete
+ * scheduling contract. Covered read-only tensor inputs may still be rewritten to
+ * ``NoDep``. AUTO scopes are skipped by default; pass
+ * ``analyze_auto_scopes=true`` to analyze them while keeping ``manual=false`` in
+ * the output IR. For each analyzed AUTO scope, the pass computes a conservative
+ * storage access summary from
  * ``arg_directions`` and attaches RAW/WAR/WAW hazards against prior calls in the
  * same scope under ``Call.attrs["compiler_manual_dep_edges"]``. On unanalyzable
  * hazards, partial compiler deps are stripped and AUTO tracking remains active.
