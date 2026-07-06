@@ -76,6 +76,23 @@ namespace transform_utils = ir::transform_utils;
 
 namespace {
 
+// Full-MemRef-identity key used by PTOAS memory-planner codegen to decide when
+// two tile variables denote the *same* buffer (and must share one tile_buf
+// handle so the op writes in place). Same base + byte_offset + size = same
+// buffer (loop-carried accumulator, in-place op result). A view shares the
+// base but differs in offset and/or size, so it gets a distinct key.
+std::string MemRefIdentityKey(const ir::MemRefPtr& memref) {
+  std::ostringstream key;
+  key << static_cast<const void*>(memref->base_.get()) << '|';
+  if (auto off = As<ir::ConstInt>(memref->byte_offset_)) {
+    key << "off" << off->value_;
+  } else {
+    key << "off@" << static_cast<const void*>(memref->byte_offset_.get());
+  }
+  key << "|sz" << memref->size_;
+  return key.str();
+}
+
 bool IsSameDimExpr(const ExprPtr& lhs, const ExprPtr& rhs) {
   if (lhs == rhs) {
     return true;
@@ -384,7 +401,8 @@ const backend::BackendHandler* PTOCodegen::GetBackendHandler() const { return ba
 // Generate entry and GenerateFunction
 // ========================================================================
 
-std::string PTOCodegen::Generate(const ProgramPtr& program) {
+std::string PTOCodegen::Generate(const ProgramPtr& program, bool emit_tile_addr) {
+  emit_tile_addr_ = emit_tile_addr;
   stream_.str("");
   stream_.clear();
   fs_.constants_section.str("");
@@ -588,17 +606,35 @@ void PTOCodegen::GenerateFunction(const FunctionPtr& func) {
   // Still collect fs_.memref_to_tile_type for GetTileBufTypeString fallback paths
   fs_.memref_to_tile_type = collector.GetMemRefTileTypes();
 
-  // Per-var SSA binding: each tile variable gets its own SSA name
+  // Per-var SSA binding: each tile variable gets its own SSA name — except in
+  // PTOAS memory-planner mode (no addr baked), where variables denoting the
+  // *same* buffer (same MemRef base+offset+size, e.g. a loop-carried
+  // accumulator coalesced by MemoryReuse) must share one tile_buf handle. In
+  // level3 that aliasing was carried by an identical `addr`; without addr, ptoas
+  // PlanMemory would otherwise allocate them separately, so we instead emit a
+  // single alloc_tile and let the op write in place (`outs(%acc)`).
   for (const auto& [tile_var, tile_type] : fs_.tile_var_allocs) {
-    std::string ssa_name = NewNamedTemp(tile_var->name_hint_);
+    auto memref = ir::GetDefinedMemRef(tile_type);
+
+    std::string ssa_name;
+    if (!emit_tile_addr_) {
+      const std::string ident = MemRefIdentityKey(memref);
+      auto it = fs_.memref_identity_to_mlir.find(ident);
+      if (it != fs_.memref_identity_to_mlir.end()) {
+        ssa_name = it->second;  // reuse the shared handle (in-place aliasing)
+      } else {
+        ssa_name = NewNamedTemp(tile_var->name_hint_);
+        fs_.memref_identity_to_mlir[ident] = ssa_name;
+      }
+    } else {
+      ssa_name = NewNamedTemp(tile_var->name_hint_);
+    }
     BindVarToMlir(tile_var, ssa_name);
 
     // Pre-populate type so body visitors (e.g., tile.reshape no-op check)
     // can query it before per-variable alloc_tile emission runs.
     std::string type_str = GetTileBufTypeStringFromTileType(tile_type);
     fs_.ssa_to_tile_buf_type[ssa_name] = type_str;
-
-    auto memref = ir::GetDefinedMemRef(tile_type);
 
     // Also maintain fs_.memref_to_mlir for compatibility (first var per allocation)
     const ir::Var* base_ptr = memref->base_.get();
@@ -728,10 +764,12 @@ void PTOCodegen::GenerateFunction(const FunctionPtr& func) {
   // For addr constants specifically, codegen preserves the IR ConstInt
   // dtype 1:1 (other operands like valid_row/valid_col adapt to the
   // consumer's type via cast_to_index — see ComputeAllocTileFields).
-  for (const auto& [tile_var, tile_type] : fs_.tile_var_allocs) {
-    auto memref = ir::GetDefinedMemRef(tile_type);
-    if (auto const_offset = memref ? As<ir::ConstInt>(memref->byte_offset_) : nullptr) {
-      GetOrEmitConstant(const_offset->value_, const_offset->dtype());
+  if (emit_tile_addr_) {
+    for (const auto& [tile_var, tile_type] : fs_.tile_var_allocs) {
+      auto memref = ir::GetDefinedMemRef(tile_type);
+      if (auto const_offset = memref ? As<ir::ConstInt>(memref->byte_offset_) : nullptr) {
+        GetOrEmitConstant(const_offset->value_, const_offset->dtype());
+      }
     }
   }
 
@@ -1074,7 +1112,7 @@ PTOCodegen::AllocTileFields PTOCodegen::ComputeAllocTileFields(
   }
 
   auto memref = ir::GetDefinedMemRef(tile_type);
-  if (memref) {
+  if (memref && emit_tile_addr_) {
     if (auto const_offset = As<ir::ConstInt>(memref->byte_offset_)) {
       fields.addr_ssa = GetOrEmitConstant(const_offset->value_, const_offset->dtype());
     }
@@ -1093,6 +1131,12 @@ void PTOCodegen::EmitAllocTileForVar(const ir::VarPtr& tile_var,
   INTERNAL_CHECK_SPAN(mlir_it != fs_.var_to_mlir.end(), tile_var->span_)
       << "Tile var " << tile_var->name_hint_ << " not found in fs_.var_to_mlir";
   std::string tile_buf = mlir_it->second;
+
+  // In PTOAS mode several vars may share one handle (in-place aliasing); emit
+  // the alloc_tile only once per handle so the shared buffer has a single def.
+  if (!fs_.emitted_tile_alloc_names.insert(tile_buf).second) {
+    return;
+  }
 
   AllocTileFields fields = ComputeAllocTileFields(tile_type);
 
@@ -1305,7 +1349,7 @@ bool PTOCodegen::IsDualAivDispatchFunction() const {
 void PTOCodegen::EmitExtraAllocTiles() {
   for (const auto& alloc : fs_.extra_alloc_tiles) {
     stream_ << GetIndent() << alloc.name << " = pto.alloc_tile";
-    if (!alloc.addr_ssa.empty()) {
+    if (emit_tile_addr_ && !alloc.addr_ssa.empty()) {
       stream_ << " addr = " << alloc.addr_ssa;
     }
     if (!alloc.valid_row_ssa.empty()) {
