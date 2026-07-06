@@ -450,9 +450,14 @@ def auto_tile_matmul_l0() -> Pass:
     auto-inserted Mat→Left/Right moves. Already-L0-sized matmuls are left
     untouched.
 
-    Supported today: ``tile.matmul`` and ``tile.matmul_acc``;
-    ``tile.matmul_bias`` is deferred. Only K tiling; M/N tiling and
-    ``K % k != 0`` cases emit a perf hint and skip.
+    Supported today: ``tile.matmul`` and ``tile.matmul_acc``
+    (``tile.matmul_bias`` is deferred). The chooser is a roofline cost-model
+    search over ``(m, n, k, stationarity)``; besides the K-loop it emits
+    **M/N output tiling** (a direct-store grid, or an on-chip **Mat-scratch**
+    assemble when the result is consumed as a matmul operand), a
+    **non-divisor-K boundary peel** for 16-aligned K, and **operand-stationary**
+    (A/B-stationary) schedules. Non-16-aligned K and the other deferred regimes
+    emit a perf hint and are left untouched.
     """
 
 def canonicalize_tile_slice() -> Pass:
@@ -708,10 +713,17 @@ class stmt_dependency_analysis:
         """
 
 class l0_tile_chooser:
-    """Closed-form chooser for L0 matmul tile shape (m, n, k)."""
+    """Chooser for the L0 matmul design point by roofline cost model."""
+
+    class Stationarity(Enum):
+        """Which GEMM operand is pinned across the L0 tiling loops."""
+
+        OutputStationary = 0
+        AStationary = 1
+        BStationary = 2
 
     class L0TileConfig:
-        """Inputs to choose_l0_tile: problem dims + hardware + schedule knobs."""
+        """Inputs to choose_l0_tile: problem dims + hardware + realizable-mask gates."""
 
         M: int
         N: int
@@ -728,26 +740,37 @@ class l0_tile_chooser:
         align_m: int
         align_n: int
         align_k: int
-        double_buffer_a: bool
-        double_buffer_b: bool
-        double_buffer_c: bool
+        allow_a_stationary: bool
+        allow_b_stationary: bool
+        allow_double_buffer_c: bool
         c_read: bool
+        bw_a: float
+        bw_b: float
+        bw_drain: float
+        drain_fixed_cycles: float
+        mad_head: int
+        mad_k_fractal_bytes: int
         allow_padding: bool
+        allow_k_boundary: bool
         def __init__(self) -> None: ...
 
     class L0TileResult:
-        """Output of choose_l0_tile: the chosen (m, n, k) plus diagnostics."""
+        """Output of choose_l0_tile: the chosen design point plus diagnostics."""
 
         m: int
         n: int
         k: int
         estimated_traffic_bytes: int
+        estimated_cost_cycles: int
         padded_compute_volume: int
+        stationarity: l0_tile_chooser.Stationarity
+        os_holds_a: bool
+        double_buffer_c: bool
         perf_hint: str
 
     @staticmethod
     def choose_l0_tile(config: L0TileConfig) -> L0TileResult:
-        """Pick an approximately-optimal L0 tile shape (m, n, k)."""
+        """Pick the minimum-wall L0 GEMM design point under the roofline cost model."""
 
 __all__ = [
     "IRProperty",
@@ -820,6 +843,7 @@ __all__ = [
     "create_function_pass",
     "create_program_pass",
     "stmt_dependency_analysis",
+    "l0_tile_chooser",
     "skew_cross_core_pipeline",
     "lower_pipeline_loops",
     "canonicalize_io_order",
