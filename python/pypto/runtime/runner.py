@@ -135,8 +135,9 @@ class RunConfig:
             Output: ``<work_dir>/dfx_outputs/pmu.csv``. Mirrors
             ``--enable-pmu N``.
         enable_dep_gen: Capture PTO2 dependency edges into
-            ``<work_dir>/dfx_outputs/deps.json``. Render to HTML on demand
-            via ``python -m simpler_setup.tools.deps_to_graph``. Mirrors
+            ``<work_dir>/dfx_outputs/deps.json``. Render to HTML on demand via
+            ``python -m simpler_setup.tools.deps_viewer <deps.json> --format
+            html`` (the CLI defaults to text output). Mirrors
             ``--enable-dep-gen``.
         enable_scope_stats: Capture per-scope heap / task_window / tensormap
             ring-fill peaks into
@@ -992,7 +993,7 @@ def _collect_dfx_artifacts(
     # Synthesise the func_id→name map the profiling tools need for readable
     # labels. simpler's SceneTest harness writes this itself; pypto does not
     # use SceneTest, so we derive it from ``kernel_config.py`` and drop it next
-    # to the records. ``deps_to_graph`` auto-discovers ``name_map_*.json`` in
+    # to the records. ``deps_viewer`` auto-discovers ``name_map_*.json`` in
     # the same directory, and ``swimlane_converter`` is pointed at it below via
     # ``--func-names``. Written whenever swimlane or dep_gen is enabled (the two
     # consumers); harmless no-op when no kernel names are available.
@@ -1018,7 +1019,7 @@ def _collect_dfx_artifacts(
             )
 
     if dfx.enable_dep_gen and (dfx_dir / "deps.json").exists():
-        # ``deps_to_graph`` is an offline post-processing tool; leave the
+        # ``deps_viewer`` is an offline post-processing tool; leave the
         # artefact in place and point the user at the rendering command.
         # Doing it inline on hot path risks hanging the run on large graphs
         # (Graphviz ``dot`` is O(N²~N³) and has SIGKILL'd taskqueue jobs).
@@ -1027,9 +1028,9 @@ def _collect_dfx_artifacts(
         deps_path = shlex.quote(str(dfx_dir / "deps.json"))
         print(
             f"deps.json written to {deps_path} — render with:\n"
-            f"  python -m simpler_setup.tools.deps_to_graph {deps_path}\n"
-            f"  # for large graphs, pass --engine (default 'dot' works for <500 nodes):\n"
-            f"  python -m simpler_setup.tools.deps_to_graph {deps_path} --engine sfdp\n"
+            f"  python -m simpler_setup.tools.deps_viewer {deps_path}\n"
+            f"  # for large graphs, render HTML with a scalable layout engine:\n"
+            f"  python -m simpler_setup.tools.deps_viewer {deps_path} --format html --engine sfdp\n"
             f"  # --engine choices: dot | sfdp | fdp | neato | circo | twopi"
         )
 
@@ -1066,7 +1067,7 @@ def _write_name_map(work_dir: Path, dfx_dir: Path) -> Path | None:
     The profiling tools render human-readable kernel names (``QK(rXtY)``
     instead of the anonymous ``task(rXtY)``) only when a name map sits next to
     the records: ``swimlane_converter`` consumes it via ``--func-names`` and
-    ``deps_to_graph`` auto-discovers any sibling ``name_map_*.json``. simpler's
+    ``deps_viewer`` auto-discovers any sibling ``name_map_*.json``. simpler's
     SceneTest harness writes this file itself, but pypto does not use SceneTest,
     so we build the same ``callable_id_to_name`` mapping from the
     ``func_id``/``name`` fields already emitted into ``kernel_config.py``.
