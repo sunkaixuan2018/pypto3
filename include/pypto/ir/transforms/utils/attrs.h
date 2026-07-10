@@ -55,6 +55,29 @@ inline constexpr const char* kPipelineStagesAttr = "pipeline_stages";
 /// ``pipeline_stages``.
 inline constexpr const char* kPipelineOverlapStoresAttr = "pipeline_overlap_stores";
 
+/// Optional ``bool`` policy attr on a ``ForKind::Pipeline`` ``ForStmt`` (absent ⇒
+/// ``false``): when ``true``, ``CanonicalizeIOOrder`` floats the Acc-draining ops
+/// into a tier *above all compute* in the loop body, so every sibling-iteration
+/// drain sorts after every matmul — ``matmul_i, matmul_{i+1}, drain_i, drain_{i+1}``
+/// instead of ``matmul_i, drain_i, matmul_{i+1}, drain_{i+1}``. The drain op is
+/// ``tile.store`` on the direct-store (Acc→GM) path and ``tile.assemble`` on the
+/// Mat-scratch (Acc→Mat) path.
+///
+/// This is a *stronger* float than ``pipeline_overlap_stores`` (which only orders
+/// store-after-compute *within* a stage — the compute/store tier is shared and
+/// sorted by stage, so a stage-i store still precedes the stage-{i+1} matmul).
+/// It keeps the two iterations' L0C accumulators genuinely co-live, which is the
+/// dbC=2 (double-buffered L0C) ping-pong: overlapping their live ranges forces any
+/// correct allocator to give them distinct L0C offsets, so tile i's FIXPIPE drain
+/// overlaps tile i+1's MAD.  The co-live pair only survives under
+/// ``memory_planner=PTOAS``, which skips MemoryReuse (whose opportunistic reuse
+/// over-coalesces the pair into one buffer); InitMemRef then keeps the two buffers
+/// distinct and ptoas places them.  AutoTileMatmulL0 sets it only when the chooser
+/// picked ``double_buffer_c`` (ptoas planner + accumulator budgeted at L0C/2);
+/// under the pypto planner it stays absent (⇒ ``false``).  Consumed (stripped) by
+/// ``CanonicalizeIOOrder`` alongside ``pipeline_stages`` and ``pipeline_overlap_stores``.
+inline constexpr const char* kPipelineDoubleBufferCAttr = "pipeline_double_buffer_c";
+
 /// Attribute key marking a tile-producing ``Call`` with the pipeline-stage
 /// membership(s) of the tile it defines. ``LowerPipelineLoops`` sets it when it
 /// replicates a ``pl.pipeline`` body: every clone of a replicated region is one
