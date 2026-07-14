@@ -24,6 +24,7 @@ declares no annotation, so both the original build and the reparse agree.
 """
 
 import pypto.language as pl
+import pypto.language.distributed as pld
 import pytest
 from pypto import ir
 
@@ -219,6 +220,175 @@ def test_submit_to_annotationless_callee_return_unchanged():
     assert len(submit_type.types) == 1
     assert isinstance(submit_type.types[0], ir.ScalarType)
 
+    _assert_roundtrips(Prog)
+
+
+def test_symbolic_valid_shape_and_composite_return_metadata_are_substituted():
+    """A DSL call rebuilds a composite valid-shape expression for the actual tensor shape."""
+    n = pl.dynamic("N")
+
+    @pl.program
+    class Prog:
+        @pl.function
+        def view(self, arg: pl.Tensor[[n, 64], pl.FP32]):
+            return pl.tensor.slice(arg, [n, 64], [0, 0], valid_shape=[n - 1, 64])
+
+        @pl.function
+        def main(self, actual: pl.Tensor[[32, 64], pl.FP32]):
+            return self.view(actual)
+
+    (deduced,) = _user_call_types(Prog, "view")
+    assert isinstance(deduced, ir.TensorType)
+    assert [str(dim) for dim in deduced.shape] == ["32", "64"]
+    assert deduced.tensor_view is not None
+    valid_expr = deduced.tensor_view.valid_shape[0]
+    assert isinstance(valid_expr, ir.Sub)
+    assert isinstance(valid_expr.left, ir.ConstInt) and valid_expr.left.value == 32
+    assert isinstance(valid_expr.right, ir.ConstInt) and valid_expr.right.value == 1
+    _assert_roundtrips(Prog)
+
+
+def test_self_binding_is_refined_by_later_concrete_argument():
+    """A shared placeholder does not hide a concrete binding from a later argument."""
+    n = pl.dynamic("N")
+
+    @pl.program
+    class Prog:
+        @pl.function
+        def select(self, symbolic: pl.Tensor[[n], pl.FP32], concrete: pl.Tensor[[n], pl.FP32]):
+            return concrete
+
+        @pl.function
+        def main(self, symbolic: pl.Tensor[[n], pl.FP32], concrete: pl.Tensor[[8], pl.FP32]):
+            return self.select(symbolic, concrete)
+
+    (deduced,) = _user_call_types(Prog, "select")
+    assert isinstance(deduced, ir.TensorType)
+    assert [str(dim) for dim in deduced.shape] == ["8"]
+    _assert_roundtrips(Prog)
+
+
+def test_repeated_composite_binding_is_checked_after_transitive_substitution():
+    """A repeated extent can be proved after a later parameter binds its nested variable."""
+    factor = pl.dynamic("FACTOR")
+    total = pl.dynamic("TOTAL")
+    actual_factor = pl.dynamic("ACTUAL_FACTOR")
+
+    @pl.program
+    class Prog:
+        @pl.function
+        def select(
+            self,
+            first: pl.Tensor[[total], pl.FP32],
+            second: pl.Tensor[[total], pl.FP32],
+            marker: pl.Tensor[[factor], pl.FP32],
+        ):
+            return first
+
+        @pl.function
+        def main(
+            self,
+            first: pl.Tensor[[factor * 64], pl.FP32],
+            second: pl.Tensor[[actual_factor * 64], pl.FP32],
+            marker: pl.Tensor[[actual_factor], pl.FP32],
+        ):
+            return self.select(first, second, marker)
+
+    (deduced,) = _user_call_types(Prog, "select")
+    assert isinstance(deduced, ir.TensorType)
+    assert [str(dim) for dim in deduced.shape] == ["ACTUAL_FACTOR * 64"]
+    _assert_roundtrips(Prog)
+
+
+def test_composite_binding_skips_mismatched_nonvariable_operands():
+    """A compatible call can bind from a later argument without a partial composite binding."""
+    n = pl.dynamic("N")
+    m = pl.dynamic("M")
+
+    @pl.program
+    class Prog:
+        @pl.function
+        def select(
+            self,
+            shifted: pl.Tensor[[n + 1], pl.FP32],
+            marker: pl.Tensor[[n], pl.FP32],
+        ):
+            return marker
+
+        @pl.function
+        def main(
+            self,
+            shifted: pl.Tensor[[m + 2], pl.FP32],
+            marker: pl.Tensor[[m + 1], pl.FP32],
+        ):
+            return self.select(shifted, marker)
+
+    (deduced,) = _user_call_types(Prog, "select")
+    assert isinstance(deduced, ir.TensorType)
+    assert [str(dim) for dim in deduced.shape] == ["M + 1"]
+    _assert_roundtrips(Prog)
+
+
+def test_recursive_tuple_and_tile_return_metadata_are_substituted():
+    """A DSL call recursively substitutes metadata on a Tile nested inside tuples."""
+    n = pl.dynamic("N")
+
+    @pl.program
+    class Prog:
+        @pl.function(type=pl.FunctionType.InCore)
+        def load_tile(self, arg: pl.Tensor[[n, 64], pl.FP32]):
+            tile = pl.load(arg, [0, 0], [n, 64], valid_shapes=[n - 1, 64])
+            status = pl.const(0, pl.INT64)
+            return status, (tile,)
+
+        @pl.function
+        def main(self, actual: pl.Tensor[[32, 64], pl.FP32]):
+            return self.load_tile(actual)
+
+    (deduced,) = _user_call_types(Prog, "load_tile")
+    assert isinstance(deduced, ir.TupleType)
+    assert isinstance(deduced.types[1], ir.TupleType)
+    deduced_tile = deduced.types[1].types[0]
+    assert isinstance(deduced_tile, ir.TileType)
+    assert [str(dim) for dim in deduced_tile.shape] == ["32", "64"]
+    assert deduced_tile.tile_view is not None
+    valid_expr = deduced_tile.tile_view.valid_shape[0]
+    assert isinstance(valid_expr, ir.Sub)
+    assert isinstance(valid_expr.left, ir.ConstInt) and valid_expr.left.value == 32
+    assert isinstance(valid_expr.right, ir.ConstInt) and valid_expr.right.value == 1
+    _assert_roundtrips(Prog)
+
+
+def test_distributed_return_kind_and_valid_shape_are_preserved():
+    """A DSL call preserves DistributedTensorType while substituting its valid shape."""
+    n = pl.dynamic("N")
+
+    @pl.program
+    class Prog:
+        @pl.function
+        def view(
+            self,
+            shape_source: pl.Tensor[[n], pl.FP32],
+            arg: pld.DistributedTensor[[64, 64], pl.FP32],
+        ):
+            return pl.tensor.slice(arg, [64, 64], [0, 0], valid_shape=[n - 1, 64])
+
+        @pl.function
+        def main(
+            self,
+            actual_shape_source: pl.Tensor[[32], pl.FP32],
+            actual: pld.DistributedTensor[[64, 64], pl.FP32],
+        ):
+            return self.view(actual_shape_source, actual)
+
+    (deduced,) = _user_call_types(Prog, "view")
+    assert isinstance(deduced, ir.DistributedTensorType)
+    assert [str(dim) for dim in deduced.shape] == ["64", "64"]
+    assert deduced.tensor_view is not None
+    valid_expr = deduced.tensor_view.valid_shape[0]
+    assert isinstance(valid_expr, ir.Sub)
+    assert isinstance(valid_expr.left, ir.ConstInt) and valid_expr.left.value == 32
+    assert isinstance(valid_expr.right, ir.ConstInt) and valid_expr.right.value == 1
     _assert_roundtrips(Prog)
 
 
