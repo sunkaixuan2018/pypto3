@@ -44,6 +44,7 @@ For each InCore function (InCore, AIC, AIV):
 
 1. **Validate preconditions**: Check static physical shapes, last-axis reduction, no `tile.read`/`tile.write`/`tile.slice` on >2D
 2. **Transform statements**: Walk function body and convert >2D tile ops to 2D, preserving any dynamic `valid_shape` (see [Dynamic valid_shape](#dynamic-tile-dimensions-issue-1578))
+3. **Verify postconditions**: The `TileOps2D` property verifier independently checks that the rewritten InCore IR contains only supported tile ranks and codegen-ready transpose forms
 
 Per-statement handling:
 
@@ -180,7 +181,19 @@ chunk the dynamic dim with `pl.range`/`pl.parallel`, or reshape to 2D before the
 
 **Header**: `include/pypto/ir/transforms/passes.h`
 
-**Implementation**: `src/ir/transforms/flatten_tile_nd_to_2d_pass.cpp`
+The implementation is split by responsibility:
+
+| Phase | File | Responsibility |
+| ----- | ---- | -------------- |
+| Coordination | `src/ir/transforms/flatten_tile_nd_to_2d/pass.cpp` | Select InCore functions and sequence analysis before rewrite |
+| Analysis | `src/ir/transforms/flatten_tile_nd_to_2d/analysis.cpp` | Read-only precondition validation |
+| Rewrite orchestration | `src/ir/transforms/flatten_tile_nd_to_2d/rewrite.cpp` | Recursive statement traversal and operation dispatch |
+| Rewrite utilities | `src/ir/transforms/flatten_tile_nd_to_2d/rewrite_utils.cpp` | Shared shape, index, and capacity helpers |
+| Batched matmul rewrite | `src/ir/transforms/flatten_tile_nd_to_2d/batch_matmul.cpp` | Batched matmul and matmul-acc page lowering |
+| Transpose rewrite | `src/ir/transforms/flatten_tile_nd_to_2d/transpose.cpp` | Standalone N-D transpose lowering |
+| Verification | `src/ir/transforms/flatten_tile_nd_to_2d/verification.cpp` | Independent `TileOps2D` postcondition verification |
+
+The phase entry points and rewrite component interface are private to the transform implementation; the public API remains `pass::FlattenTileNdTo2D()`.
 
 **Python binding**: `python/bindings/modules/passes.cpp`
 
