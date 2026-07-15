@@ -551,51 +551,48 @@ def broadcast(
 
 def allgather(
     local_data: Tensor | DistributedTensor,
-    target: DistributedTensor | None = None,
-    signal: DistributedTensor | None = None,
-    out: Tensor | None = None,
-) -> Tensor | DistributedTensor:
-    """Gather data from all ranks, either as an InCore composite or HOST builtin.
+    target: DistributedTensor,
+    signal: DistributedTensor,
+) -> DistributedTensor:
+    """Gather data from all ranks (InCore composite or HOST builtin).
 
-        **InCore composite (4 args):** ``pld.tensor.allgather(local_data, target, signal, out)`` —
-        ``local_data`` is a plain Tensor [1, SIZE] with this rank's chunk.
-        The intrinsic handles ``pl.load``, stage-in, notify/wait, and per-peer
-        ``remote_load`` into ``out``.
+    Unified 3-arg API: ``pld.tensor.allgather(local_data, target, signal)``
+    with the same arg roles for both paths.
 
-        **HOST builtin (2 args):** ``pld.tensor.allgather(data, signal)`` —
-        each rank's chunk is already staged in ``data[my_rank, :]`` via a prior
-    publish step.  The host lowering emits ``builtin.tensor.barrier`` per chip
-            (the allgather AIV kernel requires concurrent cross-chip dispatch;
-            a barrier synchronises pre-staged window data).
+    **InCore composite:** push-based: each rank pushes its chunk into every
+    peer's window slot at ``target[my_rank, :]`` via ``pld.tile.put``, then
+    notify/wait barrier; the window itself becomes the gathered ``[NR, SIZE]``
+    result (window-as-result).
 
-        Args:
-            local_data: For InCore: :class:`pl.Tensor` [1, SIZE].  For HOST:
-                window-bound :class:`pld.DistributedTensor` [NR, SIZE] with
-                pre-staged chunks.
-            target: InCore only: :class:`pld.DistributedTensor` [NR, SIZE] staging window.
-            signal: Window-bound INT32 :class:`pld.DistributedTensor` barrier tensor.
-            out: InCore only: :class:`pl.Tensor` [1, NR*SIZE] output.
+    **HOST builtin:** ``local_data`` is the already-staged
+    :class:`pld.DistributedTensor` [NR, SIZE] window (staged by per-chip
+    dispatch before the call), ``target`` is the same (or aliased) DT window,
+    ``signal`` is the barrier.  The host lowering emits
+    ``builtin.tensor.barrier`` per chip to synchronise the pre-staged data.
 
-        Returns:
-            InCore: the ``out`` :class:`pl.Tensor`.  HOST: the rebound
-            :class:`pld.DistributedTensor`.
+    The C++ deducer validates ``target`` and ``signal`` by type. The InCore
+    composite path requires ``local_data`` to be a plain ``Tensor [1, SIZE]``;
+    the HOST builtin path accepts either ``Tensor [1, SIZE]`` or
+    ``DistributedTensor [NR, SIZE]`` (pre-staged by per-chip dispatch). The
+    lowering passes handle this path-specific validation per their context.
+
+    Args:
+        local_data: InCore: :class:`pl.Tensor` [1, SIZE] with this rank's
+            chunk.  HOST: :class:`pl.Tensor` [1, SIZE].
+        target: :class:`pld.DistributedTensor` [NR, SIZE] result window
+            (window-as-result for both paths).
+        signal: INT32 :class:`pld.DistributedTensor` barrier tensor.
+
+    Returns:
+        :class:`pld.DistributedTensor` — the ``target`` window holding the
+        gathered ``[NR, SIZE]`` result.
     """
-    if isinstance(target, DistributedTensor) and signal is None and out is None:
-        # 2-arg HOST builtin path: allgather(data, signal)
-        # Positional mapping: data→local_data, signal→target
-        data_expr, signal_expr = _unwrap_distributed_tensors(
-            "pld.tensor.allgather", target=local_data, signal=target
-        )
-        call = _ir_tensor.allgather(data_expr, signal_expr)
-        return DistributedTensor(expr=call)
-    # 4-arg InCore composite path
     target_expr, signal_expr = _unwrap_distributed_tensors(
         "pld.tensor.allgather", target=target, signal=signal
     )
     local_data_expr = _unwrap(local_data)
-    out_expr = _unwrap(out)
-    call = _ir_tensor.allgather(local_data_expr, target_expr, signal_expr, out_expr)
-    return Tensor(expr=call)
+    call = _ir_tensor.allgather(local_data_expr, target_expr, signal_expr)
+    return DistributedTensor(expr=call)
 
 
 def reduce_scatter(

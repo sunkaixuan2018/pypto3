@@ -315,15 +315,14 @@ class DispatchAnalyzer : public IRVisitor {
     }
 
     if (IsOp(op, "pld.tensor.allgather")) {
-      if (op->args_.size() == 2) {
-        collective_consumers.push_back({ResolveWindowAlloc(op->args_[0], "pld.tensor.allgather", "target"),
-                                        ResolveWindowAlloc(op->args_[1], "pld.tensor.allgather", "signal"),
-                                        op->span_});
-        return;
-      }
-      INTERNAL_CHECK_SPAN(op->args_.size() == 4, op->span_)
-          << "MaterializeCommDomainScopes: pld.tensor.allgather expects 2 args (host builtin) or "
-             "4 args (InCore composite)";
+      INTERNAL_CHECK_SPAN(op->args_.size() == 3, op->span_)
+          << "MaterializeCommDomainScopes: pld.tensor.allgather expects 3 args (unified 3-arg)";
+
+      // Unified arg roles for both paths:
+      //   arg[1] = target     — DistributedTensor [NR, SIZE] result window
+      //   arg[2] = signal     — DistributedTensor INT32 barrier
+      // HOST path also has a DT in arg[0], but it shares the same WindowBuffer
+      // as arg[1] (the target).  Registering arg[1] covers it.
       collective_consumers.push_back({ResolveWindowAlloc(op->args_[1], "pld.tensor.allgather", "target"),
                                       ResolveWindowAlloc(op->args_[2], "pld.tensor.allgather", "signal"),
                                       op->span_});
